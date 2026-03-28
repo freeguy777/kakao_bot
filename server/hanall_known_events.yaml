@@ -1,0 +1,11 @@
+known_events:
+  - event_id: "hanall_agm_2026_53"
+    importance: "high"
+    target_type: "direct_company"
+    entity: "HanAll Biopharma"
+    category: "shareholder_meeting"
+    scheduled_for_kst: "2026-03-26 09:00 KST"
+    fact: "제53기 정기주주총회가 오늘 개최 예정임"
+    basis: "2026-02-25 주주총회소집공고 및 주주총회소집결의 기준 일정 확인"
+    primary_source: "DART 주주총회소집공고"
+    status_note: "오늘 예정, 결과 공시 추가 확인 필요"

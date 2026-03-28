@@ -1,0 +1,1538 @@
+// ===== 1. Bot =====
+var bot = BotManager.getCurrentBot();
+var ACTUAL_BOT_NAME = "";
+
+try {
+  ACTUAL_BOT_NAME = safeString(bot.getName ? bot.getName() : "");
+} catch (e) {
+  ACTUAL_BOT_NAME = "";
+}
+
+// ===== 2. Config =====
+var CONFIG = {
+  BOT_NAME: "삐래봇",
+  API_BASE_URL: "http://192.168.0.10:8000/kakao",
+  COMMAND_PREFIX: "@",
+  ADMIN_ROOM_NAME: "김휘태",
+  ADMIN_CHANNEL_ID: "464174551530382",
+  SOCKET_PACKAGE_NAME: "com.kakao.talk",
+  ENABLE_LOG: true,
+  STARTUP_NOTIFY_ADMIN: true,
+  NOTIFY_ADMIN_ON_NEW_ROOM: true,
+  ONLY_FORWARD_YOUTUBE: true,
+  HTTP_TIMEOUT_MS: 120000,
+  SEND_DELAY_MS: 250,
+  POLLING_ENABLED: true,
+  POLLING_AUTO_START: true,
+  POLLING_INTERVAL_MS: 15000,
+  POLLING_LIMIT: 10,
+  POLLING_ACK_INCREMENT_RETRY_ON_FAILURE: true,
+  POLLING_NOTIFY_ADMIN: true,
+  POLLING_ERROR_NOTIFY_INTERVAL_MS: 300000,
+  ASYNC_WORKER_COUNT: 2,
+  ASYNC_QUEUE_CAPACITY: 200,
+  MAX_RECENT_ROOMS: 100,
+  RECENT_EVENT_TTL_MS: 30000,
+  RECENT_COMMAND_TTL_MS: 1500
+};
+
+// ===== 3. State =====
+var STATE = {
+  roomsByChannelId: {},
+  roomOrder: [],
+  recentHandledEvents: {},
+  pollingEnabled: false,
+  pollingThreadRunning: false,
+  pollingBusy: false,
+  pollingCycleCount: 0,
+  pollingLastStartedAt: "",
+  pollingLastPolledAt: "",
+  pollingLastSuccessAt: "",
+  pollingLastPulledCount: 0,
+  pollingLastSentCount: 0,
+  pollingLastAckSuccessCount: 0,
+  pollingLastAckFailCount: 0,
+  pollingLastError: "",
+  pollingLastErrorNotifiedAtMs: 0,
+  asyncWorkersStarted: false,
+  asyncTaskQueue: null,
+  asyncEnqueuedCount: 0,
+  asyncExecutedCount: 0,
+  asyncDroppedCount: 0,
+  asyncLastError: ""
+};
+
+// ===== 4. Logging =====
+var Log = {
+  i: function(msg) {
+    if (!CONFIG.ENABLE_LOG) {
+      return;
+    }
+    try {
+      java.lang.System.out.println("[INFO] " + msg);
+    } catch (e) {}
+  },
+  e: function(msg) {
+    try {
+      java.lang.System.out.println("[ERROR] " + msg);
+    } catch (e) {}
+  }
+};
+
+// ===== 5. Utils =====
+function safeString(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value);
+}
+
+function trimString(value) {
+  return safeString(value).replace(/^\s+|\s+$/g, "");
+}
+
+function isArray(value) {
+  return Object.prototype.toString.call(value) === "[object Array]";
+}
+
+function toPlainArray(value) {
+  var result = [];
+  var i;
+  var size;
+
+  if (!value) {
+    return result;
+  }
+
+  if (isArray(value)) {
+    return value.slice(0);
+  }
+
+  try {
+    if (typeof value.length === "number") {
+      for (i = 0; i < value.length; i++) {
+        result.push(value[i]);
+      }
+      return result;
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof value.size === "function" && typeof value.get === "function") {
+      size = value.size();
+      for (i = 0; i < size; i++) {
+        result.push(value.get(i));
+      }
+      return result;
+    }
+  } catch (e2) {}
+
+  return result;
+}
+
+function previewText(text, limit) {
+  var value = safeString(text);
+  var maxLength = limit || 120;
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return value.substring(0, maxLength) + "...";
+}
+
+function nowIsoString() {
+  var sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX");
+  return String(sdf.format(new java.util.Date()));
+}
+
+function nowMillis() {
+  return java.lang.System.currentTimeMillis();
+}
+
+function sleepMs(ms) {
+  try {
+    java.lang.Thread.sleep(ms);
+  } catch (e) {}
+}
+
+function startThread(runFn, threadName) {
+  var label = trimString(threadName) || "async-thread";
+  var runnable = new java.lang.Runnable({
+    run: function() {
+      try {
+        runFn();
+      } catch (e) {
+        Log.e("thread crashed name=" + label + " error=" + safeString(e));
+      }
+    }
+  });
+  var thread = new java.lang.Thread(runnable);
+  try {
+    thread.setName(label);
+  } catch (e2) {}
+  thread.start();
+  return thread;
+}
+
+function getAsyncQueueSize() {
+  try {
+    if (!STATE.asyncTaskQueue) {
+      return 0;
+    }
+    return STATE.asyncTaskQueue.size();
+  } catch (e) {
+    return -1;
+  }
+}
+
+function ensureAsyncWorkersStarted() {
+  var i;
+
+  if (STATE.asyncWorkersStarted) {
+    return;
+  }
+
+  STATE.asyncTaskQueue = new java.util.concurrent.LinkedBlockingQueue(CONFIG.ASYNC_QUEUE_CAPACITY);
+  STATE.asyncWorkersStarted = true;
+
+  for (i = 0; i < CONFIG.ASYNC_WORKER_COUNT; i++) {
+    (function(workerIndex) {
+      startThread(
+        function() {
+          var task;
+          var taskLabel;
+
+          Log.i("async worker started index=" + String(workerIndex));
+          while (true) {
+            try {
+              task = STATE.asyncTaskQueue.take();
+            } catch (takeError) {
+              STATE.asyncLastError =
+                "async queue take failed worker=" + String(workerIndex) +
+                " error=" + safeString(takeError);
+              Log.e(STATE.asyncLastError);
+              sleepMs(500);
+              continue;
+            }
+
+            if (!task || typeof task.run !== "function") {
+              continue;
+            }
+
+            taskLabel = trimString(task.label) || ("async-task-" + String(workerIndex));
+            try {
+              task.run();
+              STATE.asyncExecutedCount += 1;
+            } catch (taskError) {
+              STATE.asyncLastError =
+                "async task failed worker=" + String(workerIndex) +
+                " label=" + taskLabel +
+                " error=" + safeString(taskError);
+              Log.e(STATE.asyncLastError);
+            }
+          }
+        },
+        "PpiraeAsyncWorker-" + String(workerIndex)
+      );
+    })(i + 1);
+  }
+
+  Log.i(
+    "async workers started count=" + String(CONFIG.ASYNC_WORKER_COUNT) +
+    " queueCapacity=" + String(CONFIG.ASYNC_QUEUE_CAPACITY)
+  );
+}
+
+function enqueueAsyncTask(label, runFn) {
+  var normalizedLabel = trimString(label) || "async-task";
+  var offered = false;
+
+  if (typeof runFn !== "function") {
+    return false;
+  }
+
+  ensureAsyncWorkersStarted();
+
+  try {
+    offered = STATE.asyncTaskQueue.offer({
+      label: normalizedLabel,
+      run: runFn
+    });
+  } catch (e) {
+    STATE.asyncLastError =
+      "async enqueue failed label=" + normalizedLabel +
+      " error=" + safeString(e);
+    Log.e(STATE.asyncLastError);
+    return false;
+  }
+
+  if (!offered) {
+    STATE.asyncDroppedCount += 1;
+    STATE.asyncLastError =
+      "async queue full label=" + normalizedLabel +
+      " size=" + String(getAsyncQueueSize());
+    Log.e(STATE.asyncLastError);
+    return false;
+  }
+
+  STATE.asyncEnqueuedCount += 1;
+  return true;
+}
+
+function hasCommandPrefix(text) {
+  return safeString(text).indexOf(CONFIG.COMMAND_PREFIX) === 0;
+}
+
+function containsYouTubeUrl(text) {
+  var value = safeString(text);
+  if (!value) {
+    return false;
+  }
+  return /(?:youtu\.be\/|youtube\.com\/watch|youtube\.com\/shorts\/|m\.youtube\.com\/watch)/i.test(value);
+}
+
+function normalizeMessages(messages) {
+  var result = [];
+  var i;
+  var item;
+
+  if (!messages) {
+    return result;
+  }
+
+  if (!isArray(messages)) {
+    item = trimString(messages);
+    if (item) {
+      result.push(item);
+    }
+    return result;
+  }
+
+  for (i = 0; i < messages.length; i++) {
+    item = trimString(messages[i]);
+    if (item) {
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+function cleanupRecentHandledEvents() {
+  var key;
+  var entry;
+  var ttl;
+  var now = nowMillis();
+  for (key in STATE.recentHandledEvents) {
+    if (!STATE.recentHandledEvents.hasOwnProperty(key)) {
+      continue;
+    }
+    entry = STATE.recentHandledEvents[key];
+    ttl = CONFIG.RECENT_EVENT_TTL_MS;
+    if (entry && typeof entry === "object") {
+      ttl = entry.ttl || ttl;
+      entry = entry.at;
+    }
+    if (now - entry > ttl) {
+      delete STATE.recentHandledEvents[key];
+    }
+  }
+}
+
+function wasEventRecentlyHandled(key) {
+  var normalized = trimString(key);
+  if (!normalized) {
+    return false;
+  }
+  cleanupRecentHandledEvents();
+  return !!STATE.recentHandledEvents[normalized];
+}
+
+function markEventHandled(key, ttlMs) {
+  var normalized = trimString(key);
+  if (!normalized) {
+    return;
+  }
+  cleanupRecentHandledEvents();
+  STATE.recentHandledEvents[normalized] = {
+    at: nowMillis(),
+    ttl: ttlMs || CONFIG.RECENT_EVENT_TTL_MS
+  };
+}
+
+// ===== 6. API2 Chat Accessors =====
+function getChatObject(msg) {
+  return msg && msg.chat ? msg.chat : null;
+}
+
+function getRoomObject(msg) {
+  var chat = getChatObject(msg);
+  return chat && chat.room ? chat.room : null;
+}
+
+function getMessageText(msg) {
+  var chat = getChatObject(msg);
+  if (chat && chat.content !== undefined && chat.content !== null) {
+    return safeString(chat.content);
+  }
+  if (msg && msg.content !== undefined && msg.content !== null) {
+    return safeString(msg.content);
+  }
+  if (msg && msg.message !== undefined && msg.message !== null) {
+    return safeString(msg.message);
+  }
+  return "";
+}
+
+function getRoomName(msg) {
+  var room = getRoomObject(msg);
+  if (room && room.name !== undefined && room.name !== null) {
+    return trimString(room.name);
+  }
+  return trimString(msg ? msg.room : "");
+}
+
+function getChannelId(msg) {
+  var room = getRoomObject(msg);
+  if (room && room.chatId !== undefined && room.chatId !== null) {
+    return trimString(room.chatId);
+  }
+  return trimString(msg ? msg.channelId : "");
+}
+
+function getAuthorName(msg) {
+  var chat = getChatObject(msg);
+  if (chat && chat.sender && chat.sender.name !== undefined && chat.sender.name !== null) {
+    return trimString(chat.sender.name);
+  }
+  return trimString(msg && msg.author ? msg.author.name : "");
+}
+
+function getUserHash(msg) {
+  var chat = getChatObject(msg);
+  if (chat && chat.sender && chat.sender.hash !== undefined && chat.sender.hash !== null) {
+    return trimString(chat.sender.hash);
+  }
+  return trimString(msg && msg.author ? msg.author.hash : "");
+}
+
+function getPackageName(msg) {
+  var chat = getChatObject(msg);
+  if (chat && chat.packageName !== undefined && chat.packageName !== null) {
+    return trimString(chat.packageName);
+  }
+  return trimString(msg ? msg.packageName : "");
+}
+
+function getIsGroupChat(msg) {
+  var room = getRoomObject(msg);
+  if (room && room.isGroupChat !== undefined && room.isGroupChat !== null) {
+    return !!room.isGroupChat;
+  }
+  return !!(msg && msg.isGroupChat);
+}
+
+function getLogId(msg) {
+  var chat = getChatObject(msg);
+  if (chat && chat.chatLogId !== undefined && chat.chatLogId !== null) {
+    return trimString(chat.chatLogId);
+  }
+  return trimString(msg ? msg.logId : "");
+}
+
+// ===== 7. Admin Command Parsing =====
+function isKnownAdminCommand(command) {
+  var value = trimString(command).toLowerCase();
+  return (
+    value === "help" ||
+    value === "도움말" ||
+    value === "핑" ||
+    value === "ping" ||
+    value === "방목록" ||
+    value === "방검색" ||
+    value === "yaml" ||
+    value === "연동상태" ||
+    value === "폴링상태" ||
+    value === "폴링시작" ||
+    value === "폴링중지" ||
+    value === "폴링재시작" ||
+    value === "동기화" ||
+    value === "폴링한번" ||
+    value === "내방" ||
+    value === "채널확인"
+  );
+}
+
+function parseCommandText(text) {
+  var trimmed = trimString(text);
+  var body;
+  var tokens;
+
+  if (!hasCommandPrefix(trimmed)) {
+    return null;
+  }
+
+  body = trimString(trimmed.substring(CONFIG.COMMAND_PREFIX.length));
+  if (!body) {
+    return null;
+  }
+
+  tokens = body.split(/\s+/);
+  return {
+    command: trimString(tokens[0]),
+    args: tokens.slice(1)
+  };
+}
+
+function parseAdminCommandText(text) {
+  var parsed = parseCommandText(text);
+  var trimmed = trimString(text);
+  var tokens;
+  var command;
+
+  if (parsed) {
+    return parsed;
+  }
+
+  if (!trimmed) {
+    return null;
+  }
+
+  tokens = trimmed.split(/\s+/);
+  command = trimString(tokens[0]);
+  if (!isKnownAdminCommand(command)) {
+    return null;
+  }
+
+  return {
+    command: command,
+    args: tokens.slice(1)
+  };
+}
+
+function parseCommandEventPayload(chat) {
+  var command = trimString(chat && chat.command);
+  var args = toPlainArray(chat && chat.args);
+
+  if (command) {
+    return {
+      command: command,
+      args: args
+    };
+  }
+
+  return parseCommandText(getMessageText(chat));
+}
+
+function isAdminRoom(msg) {
+  var roomName = getRoomName(msg);
+  var channelId = getChannelId(msg);
+
+  if (trimString(CONFIG.ADMIN_CHANNEL_ID) && trimString(channelId) === trimString(CONFIG.ADMIN_CHANNEL_ID)) {
+    return true;
+  }
+
+  return roomName === CONFIG.ADMIN_ROOM_NAME;
+}
+
+// ===== 8. Room Cache =====
+function addRoomOrder(channelId) {
+  var i;
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    if (STATE.roomOrder[i] === channelId) {
+      STATE.roomOrder.splice(i, 1);
+      break;
+    }
+  }
+  STATE.roomOrder.unshift(channelId);
+  while (STATE.roomOrder.length > CONFIG.MAX_RECENT_ROOMS) {
+    STATE.roomOrder.pop();
+  }
+}
+
+function roomCount() {
+  var count = 0;
+  var key;
+  for (key in STATE.roomsByChannelId) {
+    if (STATE.roomsByChannelId.hasOwnProperty(key)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function buildRoomLine(item, index) {
+  return (
+    (index + 1) + ". " + item.room +
+    " | channelId=" + item.channelId +
+    " | group=" + String(item.isGroupChat) +
+    " | lastSeen=" + item.lastSeenAt
+  );
+}
+
+function cacheRoom(msg) {
+  var channelId = getChannelId(msg);
+  var roomName = getRoomName(msg);
+  var item;
+  var isNew = false;
+
+  if (!channelId || !roomName) {
+    return null;
+  }
+
+  item = STATE.roomsByChannelId[channelId];
+  if (!item) {
+    item = {};
+    isNew = true;
+  }
+
+  item.channelId = channelId;
+  item.room = roomName;
+  item.isGroupChat = getIsGroupChat(msg);
+  item.packageName = getPackageName(msg) || CONFIG.SOCKET_PACKAGE_NAME;
+  item.lastAuthor = getAuthorName(msg);
+  item.lastLogId = getLogId(msg);
+  item.lastSeenAt = nowIsoString();
+
+  STATE.roomsByChannelId[channelId] = item;
+  addRoomOrder(channelId);
+
+  if (isNew && CONFIG.NOTIFY_ADMIN_ON_NEW_ROOM && item.room !== CONFIG.ADMIN_ROOM_NAME) {
+    notifyAdminAsync(
+      "[새 방 감지]\n" +
+      "room: " + item.room + "\n" +
+      "channelId: " + item.channelId + "\n" +
+      "isGroupChat: " + String(item.isGroupChat)
+    );
+  }
+
+  return item;
+}
+
+function getRecentRoomsText(limit) {
+  var lines = [];
+  var i;
+  var item;
+  var max = limit || 15;
+
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    if (lines.length >= max) {
+      break;
+    }
+    item = STATE.roomsByChannelId[STATE.roomOrder[i]];
+    if (!item) {
+      continue;
+    }
+    lines.push(buildRoomLine(item, lines.length));
+  }
+
+  if (lines.length === 0) {
+    return "캐시된 방이 없다.";
+  }
+  return "[최근 감지된 방]\n" + lines.join("\n");
+}
+
+function searchRoomsText(keyword) {
+  var lines = [];
+  var i;
+  var item;
+  var lower = trimString(keyword).toLowerCase();
+
+  if (!lower) {
+    return "검색어가 비어 있다.";
+  }
+
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    item = STATE.roomsByChannelId[STATE.roomOrder[i]];
+    if (!item) {
+      continue;
+    }
+    if (
+      safeString(item.room).toLowerCase().indexOf(lower) >= 0 ||
+      safeString(item.channelId).indexOf(lower) >= 0
+    ) {
+      lines.push(buildRoomLine(item, lines.length));
+    }
+  }
+
+  if (lines.length === 0) {
+    return "검색 결과가 없다: " + keyword;
+  }
+  return "[검색 결과]\n" + lines.join("\n");
+}
+
+function findRoomItem(keywordOrChannelId) {
+  var keyword = trimString(keywordOrChannelId);
+  var i;
+  var item;
+  var lower;
+
+  if (!keyword) {
+    return null;
+  }
+
+  if (STATE.roomsByChannelId[keyword]) {
+    return STATE.roomsByChannelId[keyword];
+  }
+
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    item = STATE.roomsByChannelId[STATE.roomOrder[i]];
+    if (item && safeString(item.room) === keyword) {
+      return item;
+    }
+  }
+
+  lower = keyword.toLowerCase();
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    item = STATE.roomsByChannelId[STATE.roomOrder[i]];
+    if (item && safeString(item.room).toLowerCase().indexOf(lower) >= 0) {
+      return item;
+    }
+  }
+
+  return null;
+}
+
+function escapeYamlString(text) {
+  return safeString(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
+}
+
+function buildYamlSnippet(item, roomKey) {
+  var key = trimString(roomKey) || "sample_room_key";
+  var lines = [];
+  lines.push("rooms:");
+  lines.push("  " + key + ":");
+  lines.push("    display_name: \"" + escapeYamlString(item.room) + "\"");
+  lines.push("    channel_id: \"" + escapeYamlString(item.channelId) + "\"");
+  return lines.join("\n");
+}
+
+// ===== 9. Send Helpers =====
+function botSendRoom(roomName, text, packageName) {
+  var resolvedRoomName = trimString(roomName);
+  var resolvedPackage = trimString(packageName) || CONFIG.SOCKET_PACKAGE_NAME;
+  var result = false;
+
+  if (!resolvedRoomName || !trimString(text)) {
+    return false;
+  }
+
+  try {
+    result = bot.send(resolvedRoomName, text, resolvedPackage);
+    if (result === false) {
+      Log.e(
+        "bot.send returned false room=" + resolvedRoomName +
+        " package=" + resolvedPackage
+      );
+      return false;
+    }
+    return true;
+  } catch (e) {
+    Log.e(
+      "bot.send failed room=" + resolvedRoomName +
+      " package=" + resolvedPackage +
+      " error=" + safeString(e)
+    );
+    return false;
+  }
+}
+
+function sendMessagesToRoom(roomName, messages, packageName, traceId) {
+  var normalized = normalizeMessages(messages);
+  var i;
+  var ok = true;
+  var sentCount = 0;
+  var lastError = "";
+
+  for (i = 0; i < normalized.length; i++) {
+    if (!botSendRoom(roomName, normalized[i], packageName)) {
+      ok = false;
+      lastError =
+        "bot.send failed at index=" + String(i + 1) +
+        " traceId=" + safeString(traceId);
+      break;
+    }
+    sentCount += 1;
+    if (i < normalized.length - 1) {
+      sleepMs(CONFIG.SEND_DELAY_MS);
+    }
+  }
+
+  return {
+    ok: ok,
+    sentCount: sentCount,
+    error: ok ? "" : lastError
+  };
+}
+
+function sendMessagesToCurrentRoomAsync(msg, messages, traceId) {
+  var roomName = getRoomName(msg);
+  var packageName = getPackageName(msg) || CONFIG.SOCKET_PACKAGE_NAME;
+  if (!enqueueAsyncTask("send_current_room:" + safeString(traceId), function() {
+    sendMessagesToRoom(roomName, messages, packageName, traceId);
+  })) {
+    Log.e("failed to enqueue current room send traceId=" + safeString(traceId));
+  }
+}
+
+function notifyAdmin(text) {
+  botSendRoom(CONFIG.ADMIN_ROOM_NAME, text, CONFIG.SOCKET_PACKAGE_NAME);
+}
+
+function notifyAdminAsync(text) {
+  if (!enqueueAsyncTask("notify_admin", function() {
+    notifyAdmin(text);
+  })) {
+    notifyAdmin(text);
+  }
+}
+
+function replyAdminCommand(msg, text) {
+  var roomName = getRoomName(msg) || CONFIG.ADMIN_ROOM_NAME;
+  var packageName = getPackageName(msg) || CONFIG.SOCKET_PACKAGE_NAME;
+  if (!enqueueAsyncTask("reply_admin_command", function() {
+    sendMessagesToRoom(roomName, [text], packageName, "admin-command");
+  })) {
+    sendMessagesToRoom(roomName, [text], packageName, "admin-command");
+  }
+}
+
+// ===== 10. HTTP =====
+function httpPostJson(url, payload) {
+  var response;
+  var body;
+  var parsed;
+
+  try {
+    response = org.jsoup.Jsoup.connect(url)
+      .ignoreContentType(true)
+      .ignoreHttpErrors(true)
+      .header("Content-Type", "application/json; charset=UTF-8")
+      .header("Accept", "application/json")
+      .requestBody(JSON.stringify(payload))
+      .method(org.jsoup.Connection.Method.POST)
+      .timeout(CONFIG.HTTP_TIMEOUT_MS)
+      .execute();
+
+    body = response.body();
+    parsed = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch (parseError) {}
+
+    return {
+      ok: response.statusCode() >= 200 && response.statusCode() < 300,
+      status: response.statusCode(),
+      body: body,
+      json: parsed,
+      error: ""
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      status: -1,
+      body: "",
+      json: null,
+      error: safeString(e)
+    };
+  }
+}
+
+function postMessageEvent(msg) {
+  return httpPostJson(
+    CONFIG.API_BASE_URL + "/events/message",
+    {
+      room_name: getRoomName(msg),
+      channel_id: getChannelId(msg),
+      sender: getAuthorName(msg),
+      message: getMessageText(msg),
+      log_id: getLogId(msg),
+      package_name: getPackageName(msg),
+      user_hash: getUserHash(msg),
+      is_group_chat: getIsGroupChat(msg),
+      received_at: nowIsoString()
+    }
+  );
+}
+
+function postPollingPull(limit) {
+  return httpPostJson(
+    CONFIG.API_BASE_URL + "/polling/pull",
+    {
+      limit: limit || CONFIG.POLLING_LIMIT
+    }
+  );
+}
+
+function postPollingAck(messageIds, success, incrementRetry) {
+  return httpPostJson(
+    CONFIG.API_BASE_URL + "/polling/ack",
+    {
+      message_ids: messageIds,
+      success: !!success,
+      increment_retry: !!incrementRetry
+    }
+  );
+}
+
+// ===== 11. Incoming Event Handling =====
+function shouldForwardToFastApi(msg) {
+  var messageText = getMessageText(msg);
+  var packageName = getPackageName(msg);
+
+  if (!messageText) {
+    return false;
+  }
+
+  if (packageName && packageName !== CONFIG.SOCKET_PACKAGE_NAME) {
+    return false;
+  }
+
+  if (hasCommandPrefix(messageText)) {
+    return false;
+  }
+
+  if (CONFIG.ONLY_FORWARD_YOUTUBE && !containsYouTubeUrl(messageText)) {
+    return false;
+  }
+
+  return true;
+}
+
+function handleMessageEventResponse(msg, response) {
+  var data;
+  var messages;
+  var delivery;
+  var deliveryVia;
+  var traceId;
+
+  if (!response.ok || !response.json) {
+    notifyAdminAsync(
+      "[이벤트전달실패]\n" +
+      "room: " + getRoomName(msg) + "\n" +
+      "channelId: " + getChannelId(msg) + "\n" +
+      "author: " + getAuthorName(msg) + "\n" +
+      "logId: " + getLogId(msg) + "\n" +
+      "status: " + String(response.status) + "\n" +
+      "error: " + safeString(response.error)
+    );
+    return;
+  }
+
+  data = response.json;
+  if (!data.ok) {
+    notifyAdminAsync(
+      "[이벤트업무오류]\n" +
+      "room: " + getRoomName(msg) + "\n" +
+      "channelId: " + getChannelId(msg) + "\n" +
+      "author: " + getAuthorName(msg) + "\n" +
+      "logId: " + getLogId(msg) + "\n" +
+      "error: " + safeString(data.error)
+    );
+    return;
+  }
+
+  traceId = trimString(data.trace_id) || trimString(getLogId(msg)) || nowIsoString();
+  messages = normalizeMessages(data.messages);
+  delivery = data.meta && typeof data.meta === "object" ? data.meta.delivery : null;
+  deliveryVia = trimString(delivery && delivery.via);
+
+  if (deliveryVia === "polling_outbox") {
+    triggerPollingSyncNow("event_response_queued");
+  }
+
+  if (messages.length > 0) {
+    sendMessagesToCurrentRoomAsync(msg, messages, traceId);
+  }
+}
+
+function forwardMessageAsync(msg) {
+  if (!enqueueAsyncTask("forward_message_event:" + getLogId(msg), function() {
+    var response;
+    try {
+      response = postMessageEvent(msg);
+      handleMessageEventResponse(msg, response);
+    } catch (e) {
+      notifyAdminAsync(
+        "[이벤트예외]\n" +
+        "room: " + getRoomName(msg) + "\n" +
+        "channelId: " + getChannelId(msg) + "\n" +
+        "author: " + getAuthorName(msg) + "\n" +
+        "logId: " + getLogId(msg) + "\n" +
+        "error: " + safeString(e)
+      );
+    }
+  })) {
+    notifyAdmin(
+      "[이벤트큐포화]\n" +
+      "room: " + getRoomName(msg) + "\n" +
+      "channelId: " + getChannelId(msg) + "\n" +
+      "logId: " + getLogId(msg)
+    );
+  }
+}
+
+// ===== 12. Polling =====
+function buildStatusText() {
+  return (
+    "[연동 상태]\n" +
+    "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
+    "api: " + CONFIG.API_BASE_URL + "\n" +
+    "cachedRooms: " + String(roomCount()) + "\n" +
+    "deliveryMode: polling_outbox\n" +
+    "onlyForwardYouTube: " + String(CONFIG.ONLY_FORWARD_YOUTUBE)
+  );
+}
+
+function buildPollingStatusText() {
+  return (
+    "[폴링 상태]\n" +
+    "enabledSetting: " + String(CONFIG.POLLING_ENABLED) + "\n" +
+    "autoStart: " + String(CONFIG.POLLING_AUTO_START) + "\n" +
+    "running: " + String(STATE.pollingThreadRunning) + "\n" +
+    "busy: " + String(STATE.pollingBusy) + "\n" +
+    "intervalMs: " + String(CONFIG.POLLING_INTERVAL_MS) + "\n" +
+    "limit: " + String(CONFIG.POLLING_LIMIT) + "\n" +
+    "cycleCount: " + String(STATE.pollingCycleCount) + "\n" +
+    "lastStartedAt: " + safeString(STATE.pollingLastStartedAt) + "\n" +
+    "lastPolledAt: " + safeString(STATE.pollingLastPolledAt) + "\n" +
+    "lastSuccessAt: " + safeString(STATE.pollingLastSuccessAt) + "\n" +
+    "lastPulledCount: " + String(STATE.pollingLastPulledCount) + "\n" +
+    "lastSentCount: " + String(STATE.pollingLastSentCount) + "\n" +
+    "lastAckSuccessCount: " + String(STATE.pollingLastAckSuccessCount) + "\n" +
+    "lastAckFailCount: " + String(STATE.pollingLastAckFailCount) + "\n" +
+    "lastError: " + safeString(STATE.pollingLastError) + "\n" +
+    "asyncWorkersStarted: " + String(STATE.asyncWorkersStarted) + "\n" +
+    "asyncQueueSize: " + String(getAsyncQueueSize()) + "\n" +
+    "asyncEnqueuedCount: " + String(STATE.asyncEnqueuedCount) + "\n" +
+    "asyncExecutedCount: " + String(STATE.asyncExecutedCount) + "\n" +
+    "asyncDroppedCount: " + String(STATE.asyncDroppedCount) + "\n" +
+    "asyncLastError: " + safeString(STATE.asyncLastError)
+  );
+}
+
+function buildCurrentRoomText(msg) {
+  return (
+    "[현재 방]\n" +
+    "room: " + getRoomName(msg) + "\n" +
+    "channelId: " + getChannelId(msg) + "\n" +
+    "isGroupChat: " + String(getIsGroupChat(msg)) + "\n" +
+    "logId: " + getLogId(msg)
+  );
+}
+
+function buildHelpText() {
+  var lines = [];
+  lines.push("[관리자 명령]");
+  lines.push("도움말 / @도움말");
+  lines.push("핑 / @핑");
+  lines.push("연동상태 / @연동상태");
+  lines.push("폴링상태 / @폴링상태");
+  lines.push("폴링시작 / @폴링시작");
+  lines.push("폴링중지 / @폴링중지");
+  lines.push("폴링재시작 / @폴링재시작");
+  lines.push("동기화 / @동기화");
+  lines.push("방목록 / @방목록");
+  lines.push("방검색 키워드 / @방검색 키워드");
+  lines.push("yaml room_key 검색어 / @yaml room_key 검색어");
+  lines.push("내방 / @내방");
+  return lines.join("\n");
+}
+
+function notifyPollingError(text) {
+  var normalized = safeString(text);
+  var now = nowMillis();
+
+  if (!CONFIG.POLLING_NOTIFY_ADMIN) {
+    return;
+  }
+
+  if (
+    STATE.pollingLastErrorNotifiedAtMs &&
+    now - STATE.pollingLastErrorNotifiedAtMs < CONFIG.POLLING_ERROR_NOTIFY_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  STATE.pollingLastErrorNotifiedAtMs = now;
+  notifyAdminAsync("[폴링오류]\n" + normalized);
+}
+
+function normalizeOutboxItems(data) {
+  var meta = data && data.meta ? data.meta : null;
+  var rawItems = meta && isArray(meta.items) ? meta.items : [];
+  var items = [];
+  var i;
+
+  for (i = 0; i < rawItems.length; i++) {
+    if (rawItems[i] && typeof rawItems[i] === "object") {
+      items.push(rawItems[i]);
+    }
+  }
+
+  return items;
+}
+
+function resolveOutboxTarget(item) {
+  var roomName = trimString(item && item.room_name);
+  var channelId = trimString(item && item.channel_id);
+  var cached = null;
+
+  if (channelId && STATE.roomsByChannelId[channelId]) {
+    cached = STATE.roomsByChannelId[channelId];
+    return {
+      roomName: trimString(cached.room),
+      channelId: trimString(cached.channelId || channelId),
+      packageName: trimString(cached.packageName) || CONFIG.SOCKET_PACKAGE_NAME
+    };
+  }
+
+  if (!roomName) {
+    cached = findRoomItem(channelId || trimString(item && item.room_key));
+    if (cached) {
+      roomName = trimString(cached.room);
+      channelId = trimString(cached.channelId || channelId);
+    }
+  }
+
+  if (!roomName) {
+    return null;
+  }
+
+  return {
+    roomName: roomName,
+    channelId: channelId,
+    packageName: trimString(cached && cached.packageName) || CONFIG.SOCKET_PACKAGE_NAME
+  };
+}
+
+function extractOutboxMessages(item) {
+  if (isArray(item && item.messages)) {
+    return normalizeMessages(item.messages);
+  }
+  return normalizeMessages(item && item.message);
+}
+
+function ackOutboxItem(messageId, success, incrementRetry, detail) {
+  var response = postPollingAck([messageId], success, incrementRetry);
+  if (!response.ok || !response.json || !response.json.ok) {
+    STATE.pollingLastError =
+      "ack failed id=" + String(messageId) +
+      " success=" + String(!!success) +
+      " detail=" + safeString(detail) +
+      " status=" + String(response.status) +
+      " error=" + safeString(response.error);
+    notifyPollingError(STATE.pollingLastError);
+    return false;
+  }
+  return true;
+}
+
+function runSinglePollingCycle(triggerReason) {
+  var response;
+  var data;
+  var items;
+  var i;
+  var item;
+  var target;
+  var messages;
+  var sendResult;
+  var ackOk;
+  var sentCount = 0;
+  var ackSuccessCount = 0;
+  var ackFailCount = 0;
+
+  if (!CONFIG.POLLING_ENABLED) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: "polling disabled"
+    };
+  }
+
+  if (STATE.pollingBusy) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: "polling busy"
+    };
+  }
+
+  STATE.pollingBusy = true;
+  STATE.pollingCycleCount += 1;
+  STATE.pollingLastPolledAt = nowIsoString();
+  STATE.pollingLastError = "";
+
+  try {
+    response = postPollingPull(CONFIG.POLLING_LIMIT);
+    if (!response.ok || !response.json) {
+      STATE.pollingLastError =
+        "pull failed trigger=" + safeString(triggerReason) +
+        " status=" + String(response.status) +
+        " error=" + safeString(response.error);
+      notifyPollingError(STATE.pollingLastError);
+      return {
+        ok: false,
+        pulled: 0,
+        sent: 0,
+        error: STATE.pollingLastError
+      };
+    }
+
+    data = response.json;
+    if (!data.ok) {
+      STATE.pollingLastError =
+        "pull business error trigger=" + safeString(triggerReason) +
+        " error=" + safeString(data.error);
+      notifyPollingError(STATE.pollingLastError);
+      return {
+        ok: false,
+        pulled: 0,
+        sent: 0,
+        error: STATE.pollingLastError
+      };
+    }
+
+    items = normalizeOutboxItems(data);
+    STATE.pollingLastPulledCount = items.length;
+
+    for (i = 0; i < items.length; i++) {
+      item = items[i];
+      target = resolveOutboxTarget(item);
+      messages = extractOutboxMessages(item);
+
+      if (!target || !target.roomName || messages.length === 0) {
+        ackOk = ackOutboxItem(
+          item.id,
+          false,
+          CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE,
+          "invalid target or empty messages"
+        );
+        if (ackOk) {
+          ackFailCount += 1;
+        }
+        continue;
+      }
+
+      sendResult = sendMessagesToRoom(
+        target.roomName,
+        messages,
+        target.packageName,
+        trimString(item.trace_id) || ("outbox-" + String(item.id))
+      );
+
+      if (sendResult.ok) {
+        sentCount += sendResult.sentCount;
+      }
+
+      ackOk = ackOutboxItem(
+        item.id,
+        sendResult.ok,
+        CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE && !sendResult.ok,
+        sendResult.error
+      );
+
+      if (ackOk) {
+        if (sendResult.ok) {
+          ackSuccessCount += 1;
+        } else {
+          ackFailCount += 1;
+        }
+      }
+
+      if (!sendResult.ok) {
+        STATE.pollingLastError =
+          "delivery failed id=" + String(item.id) +
+          " room=" + safeString(target.roomName) +
+          " error=" + safeString(sendResult.error);
+        Log.e(STATE.pollingLastError);
+      }
+    }
+
+    STATE.pollingLastSuccessAt = nowIsoString();
+    STATE.pollingLastSentCount = sentCount;
+    STATE.pollingLastAckSuccessCount = ackSuccessCount;
+    STATE.pollingLastAckFailCount = ackFailCount;
+
+    return {
+      ok: true,
+      pulled: items.length,
+      sent: sentCount,
+      ackSuccessCount: ackSuccessCount,
+      ackFailCount: ackFailCount
+    };
+  } catch (e) {
+    STATE.pollingLastError =
+      "polling exception trigger=" + safeString(triggerReason) +
+      " error=" + safeString(e);
+    notifyPollingError(STATE.pollingLastError);
+    return {
+      ok: false,
+      pulled: 0,
+      sent: 0,
+      error: STATE.pollingLastError
+    };
+  } finally {
+    STATE.pollingBusy = false;
+  }
+}
+
+function triggerPollingSyncNow(triggerReason) {
+  return enqueueAsyncTask("polling_sync:" + safeString(triggerReason || "manual"), function() {
+    runSinglePollingCycle(triggerReason || "manual");
+  });
+}
+
+function startPollingLoop() {
+  if (!CONFIG.POLLING_ENABLED) {
+    return false;
+  }
+  if (STATE.pollingThreadRunning) {
+    return false;
+  }
+
+  STATE.pollingEnabled = true;
+  STATE.pollingThreadRunning = true;
+  STATE.pollingLastStartedAt = nowIsoString();
+
+  startThread(function() {
+    var remaining;
+    Log.i("polling loop started intervalMs=" + String(CONFIG.POLLING_INTERVAL_MS));
+    try {
+      while (STATE.pollingEnabled) {
+        runSinglePollingCycle("loop");
+        remaining = Math.max(1000, CONFIG.POLLING_INTERVAL_MS);
+        while (STATE.pollingEnabled && remaining > 0) {
+          sleepMs(Math.min(1000, remaining));
+          remaining -= 1000;
+        }
+      }
+    } finally {
+      STATE.pollingThreadRunning = false;
+      Log.i("polling loop stopped");
+    }
+  });
+
+  return true;
+}
+
+function stopPollingLoop() {
+  STATE.pollingEnabled = false;
+}
+
+function restartPollingLoop() {
+  stopPollingLoop();
+  startThread(function() {
+    var remaining = 5000;
+    while (STATE.pollingThreadRunning && remaining > 0) {
+      sleepMs(250);
+      remaining -= 250;
+    }
+    startPollingLoop();
+  });
+}
+
+function ensurePollingLoopStarted() {
+  if (!CONFIG.POLLING_AUTO_START) {
+    return;
+  }
+  startPollingLoop();
+}
+
+// ===== 13. Admin Commands =====
+function handleAdminCommand(msg, parsedCommand) {
+  var command = trimString(parsedCommand.command);
+  var args = parsedCommand.args || [];
+  var keyword;
+  var roomKey;
+  var item;
+  var dedupeKey;
+  var dedupeTtl = CONFIG.RECENT_COMMAND_TTL_MS;
+
+  if (!command) {
+    return false;
+  }
+
+  dedupeKey =
+    "cmd:" +
+    getChannelId(msg) +
+    ":" +
+    command.toLowerCase() +
+    ":" +
+    trimString(args.join(" "));
+
+  if (wasEventRecentlyHandled(dedupeKey)) {
+    return false;
+  }
+  markEventHandled(dedupeKey, dedupeTtl);
+
+  if (command === "도움말" || command.toLowerCase() === "help") {
+    replyAdminCommand(msg, buildHelpText());
+    return true;
+  }
+
+  if (command === "핑" || command.toLowerCase() === "ping") {
+    replyAdminCommand(
+      msg,
+      "[핑]\n" +
+      "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
+      "room: " + getRoomName(msg) + "\n" +
+      "channelId: " + getChannelId(msg) + "\n" +
+      "isGroupChat: " + String(getIsGroupChat(msg))
+    );
+    return true;
+  }
+
+  if (command === "방목록") {
+    replyAdminCommand(msg, getRecentRoomsText(20));
+    return true;
+  }
+
+  if (command === "방검색") {
+    keyword = trimString(args.join(" "));
+    if (!keyword) {
+      replyAdminCommand(msg, "사용법: 방검색 키워드");
+      return true;
+    }
+    replyAdminCommand(msg, searchRoomsText(keyword));
+    return true;
+  }
+
+  if (command === "yaml") {
+    if (!args || args.length < 2) {
+      replyAdminCommand(msg, "사용법: yaml room_key 검색어\n예: yaml stock_openchat_alpha 가족");
+      return true;
+    }
+    roomKey = safeString(args[0]);
+    keyword = trimString(args.slice(1).join(" "));
+    item = findRoomItem(keyword);
+    if (!item) {
+      replyAdminCommand(msg, "대상 방을 찾지 못했다: " + keyword);
+      return true;
+    }
+    replyAdminCommand(msg, buildYamlSnippet(item, roomKey));
+    return true;
+  }
+
+  if (command === "연동상태") {
+    replyAdminCommand(msg, buildStatusText() + "\n\n" + buildPollingStatusText());
+    return true;
+  }
+
+  if (command === "폴링상태") {
+    replyAdminCommand(msg, buildPollingStatusText());
+    return true;
+  }
+
+  if (command === "폴링시작") {
+    startPollingLoop();
+    triggerPollingSyncNow("admin_start");
+    replyAdminCommand(msg, "폴링을 시작했다.\n\n" + buildPollingStatusText());
+    return true;
+  }
+
+  if (command === "폴링중지") {
+    stopPollingLoop();
+    replyAdminCommand(msg, "폴링을 중지했다.\n\n" + buildPollingStatusText());
+    return true;
+  }
+
+  if (command === "폴링재시작") {
+    restartPollingLoop();
+    triggerPollingSyncNow("admin_restart");
+    replyAdminCommand(msg, "폴링을 재시작했다.\n\n" + buildPollingStatusText());
+    return true;
+  }
+
+  if (command === "동기화" || command === "폴링한번") {
+    triggerPollingSyncNow("admin_sync");
+    replyAdminCommand(msg, "폴링 동기화를 요청했다.\n\n" + buildPollingStatusText());
+    return true;
+  }
+
+  if (command === "내방" || command === "채널확인") {
+    replyAdminCommand(msg, buildCurrentRoomText(msg));
+    return true;
+  }
+
+  return false;
+}
+
+// ===== 14. Event Handlers =====
+function onMessage(chat) {
+  var messageText;
+  var parsedCommand;
+
+  try {
+    cacheRoom(chat);
+    messageText = getMessageText(chat);
+
+    if (isAdminRoom(chat)) {
+      parsedCommand = parseAdminCommandText(messageText);
+      if (parsedCommand) {
+        handleAdminCommand(chat, parsedCommand);
+        return;
+      }
+    }
+
+    if (shouldForwardToFastApi(chat)) {
+      forwardMessageAsync(chat);
+    }
+  } catch (e) {
+    Log.e("onMessage error: " + safeString(e));
+    if (isAdminRoom(chat)) {
+      notifyAdminAsync("[메시지이벤트오류]\nerror: " + safeString(e));
+    }
+  }
+}
+
+function onCommand(chat) {
+  var parsedCommand;
+
+  try {
+    cacheRoom(chat);
+    if (!isAdminRoom(chat)) {
+      return;
+    }
+
+    parsedCommand = parseCommandEventPayload(chat);
+    if (!parsedCommand) {
+      return;
+    }
+
+    handleAdminCommand(chat, parsedCommand);
+  } catch (e) {
+    Log.e("onCommand error: " + safeString(e));
+    if (isAdminRoom(chat)) {
+      notifyAdminAsync("[명령이벤트오류]\nerror: " + safeString(e));
+    }
+  }
+}
+
+// ===== 15. Register =====
+bot.setCommandPrefix(CONFIG.COMMAND_PREFIX);
+bot.addListener(Event.MESSAGE, onMessage);
+bot.addListener(Event.COMMAND, onCommand);
+ensurePollingLoopStarted();
+ensureAsyncWorkersStarted();
+
+// ===== 16. Startup =====
+Log.i("==================");
+Log.i((ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + " loaded");
+Log.i("API_BASE_URL=" + CONFIG.API_BASE_URL);
+Log.i("DELIVERY_MODE=polling_outbox");
+Log.i("POLLING_AUTO_START=" + String(CONFIG.POLLING_AUTO_START));
+Log.i("POLLING_INTERVAL_MS=" + String(CONFIG.POLLING_INTERVAL_MS));
+Log.i("ASYNC_WORKER_COUNT=" + String(CONFIG.ASYNC_WORKER_COUNT));
+Log.i("==================");
+
+if (CONFIG.STARTUP_NOTIFY_ADMIN) {
+  notifyAdminAsync(
+    "[삐래봇 로드됨]\n" +
+    "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
+    "adminRoom: " + CONFIG.ADMIN_ROOM_NAME + "\n" +
+    "adminChannelId: " + CONFIG.ADMIN_CHANNEL_ID + "\n" +
+    "api: " + CONFIG.API_BASE_URL + "\n" +
+    "mode: polling_outbox"
+  );
+}
