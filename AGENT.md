@@ -95,6 +95,10 @@ socket listener, debugRoom 기반 push, 스마트폰 소켓 서버 대기 구조
 - 필요하면 관리자 방 또는 1:1 방에서 수동 동기화 명령을 실행할 수 있게 설계
 - 가능한 한 메신저봇R 쪽은 thin client를 유지하되, polling client 역할은 포함해라
 - 메시지 전송은 실제 메신저봇R에서 수행하며, API2 환경 제약을 고려해 안정적인 전송 방식을 사용하도록 설계해라
+- 일회성 비동기 작업은 요청마다 raw thread를 새로 만들지 말고, bounded queue + 고정 worker 수로 처리해라
+- polling loop는 전용 장수 스레드 하나로 유지하고, 관리자 알림/수동 동기화/포워딩 같은 보조 작업은 별도 worker queue로 분리해라
+- 관리자 명령 `@폴링상태`만으로 polling loop 재기동 시각, async queue 크기, drop 수, 마지막 async 오류를 확인할 수 있게 설계해라
+- `bot.send(...)` 반환값만으로 실제 KakaoTalk 수신 성공을 단정하지 말고, false negative 가능성을 운영 로그와 함께 고려해라
 
 ## B. FastAPI 서버 측 역할
 - REST API 제공
@@ -232,6 +236,8 @@ socket listener, debugRoom 기반 push, 스마트폰 소켓 서버 대기 구조
 - 메신저봇R과 FastAPI 사이 통신 실패 시 복구 전략 포함
 - polling 실패 시 backlog 누적, 재시도, 관리자 알림 전략 포함
 - polling 폭주 또는 무한 루프 방지 전략 포함
+- 메신저봇R 쪽 일회성 비동기 작업은 bounded concurrency 전략으로 설계해 thread 누적을 막아라
+- 앱 재시작 후에도 관리자 명령으로 polling loop 재기동 여부와 async queue 상태를 바로 점검할 수 있어야 한다
 
 # 8. 코드 스타일 요구사항
 

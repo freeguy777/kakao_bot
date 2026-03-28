@@ -1,6 +1,6 @@
 # Kakao Delivery Incident & Maintenance Log
 
-Last updated: 2026-03-26
+Last updated: 2026-03-28
 
 ## Purpose
 
@@ -75,18 +75,23 @@ Last updated: 2026-03-26
 - polling/outbox 경로에서는 관리자방 기준 `3000`자 단일 메시지 실제 수신이 확인됐다.
 - 기본 `message_length_limit`은 현재 `3000`이다.
 - 긴 메시지 분할은 문단 경계를 유지하되, 현재 청크를 최대한 채우는 방식으로 보정됐다.
+- phone-side 일회성 비동기 작업은 raw `startThread()` 남발 대신 bounded async worker queue로 교체됐다.
+- `@폴링상태`는 polling loop 상태 외에 async worker/queue 진단값도 함께 보여준다.
+- `bot.send(...)`가 실패로 판정돼도 실제 KakaoTalk 방에는 메시지가 도착하는 false negative가 관측됐다.
 
 현재 열려 있는 유지보수 이슈:
 
 - polling thread가 메신저봇R 재시작/스크립트 재로딩 후 안정적으로 재기동되는지 실운영 검증 필요
 - outbox ack 실패 시 inflight 재처리와 중복 전송 가능성에 대한 운영 관찰 필요
 - 길이 제한보다 polling 주기, ack 안정성, room 식별 정보 품질이 더 중요한 운영 포인트가 됨
+- Android 또는 메신저봇 앱 프로세스가 일정 시간 뒤 죽었다가 다시 살아나는지 별도 관찰 필요
 
 현재 운영 권장:
 
 - 서버 주도 메시지는 `deliver_room_messages(...)`로 직접 전송하지 말고 outbox 적재 흐름을 기준으로 본다.
 - 메신저봇R에서는 polling loop가 살아 있는지 `@폴링상태`로 먼저 확인한다.
 - 긴 메시지는 우선 `3000`자까지 단일 메시지로 유지하고, 초과 시에만 분할한다.
+- `@폴링상태` 확인 시 `lastStartedAt`, `lastPolledAt`, `asyncQueueSize`, `asyncDroppedCount`, `asyncLastError`를 같이 본다.
 
 ## Known Constraints
 
@@ -96,6 +101,8 @@ Last updated: 2026-03-26
 - debugRoom/control payload 자체의 크기 또는 처리 방식이 추가 제약일 수 있다.
 - phone-side bridge에서 `ack`가 오지 않거나 `null`이어도 서버는 실패로 취급하지 않는다.
 - 청크별 길이가 안전 범위 안이어도, 전체 control payload 경로에서 실패할 수 있다.
+- `bot.send(...)`가 false를 반환해도 실제 KakaoTalk 수신이 성공할 수 있다.
+- phone-side에서 작업마다 raw thread를 만드는 구조는 장시간 실행 시 메신저봇 안정성을 해칠 수 있다.
 
 ## Confirmed Findings
 
@@ -224,6 +231,18 @@ LLM 관련 메모:
 - phone-side end-to-end 확인 없이 상한을 올리는 방식
 
 ## Incident History
+
+### 2026-03-28 23:29 KST | Phone-side thread accumulation suspected, async worker queue introduced
+
+- Symptom: 관리자방 가족 브리핑이 오랫동안 `pending`으로 남았고, 폰 쪽 메신저봇이 죽었다가 다시 살아난 것처럼 보였다.
+- Scope: polling/outbox 기반 관리자방 발송 경로와 phone-side `bot.txt`
+- Trigger: `2026-03-28` 저녁에 관리자방 가족 브리핑을 수동 예약 적재했지만 운영 DB에서 `last_attempt_at=None` 상태가 길게 유지됐다.
+- Server Result: 서버 스케줄러의 `rooms_config_watch`는 정상 heartbeat를 유지했고, 가족 브리핑 outbox `58`, `59`가 적재됐다.
+- Client Result: 이후 polling이 다시 살아난 뒤 관리자방에 대기 중이던 가족 브리핑 2건이 실제 도착했다. 추가로 오래된 잘못된 outbox `id=29`가 계속 pull돼 ack fail 카운트를 더럽히고 있었다.
+- Trace IDs: `f3cd3ead488b`, `31e91ea7e727`
+- Hypothesis: phone-side에서 관리자 알림, 포워딩, 수동 동기화 등 일회성 작업마다 raw thread를 만드는 구조가 누적돼 장시간 실행 안정성을 해쳤을 가능성이 높다.
+- Action Taken: `bot.txt`의 one-shot async 경로를 `2`개 worker와 `200`개 용량의 bounded queue로 교체하고, `@폴링상태`에 `asyncWorkersStarted`, `asyncQueueSize`, `asyncEnqueuedCount`, `asyncExecutedCount`, `asyncDroppedCount`, `asyncLastError`를 추가했다. 오래된 잘못된 outbox `id=29`는 `cancelled`로 정리했다.
+- Decision: polling loop는 전용 장수 스레드로 유지하고, 일회성 비동기 작업은 raw thread-per-task를 사용하지 않는다. `bot.send(...)` 실패 로그는 실제 KakaoTalk 수신 여부와 분리해서 해석한다.
 
 ### 2026-03-26 | Initial investigation and baseline documentation
 
@@ -395,3 +414,5 @@ LLM 관련 메모:
 2. `pending/inflight/sent` outbox 카운트와 실제 카카오 수신이 일치하는지 운영 중 관찰한다.
 3. ack 실패 시 inflight 재처리와 중복 전송 여부를 실제 운영 로그로 확인한다.
 4. room snapshot이 없는 상태에서도 scheduled room 전송이 안정적인지 검증한다.
+5. `@폴링상태`의 `asyncQueueSize`, `asyncDroppedCount`, `asyncLastError`가 누적되거나 비정상적으로 증가하는지 본다.
+6. `lastStartedAt`이 자주 바뀌는지 보고 Android 백그라운드 프로세스 종료 여부를 추적한다.
