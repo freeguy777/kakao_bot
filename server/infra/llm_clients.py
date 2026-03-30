@@ -250,9 +250,9 @@ def call_gemini_parts(
     timeout: int = 30,
 ) -> str:
     settings = get_settings()
-    api_key = settings.google_api_key.strip()
+    api_key = str(getattr(settings, "gemini_api_key", getattr(settings, "google_api_key", ""))).strip()
     if not api_key or api_key == "replace_me":
-        raise ValueError("GOOGLE_API_KEY가 설정되지 않았습니다.")
+        raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
 
     llm_config = get_llm_config(feature_key)
     resolved_model = str(model or llm_config["model"]).strip()

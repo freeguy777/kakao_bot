@@ -168,6 +168,15 @@ def init_db(sqlite_path: str | None = None) -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS scheduler_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                trace_id TEXT,
+                meta_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS room_targets (
                 room_key TEXT PRIMARY KEY,
                 channel_id TEXT,
@@ -196,6 +205,9 @@ def init_db(sqlite_path: str | None = None) -> None:
         )
         _ensure_column(conn, "outbox_messages", "last_attempt_at", "TEXT")
         _ensure_column(conn, "outbox_messages", "sent_at", "TEXT")
+        _ensure_column(conn, "scheduler_events", "detail", "TEXT")
+        _ensure_column(conn, "scheduler_events", "trace_id", "TEXT")
+        _ensure_column(conn, "scheduler_events", "meta_json", "TEXT")
     logger.info("database initialized path=%s", get_db_path())
 
 
@@ -412,6 +424,54 @@ def record_job_run(job_name: str, status: str, detail: str, trace_id: str | None
             """,
             (job_name, status, detail, trace_id, now_kst().isoformat()),
         )
+
+
+def record_scheduler_event(
+    event_type: str,
+    detail: str,
+    trace_id: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduler_events (event_type, detail, trace_id, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event_type,
+                detail,
+                trace_id,
+                json.dumps(meta or {}, ensure_ascii=False),
+                now_kst().isoformat(),
+            ),
+        )
+
+
+def list_scheduler_events(limit: int = 10) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 100))
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, event_type, detail, trace_id, meta_json, created_at
+            FROM scheduler_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (normalized_limit,),
+        ).fetchall()
+
+    return [
+        {
+            "id": int(row["id"]),
+            "event_type": str(row["event_type"]).strip(),
+            "detail": str(row["detail"] or "").strip(),
+            "trace_id": str(row["trace_id"]).strip() if row["trace_id"] else None,
+            "meta": json.loads(row["meta_json"] or "{}"),
+            "created_at": str(row["created_at"]).strip(),
+        }
+        for row in rows
+    ]
 
 
 def save_room_target(room_key: str, room_name: str | None = None, channel_id: str | None = None) -> None:

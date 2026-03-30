@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
     scheduler = create_scheduler(settings.timezone)
     register_jobs(scheduler, settings)
     app.state.scheduler = scheduler
-    logger.info("application started base_url=%s", get_api_base_url())
+    logger.info("application started base_url=%s active_transport=%s", get_api_base_url(), "polling_outbox")
     try:
         yield
     finally:

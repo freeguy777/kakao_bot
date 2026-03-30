@@ -29,7 +29,7 @@ class DeliveryDispatchUseCase:
                 payload=build_standard_response(
                     ok=False,
                     trace_id=trace_id,
-                    action="socket.send",
+                    action="polling.outbox.enqueue",
                     messages=[],
                     error="room_key is required",
                     meta={},
@@ -45,14 +45,16 @@ class DeliveryDispatchUseCase:
             meta=request.meta,
             dedupe_key=request.dedupe_key,
         )
-        accepted = result["ok"] or bool(result["outbox_ids"])
-        if result["via"] == "dedupe_skip":
+        accepted = bool(result.get("queued")) or bool(result.get("delivered")) or bool(result.get("outbox_ids")) or (
+            result.get("transport") == "polling" and result.get("via") == "dedupe_skip"
+        )
+        if result.get("transport") == "polling" and result.get("via") == "dedupe_skip":
             messages = ["duplicate delivery skipped"]
-        elif result["via"] == "polling_outbox":
+        elif result.get("transport") == "polling" and result.get("queued"):
             messages = ["delivery queued for polling"]
-        elif result["ok"]:
+        elif result.get("transport") == "polling" and result.get("delivered"):
             messages = ["delivery completed"]
-        elif result["outbox_ids"]:
+        elif result.get("outbox_ids"):
             messages = ["delivery queued"]
         else:
             messages = []
@@ -62,9 +64,9 @@ class DeliveryDispatchUseCase:
             payload=build_standard_response(
                 ok=accepted,
                 trace_id=trace_id,
-                action="socket.send",
+                action="polling.outbox.enqueue",
                 messages=messages,
-                error=result["error"] if not result["ok"] and not result["outbox_ids"] else None,
+                error=result.get("error") if not accepted else None,
                 meta=result,
             ),
         )
@@ -76,8 +78,8 @@ class DeliveryDispatchUseCase:
         return build_standard_response(
             ok=True,
             trace_id=trace_id,
-            action="socket.flush",
-            messages=["socket flush is deprecated; polling clients should pull pending outbox messages"],
+            action="polling.outbox.flush",
+            messages=["direct flush is deprecated; polling clients should use /polling/pull and /polling/ack"],
             error=None,
             meta=result,
         )

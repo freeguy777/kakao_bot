@@ -210,7 +210,7 @@ rooms:
               minute: 15
     delivery:
       admin_room_key: admin_test_room
-      notify_admin_on_eror: true
+      notify_admin_on_error: true
     weather:
       enabled: true
       label: "김해율하"

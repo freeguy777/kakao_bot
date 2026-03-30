@@ -1,0 +1,18 @@
+{
+  "total": {
+    "value": 597,
+    "relation": "eq"
+  },
+  "query": {
+    "from": 0,
+    "size": 1
+  },
+  "filings": [
+    {
+      "ticker": "IMVT",
+      "formType": "4",
+      "accessionNo": "0001764013-26-000015",
+      "companyNameLong": "Immunovant, Inc."
+    }
+  ]
+}

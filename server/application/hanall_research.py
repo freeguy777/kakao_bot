@@ -32,6 +32,38 @@ MAX_PACKET_CHARS = 8500
 MAX_SNIPPET_CHARS = 360
 MAX_ITEMS_TOTAL = 12
 USER_AGENT = "kakao-bot/1.0 (hanall monitoring)"
+HANALL_DIRECT_COMPANIES = ("HanAll Biopharma", "Immunovant")
+HANALL_COMPANY_ALIASES = ("HanAll Biopharma", "한올바이오파마", "Immunovant", "IMVT")
+HANALL_CORE_ASSETS = (
+    "batoclimab",
+    "HL161",
+    "IMVT-1401",
+    "RVT-1401",
+    "HBM9161",
+    "IMVT-1402",
+    "HL161ANS",
+    "tanfanercept",
+    "HL036",
+)
+HANALL_KEY_INDICATIONS = ("MG/gMG", "TED", "CIDP", "GD", "D2T RA/RA", "SjD", "CLE", "DED")
+HANALL_COMPETITOR_SEED_THEMES = ("FcRn", "TED", "dry eye disease")
+HANALL_ASSET_ALIAS_RULES = (
+    "batoclimab = HL161 / IMVT-1401 / RVT-1401 / HBM9161",
+    "IMVT-1402 = HL161ANS",
+    "tanfanercept = HL036",
+)
+HANALL_FINAL_SECTION_HEADINGS = (
+    "요약",
+    "오늘 예정 이벤트",
+    "회사 직접 업데이트",
+    "경쟁사 관련 업데이트",
+    "경쟁사 동향 요약",
+    "확인한 자료",
+    "추가 확인 필요",
+    "아직 확인이 필요한 부분",
+    "누락 점검",
+    "참고 메모",
+)
 
 DIRECT_TERMS = (
     "hanall",
@@ -322,6 +354,83 @@ def _format_kst(dt: datetime | None, fallback: str = "확인 불가") -> str:
     if dt is None:
         return fallback
     return dt.astimezone(now_kst().tzinfo).strftime("%Y-%m-%d %H:%M KST")
+
+
+def _parse_known_event_kst(value: str) -> datetime | None:
+    normalized = _normalize_space(value).removesuffix(" KST")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+            return parsed.replace(tzinfo=now_kst().tzinfo)
+        except ValueError:
+            continue
+    return None
+
+
+def _known_event_is_completed(*, fact: str, status_note: str) -> bool:
+    combined = _normalize_space(f"{fact} {status_note}").lower()
+    completion_markers = (
+        "confirmed",
+        "completed",
+        "held",
+        "filed",
+        "발표 완료",
+        "개최 완료",
+        "완료",
+        "완료됨",
+        "확정",
+        "종료",
+    )
+    return any(marker in combined for marker in completion_markers)
+
+
+def _classify_known_event_aging(
+    *,
+    scheduled_for_kst: str,
+    fact: str,
+    status_note: str,
+    current_now: datetime,
+) -> str:
+    if _known_event_is_completed(fact=fact, status_note=status_note):
+        return "confirmed_or_completed"
+    scheduled_at = _parse_known_event_kst(scheduled_for_kst)
+    if scheduled_at is None:
+        return "due_today"
+    localized = scheduled_at.astimezone(current_now.tzinfo)
+    if localized.date() > current_now.date():
+        return "due_future"
+    if localized.date() == current_now.date():
+        return "due_today"
+    return "past_due_without_followup"
+
+
+def _normalize_known_event_copy(raw_event: dict[str, Any], *, current_now: datetime) -> dict[str, str]:
+    entity = str(raw_event.get("entity", "")).strip() or "-"
+    category = str(raw_event.get("category", "")).strip() or "-"
+    scheduled_for_kst = str(raw_event.get("scheduled_for_kst", "")).strip() or "-"
+    fact = str(raw_event.get("fact", "")).strip() or "-"
+    basis = str(raw_event.get("basis", "")).strip() or "-"
+    primary_source = str(raw_event.get("primary_source", "")).strip() or "-"
+    status_note = str(raw_event.get("status_note", "")).strip() or "-"
+    aging_status = _classify_known_event_aging(
+        scheduled_for_kst=scheduled_for_kst,
+        fact=fact,
+        status_note=status_note,
+        current_now=current_now,
+    )
+    if aging_status == "past_due_without_followup":
+        fact = f"{entity} 일정 예정일 경과, 후속 공시 확인 필요"
+        status_note = "예정일 경과, 후속 공시 확인 필요"
+    return {
+        "entity": entity,
+        "category": category,
+        "scheduled_for_kst": scheduled_for_kst,
+        "fact": fact,
+        "basis": basis,
+        "primary_source": primary_source,
+        "status_note": status_note,
+        "aging_status": aging_status,
+    }
 
 
 def _is_recent(dt: datetime | None, *, window_start: datetime, now: datetime) -> bool:
@@ -699,37 +808,104 @@ def _load_hanall_known_event_overrides(path: Path = HANALL_KNOWN_EVENTS_PATH) ->
     return list(events) if isinstance(events, list) else []
 
 
-def build_hanall_known_events_context(as_of_date: str | None = None) -> str:
+def get_hanall_known_events(as_of_date: str | None = None, *, current_now: datetime | None = None) -> list[dict[str, str]]:
     normalized_date = str(as_of_date or "").strip()[:10] or now_kst().strftime("%Y-%m-%d")
-    blocks: list[str] = []
+    reference_now = current_now or now_kst()
+    events: list[dict[str, str]] = []
     for raw_event in _load_hanall_known_event_overrides():
         if not isinstance(raw_event, dict):
             continue
-        scheduled_for_kst = str(raw_event.get("scheduled_for_kst", "")).strip()
-        if not scheduled_for_kst.startswith(normalized_date):
+        normalized = _normalize_known_event_copy(raw_event, current_now=reference_now)
+        scheduled_for_kst = normalized.get("scheduled_for_kst", "-")
+        scheduled_dt = _parse_known_event_kst(scheduled_for_kst)
+        if scheduled_dt is not None and scheduled_dt.astimezone(reference_now.tzinfo).date().isoformat() > normalized_date:
             continue
-        entity = str(raw_event.get("entity", "")).strip() or "-"
-        category = str(raw_event.get("category", "")).strip() or "-"
-        fact = str(raw_event.get("fact", "")).strip() or "-"
-        basis = str(raw_event.get("basis", "")).strip() or "-"
-        primary_source = str(raw_event.get("primary_source", "")).strip() or "-"
-        status_note = str(raw_event.get("status_note", "")).strip() or "-"
+        events.append(normalized)
+    events.sort(key=lambda item: item.get("scheduled_for_kst", ""))
+    return events
+
+
+def build_hanall_known_events_context(as_of_date: str | None = None, *, current_now: datetime | None = None) -> str:
+    blocks: list[str] = []
+    for raw_event in get_hanall_known_events(as_of_date, current_now=current_now):
         blocks.append(
             "\n".join(
                 [
-                    f"- entity: {entity}",
-                    f"  category: {category}",
-                    f"  scheduled_for_kst: {scheduled_for_kst or '-'}",
-                    f"  fact: {fact}",
-                    f"  basis: {basis}",
-                    f"  primary_source: {primary_source}",
-                    f"  status_note: {status_note}",
+                    f"- entity: {raw_event['entity']}",
+                    f"  category: {raw_event['category']}",
+                    f"  scheduled_for_kst: {raw_event['scheduled_for_kst']}",
+                    f"  fact: {raw_event['fact']}",
+                    f"  basis: {raw_event['basis']}",
+                    f"  primary_source: {raw_event['primary_source']}",
+                    f"  status_note: {raw_event['status_note']}",
                 ]
             )
         )
     if not blocks:
         return "- 오늘 날짜에 해당하는 로컬 예정 이벤트 없음"
     return "\n".join(blocks)
+
+
+def build_hanall_scope_context() -> str:
+    return "\n".join(
+        [
+            "watch_scope:",
+            f"- direct_companies: {', '.join(HANALL_DIRECT_COMPANIES)}",
+            f"- company_aliases: {', '.join(HANALL_COMPANY_ALIASES)}",
+            f"- core_assets: {', '.join(HANALL_CORE_ASSETS)}",
+            f"- asset_aliases: {'; '.join(HANALL_ASSET_ALIAS_RULES)}",
+            f"- key_indications: {', '.join(HANALL_KEY_INDICATIONS)}",
+            f"- indication_keywords: {', '.join(INDICATION_TERMS)}",
+            f"- competitor_seed_themes: {', '.join(HANALL_COMPETITOR_SEED_THEMES)}",
+            f"- competitor_alias_keywords: {', '.join(COMPETITOR_TERMS)}",
+            "- competitor_definition_rule: include only read-through updates that are directly relevant to HanAll/Immunovant assets or target indications",
+        ]
+    )
+
+
+def build_hanall_common_rules_context() -> str:
+    return "\n".join(
+        [
+            "common_rules:",
+            "- timezone_rule: always interpret and render dates/times in Asia/Seoul using YYYY-MM-DD HH:MM KST",
+            "- fact_priority_rule: confirmed facts from official APIs take precedence over RSS hits and later search results",
+            "- search_rule: search is only for omission fill and must not overwrite confirmed official facts",
+            "- confirmation_rule: keep confirmed updates, follow-up-needed items, still-unchecked areas, and omission review separate",
+            "- empty_state_rule: if a section is empty, render '- 없음' rather than implying no update was verified",
+            "- wording_rule: do not replace '확인 불가' with '업데이트 없음'",
+        ]
+    )
+
+
+def build_hanall_final_output_context() -> str:
+    section_lines = [f"  {index}. {heading}" for index, heading in enumerate(HANALL_FINAL_SECTION_HEADINGS, start=1)]
+    return "\n".join(
+        [
+            "final_output_contract:",
+            "- header_rule: start with [한올/Immunovant 24시간 브리핑]",
+            "- metadata_rule: include 기준, 범위, 커버리지, 확인 이벤트, 오늘 예정 이벤트 count before the required sections",
+            "- plain_text_only: no table, JSON, code block, or markdown decoration",
+            "- messenger_readability: keep short paragraphs and line breaks that read well in KakaoTalk",
+            "- empty_section_rule: every required section must appear and empty sections must contain '- 없음'",
+            "- final_section_order:",
+            *section_lines,
+        ]
+    )
+
+
+def build_hanall_base_prompt_replacements(current_now: datetime | None = None) -> dict[str, str]:
+    now = current_now or now_kst()
+    window_start = now - timedelta(hours=LOOKBACK_HOURS)
+    return {
+        "__NOW_KST__": now.strftime("%Y-%m-%d %H:%M KST"),
+        "__TODAY_KST__": now.strftime("%Y-%m-%d"),
+        "__SCHEDULE_LOOKBACK_START_KST__": window_start.strftime("%Y-%m-%d %H:%M KST"),
+        "__SCHEDULE_LOOKBACK_END_KST__": now.strftime("%Y-%m-%d %H:%M KST"),
+        "__KNOWN_EVENTS_CONTEXT__": build_hanall_known_events_context(now.strftime("%Y-%m-%d"), current_now=now),
+        "__HANALL_SCOPE_CONTEXT__": build_hanall_scope_context(),
+        "__HANALL_COMMON_RULES_CONTEXT__": build_hanall_common_rules_context(),
+        "__HANALL_FINAL_OUTPUT_CONTEXT__": build_hanall_final_output_context(),
+    }
 
 
 def _dedupe_items(items: list[HanallResearchItem]) -> list[HanallResearchItem]:
@@ -805,7 +981,7 @@ def build_hanall_research_packet(current_now: datetime | None = None) -> str:
             "- key_indications: MG/gMG, TED, CIDP, GD, D2T RA/RA, SjD, CLE, DED",
             "- competitor_seed_themes: FcRn, TED, dry eye disease",
             "today_known_events:",
-            build_hanall_known_events_context(now.strftime("%Y-%m-%d")),
+            build_hanall_known_events_context(now.strftime("%Y-%m-%d"), current_now=now),
             "candidate_signals:",
         ]
         if not selected_items:
@@ -860,8 +1036,6 @@ def build_hanall_research_packet(current_now: datetime | None = None) -> str:
 
 def build_hanall_prompt_replacements(current_now: datetime | None = None) -> dict[str, str]:
     now = current_now or now_kst()
-    return {
-        "__NOW_KST__": now.strftime("%Y-%m-%d %H:%M KST"),
-        "__TODAY_KST__": now.strftime("%Y-%m-%d"),
-        "__HANALL_RESEARCH_PACKET__": build_hanall_research_packet(now),
-    }
+    replacements = build_hanall_base_prompt_replacements(now)
+    replacements["__HANALL_RESEARCH_PACKET__"] = build_hanall_research_packet(now)
+    return replacements

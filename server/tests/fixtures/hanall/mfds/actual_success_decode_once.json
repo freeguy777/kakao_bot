@@ -1,0 +1,22 @@
+{
+  "header": {
+    "resultCode": "00",
+    "resultMsg": "NORMAL SERVICE."
+  },
+  "body": {
+    "pageNo": 1,
+    "totalCount": 44050,
+    "numOfRows": 1,
+    "items": [
+      {
+        "ITEM_SEQ": "195500005",
+        "ITEM_NAME": "중외5%포도당생리식염액",
+        "ENTP_NAME": "제이더블유중외제약(주)",
+        "ITEM_PERMIT_DATE": "19550412",
+        "INDUTY": "의약품",
+        "PRDUCT_TYPE": "[03310]혈액대용제",
+        "ITEM_INGR_NAME": "Glucose/Sodium Chloride"
+      }
+    ]
+  }
+}

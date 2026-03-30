@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 SERVER_DIR = Path(__file__).resolve().parent
 ENV_PATH = SERVER_DIR / ".env"
+HANALL_SOURCES_PATH = SERVER_DIR / "hanall_sources.yaml"
 ROOMS_PATH = SERVER_DIR / "rooms.yaml"
 PROMPTS_PATH = SERVER_DIR / "prompts.yaml"
 
@@ -29,6 +30,7 @@ class SocketSettings:
     retry_delay_ms: int
     flush_batch_size: int
     flush_interval_seconds: int
+    deprecated: bool = True
 
 
 @dataclass(frozen=True)
@@ -76,9 +78,18 @@ class AppSettings:
     api_base_path: str
     api_base_url: str
     sqlite_path: str
+    scheduler_recent_misfire_grace_seconds: int
     son_birth_date: str
     openai_api_key: str
+    gemini_api_key: str
     google_api_key: str
+    sec_api_key: str
+    opendart_api_key: str
+    openfda_api_key: str
+    data_go_kr_api_key: str
+    ncbi_api_key: str
+    ncbi_tool_name: str
+    ncbi_email: str
     socket: SocketSettings
     weather: WeatherSettings
     news: NewsSettings
@@ -135,14 +146,14 @@ def load_settings() -> AppSettings:
         os.environ.setdefault(key, value)
 
     socket_settings = SocketSettings(
-        enabled=_get_bool_env("PHONE_SOCKET_ENABLED", True),
+        enabled=_get_bool_env("PHONE_SOCKET_ENABLED", False),
         host=os.getenv("PHONE_SOCKET_HOST", "192.168.0.12").strip(),
         port=_get_int_env("PHONE_SOCKET_PORT", 9510),
         shared_secret=os.getenv("PHONE_SOCKET_SHARED_SECRET", "change_me_socket_secret").strip(),
         bot_name=os.getenv("PHONE_SOCKET_BOT_NAME", "PpiraeSocketBridge").strip(),
         control_room_name=os.getenv("PHONE_SOCKET_CONTROL_ROOM_NAME", "__MB_SOCKET_CONTROL__").strip(),
         control_author_name=os.getenv("PHONE_SOCKET_CONTROL_AUTHOR_NAME", "socket_bridge").strip(),
-        package_name=os.getenv("PHONE_SOCKET_PACKAGE_NAME", "com.kakao.talk").strip(),
+        package_name=os.getenv("KAKAO_PACKAGE_NAME", os.getenv("PHONE_SOCKET_PACKAGE_NAME", "com.kakao.talk")).strip(),
         connect_timeout_seconds=_get_int_env("PHONE_SOCKET_CONNECT_TIMEOUT_SECONDS", 5),
         read_timeout_seconds=_get_int_env("PHONE_SOCKET_READ_TIMEOUT_SECONDS", 2),
         retry_count=_get_int_env("PHONE_SOCKET_RETRY_COUNT", 2),
@@ -195,21 +206,30 @@ def load_settings() -> AppSettings:
         api_base_path=os.getenv("API_BASE_PATH", "/kakao").strip(),
         api_base_url=os.getenv("API_BASE_URL", "http://192.168.0.10:8000/kakao").strip(),
         sqlite_path=os.getenv("SQLITE_PATH", "./bot.db").strip(),
+        scheduler_recent_misfire_grace_seconds=_get_int_env("SCHEDULER_RECENT_MISFIRE_GRACE_SECONDS", 900),
         son_birth_date=os.getenv("SON_BIRTH_DATE", "2024-09-26").strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY", "replace_me").strip(),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", "replace_me")).strip(),
         google_api_key=os.getenv("GOOGLE_API_KEY", "replace_me").strip(),
+        sec_api_key=os.getenv("SEC_API_KEY", "replace_me").strip(),
+        opendart_api_key=os.getenv("OPENDART_API_KEY", "replace_me").strip(),
+        openfda_api_key=os.getenv("OPENFDA_API_KEY", "replace_me").strip(),
+        data_go_kr_api_key=os.getenv("DATA_GO_KR_API_KEY", "replace_me").strip(),
+        ncbi_api_key=os.getenv("NCBI_API_KEY", "replace_me").strip(),
+        ncbi_tool_name=os.getenv("NCBI_TOOL_NAME", "").strip(),
+        ncbi_email=os.getenv("NCBI_EMAIL", "").strip(),
         socket=socket_settings,
         weather=weather_settings,
         news=NewsSettings(api_key=os.getenv("NEWS_API_KEY", "replace_me").strip()),
         llm=llm_settings,
     )
     logger.info(
-        "settings loaded env=%s timezone=%s api_base_url=%s socket=%s:%s",
+        "settings loaded env=%s timezone=%s api_base_url=%s active_transport=%s socket_deprecated=%s",
         settings.app_env,
         settings.timezone,
         settings.api_base_url,
-        settings.socket.host,
-        settings.socket.port,
+        "polling_outbox",
+        settings.socket.deprecated,
     )
     return settings
 

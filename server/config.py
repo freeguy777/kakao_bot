@@ -8,6 +8,7 @@ import yaml
 
 from server.settings import (
     AppSettings,
+    HANALL_SOURCES_PATH,
     PROMPTS_PATH,
     ROOMS_PATH,
     get_api_base_path,
@@ -120,6 +121,7 @@ class RoomsConfig:
 
 _ROOMS_CONFIG: RoomsConfig | None = None
 _PROMPTS_CONFIG: dict[str, Any] | None = None
+_HANALL_SOURCES_CONFIG: dict[str, Any] | None = None
 
 
 def _load_yaml(path: Any) -> dict[str, Any]:
@@ -265,6 +267,34 @@ def _normalize_room_policy(
     )
 
 
+def _collect_room_target_warning_reasons(room: RoomConfig) -> list[str]:
+    reasons: list[str] = []
+    if room.channel_id:
+        return reasons
+    if room.schedules.enabled:
+        reasons.append("schedule_enabled_without_channel_id")
+    if room.features.news_brief or room.news.enabled:
+        reasons.append("news_brief_without_channel_id")
+    if room.features.morning_brief:
+        reasons.append("morning_brief_without_channel_id")
+    if room.display_name:
+        reasons.append("display_name_fallback_only")
+    return reasons
+
+
+def _warn_room_delivery_targets(rooms: dict[str, RoomConfig]) -> None:
+    for room in rooms.values():
+        reasons = _collect_room_target_warning_reasons(room)
+        if not reasons:
+            continue
+        logger.warning(
+            "room delivery target warning room_key=%s display_name=%s reasons=%s",
+            room.room_key,
+            room.display_name,
+            ",".join(reasons),
+        )
+
+
 def _load_rooms_config() -> RoomsConfig:
     raw_config = _load_yaml(ROOMS_PATH)
     defaults_raw = raw_config.get("defaults", {}) if isinstance(raw_config.get("defaults"), dict) else {}
@@ -296,6 +326,7 @@ def _load_rooms_config() -> RoomsConfig:
             continue
         rooms[normalized_key] = _normalize_room_policy(normalized_key, raw_room, defaults, scheduled_jobs)
 
+    _warn_room_delivery_targets(rooms)
     logger.info("rooms config loaded room_count=%s admin_room_key=%s", len(rooms), admin_room_key)
     return RoomsConfig(
         admin_room_key=admin_room_key,
@@ -329,10 +360,30 @@ def get_prompts_registry() -> dict[str, Any]:
     return _PROMPTS_CONFIG
 
 
+def _load_hanall_sources_config() -> dict[str, Any]:
+    raw_config = _load_yaml(HANALL_SOURCES_PATH)
+    logger.info(
+        "hanall sources config loaded collectors=%s rss_feeds=%s",
+        len(raw_config.get("collectors", {})) if isinstance(raw_config.get("collectors"), dict) else 0,
+        len(raw_config.get("rss", {}).get("feeds", []))
+        if isinstance(raw_config.get("rss"), dict) and isinstance(raw_config.get("rss", {}).get("feeds"), list)
+        else 0,
+    )
+    return raw_config
+
+
+def get_hanall_sources_registry() -> dict[str, Any]:
+    global _HANALL_SOURCES_CONFIG
+    if _HANALL_SOURCES_CONFIG is None:
+        _HANALL_SOURCES_CONFIG = _load_hanall_sources_config()
+    return _HANALL_SOURCES_CONFIG
+
+
 def reload_runtime_config() -> None:
-    global _ROOMS_CONFIG, _PROMPTS_CONFIG
+    global _ROOMS_CONFIG, _PROMPTS_CONFIG, _HANALL_SOURCES_CONFIG
     _ROOMS_CONFIG = _load_rooms_config()
     _PROMPTS_CONFIG = _load_prompts_config()
+    _HANALL_SOURCES_CONFIG = _load_hanall_sources_config()
 
 
 def load_settings() -> AppSettings:
@@ -375,6 +426,10 @@ def get_scheduled_jobs_config() -> dict[str, Any]:
 
 def get_prompts_config() -> dict[str, Any]:
     return dict(get_prompts_registry())
+
+
+def get_hanall_sources_config() -> dict[str, Any]:
+    return dict(get_hanall_sources_registry())
 
 
 def find_room_by_channel(channel_id: str | None) -> tuple[str | None, dict[str, Any] | None]:

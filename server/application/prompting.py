@@ -54,6 +54,14 @@ def _is_gemini_model(model: str) -> bool:
     return model.strip().lower().startswith("gemini")
 
 
+def _is_hanall_news_prompt_key(prompt_key: str) -> bool:
+    return prompt_key in {
+        "hanall_news_prompt",
+        "hanall_news_collect_prompt",
+        "hanall_news_finalize_prompt",
+    }
+
+
 def render_prompt_template(prompt_key: str, replacements: dict[str, str] | None = None) -> str:
     prompt = get_prompt(prompt_key)
     template = str(prompt.get("template", "")).strip()
@@ -84,7 +92,7 @@ def _get_prompt_execution_options(prompt_key: str) -> PromptExecutionOptions:
 
     default_max_output_tokens = settings.llm.prompt_default_max_output_tokens
     truncate_limit = 1500
-    if prompt_key == "hanall_news_prompt":
+    if _is_hanall_news_prompt_key(prompt_key):
         default_max_output_tokens = settings.llm.hanall_news_max_output_tokens
         truncate_limit = settings.llm.hanall_news_truncate_limit
 
@@ -103,11 +111,18 @@ def _get_prompt_execution_options(prompt_key: str) -> PromptExecutionOptions:
     )
 
 
-def _execute_prompt_by_key(prompt_key: str) -> tuple[str, PromptExecutionOptions]:
+def _execute_prompt_by_key(
+    prompt_key: str,
+    *,
+    replacements: dict[str, str] | None = None,
+) -> tuple[str, PromptExecutionOptions]:
     settings = get_settings()
     prompt = get_prompt(prompt_key)
     title = prompt.get("title", prompt_key)
-    body = render_prompt_template(prompt_key, replacements=_build_prompt_replacements(prompt_key))
+    merged_replacements = _build_prompt_replacements(prompt_key)
+    if replacements:
+        merged_replacements.update(replacements)
+    body = render_prompt_template(prompt_key, replacements=merged_replacements)
     execution_options = _get_prompt_execution_options(prompt_key)
     llm_config = get_llm_config(execution_options.feature_key)
     if execution_options.model:
@@ -170,11 +185,11 @@ def _execute_prompt_by_key(prompt_key: str) -> tuple[str, PromptExecutionOptions
     return result_text, execution_options
 
 
-def run_prompt_by_key(prompt_key: str) -> str:
-    result_text, execution_options = _execute_prompt_by_key(prompt_key)
+def run_prompt_by_key(prompt_key: str, *, replacements: dict[str, str] | None = None) -> str:
+    result_text, execution_options = _execute_prompt_by_key(prompt_key, replacements=replacements)
     return safe_truncate(result_text, execution_options.truncate_limit)
 
 
-def run_prompt_by_key_raw(prompt_key: str) -> str:
-    result_text, _ = _execute_prompt_by_key(prompt_key)
+def run_prompt_by_key_raw(prompt_key: str, *, replacements: dict[str, str] | None = None) -> str:
+    result_text, _ = _execute_prompt_by_key(prompt_key, replacements=replacements)
     return result_text

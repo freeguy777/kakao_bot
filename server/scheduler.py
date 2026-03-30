@@ -13,7 +13,7 @@ from server.application.family import build_family_morning_brief
 from server.application.news import build_hanall_news_brief
 from server.application.prompting import run_prompt_by_key
 from server.config import get_rooms_registry, reload_settings
-from server.db import record_job_run
+from server.db import record_job_run, record_scheduler_event
 from server.settings import ROOMS_PATH
 from server.utils import make_trace_id, now_kst
 
@@ -39,13 +39,13 @@ JOB_BUILDERS: dict[str, JobBuilder] = {
     "hanall_news_brief": lambda room_key: build_hanall_news_brief(
         room_key=room_key,
         raise_on_error=True,
-        send_raw_to_admin=True,
+        send_raw_to_admin=False,
     ),
     "test_prompt": _build_test_prompt,
 }
 SYSTEM_JOB_IDS = {"system:rooms_config_watch"}
 _ROOMS_CONFIG_MTIME_NS: int | None = None
-RECENT_MISFIRE_GRACE_SECONDS = 20
+DEFAULT_RECENT_MISFIRE_GRACE_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,49 @@ def create_scheduler(timezone: str) -> Any:
     return BackgroundScheduler(timezone=timezone)
 
 
+def _get_recent_misfire_grace_seconds(settings: Any | None = None) -> int:
+    raw_value = getattr(settings, "scheduler_recent_misfire_grace_seconds", DEFAULT_RECENT_MISFIRE_GRACE_SECONDS)
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return DEFAULT_RECENT_MISFIRE_GRACE_SECONDS
+
+
+def _safe_record_scheduler_event(
+    event_type: str,
+    detail: str,
+    *,
+    trace_id: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    try:
+        record_scheduler_event(event_type, detail, trace_id=trace_id, meta=meta)
+    except Exception:
+        logger.exception(
+            "scheduler event record failed event_type=%s trace_id=%s detail=%s",
+            event_type,
+            trace_id,
+            detail,
+        )
+
+
+def _classify_scheduler_delivery_result(result: dict[str, Any]) -> tuple[str, str]:
+    transport = str(result.get("transport", "")).strip()
+    via = str(result.get("via", "")).strip()
+    queued = bool(result.get("queued"))
+    delivered = bool(result.get("delivered"))
+    outbox_ids = list(result.get("outbox_ids", []) or [])
+    error = str(result.get("error", "") or "").strip()
+
+    if transport == "polling" and via == "dedupe_skip":
+        return "skipped", "duplicate schedule delivery skipped"
+    if transport == "polling" and queued:
+        return "queued", f"queued transport={transport} via={via} outbox_ids={outbox_ids}"
+    if transport == "polling" and delivered:
+        return "success", f"delivered transport={transport} via={via}"
+    return "failed", f"delivery failed transport={transport or '-'} via={via or '-'} error={error or '-'}"
+
+
 def _deliver_job_message(job_name: str, room_key: str, builder: JobBuilder) -> None:
     trace_id = make_trace_id()
     dedupe_key = f"schedule:{room_key}:{job_name}:{now_kst().strftime('%Y%m%d%H%M')}"
@@ -78,26 +121,7 @@ def _deliver_job_message(job_name: str, room_key: str, builder: JobBuilder) -> N
             meta={"job_name": job_name},
             dedupe_key=dedupe_key,
         )
-        if result["via"] == "dedupe_skip":
-            record_job_run(job_name, "skipped", "duplicate schedule delivery skipped", trace_id)
-            return
-        if result["via"] == "polling_outbox":
-            detail = (
-                f"queued via={result['via']} "
-                f"trace_id={trace_id} "
-                f"outbox_ids={result.get('outbox_ids', [])}"
-            )
-            status = "queued"
-        elif result["ok"]:
-            detail = f"delivered via={result['via']} trace_id={trace_id}"
-            status = "success"
-        else:
-            detail = (
-                f"queued via={result['via']} "
-                f"outbox_ids={result.get('outbox_ids', [])} "
-                f"error={result.get('error', '')}"
-            )
-            status = "queued"
+        status, detail = _classify_scheduler_delivery_result(result)
         record_job_run(job_name, status, detail, trace_id)
     except FeatureExecutionError as exc:
         logger.warning(
@@ -234,10 +258,16 @@ def _sync_room_jobs(scheduler: Any, timezone: str) -> list[str]:
     return desired_job_ids
 
 
-def _deliver_recently_due_jobs(timezone: str) -> list[str]:
+def _deliver_recently_due_jobs(
+    timezone: str,
+    recent_misfire_grace_seconds: int,
+    *,
+    current_now: datetime | None = None,
+) -> list[str]:
     delivered_job_ids: list[str] = []
-    now = datetime.now(ZoneInfo(timezone))
-    lookup_from = now - timedelta(minutes=1)
+    now = current_now or datetime.now(ZoneInfo(timezone))
+    grace_seconds = max(0, int(recent_misfire_grace_seconds))
+    lookup_from = now - timedelta(seconds=grace_seconds)
 
     for spec in _iter_room_job_specs():
         cron_trigger = _build_cron_trigger(spec.trigger, timezone)
@@ -245,7 +275,7 @@ def _deliver_recently_due_jobs(timezone: str) -> list[str]:
         if due_time is None or now <= due_time:
             continue
         delay_seconds = (now - due_time).total_seconds()
-        if delay_seconds > RECENT_MISFIRE_GRACE_SECONDS:
+        if delay_seconds > grace_seconds:
             continue
         job_id = _build_scheduler_job_id(spec.room_key, spec.job_name, spec.job_index, spec.trigger, spec.trigger_index)
         logger.info(
@@ -258,6 +288,22 @@ def _deliver_recently_due_jobs(timezone: str) -> list[str]:
         )
         _deliver_job_message(spec.job_name, spec.room_key, spec.builder)
         delivered_job_ids.append(job_id)
+        _safe_record_scheduler_event(
+            "catch_up_delivered",
+            (
+                f"catch-up delivered job_id={job_id} room_key={spec.room_key} "
+                f"job_name={spec.job_name} scheduled_for={due_time.isoformat()} "
+                f"delay_seconds={delay_seconds:.1f}"
+            ),
+            meta={
+                "job_id": job_id,
+                "room_key": spec.room_key,
+                "job_name": spec.job_name,
+                "scheduled_for": due_time.isoformat(),
+                "delay_seconds": round(delay_seconds, 1),
+                "grace_seconds": grace_seconds,
+            },
+        )
     return delivered_job_ids
 
 
@@ -276,8 +322,24 @@ def _reload_schedule_config_job(scheduler: Any) -> None:
     try:
         settings = reload_settings()
         synced_job_ids = _sync_room_jobs(scheduler, settings.timezone)
-        catch_up_job_ids = _deliver_recently_due_jobs(settings.timezone)
+        grace_seconds = _get_recent_misfire_grace_seconds(settings)
+        catch_up_job_ids = _deliver_recently_due_jobs(settings.timezone, grace_seconds)
         _ROOMS_CONFIG_MTIME_NS = current_mtime_ns
+        _safe_record_scheduler_event(
+            "config_reloaded",
+            (
+                f"reloaded timezone={settings.timezone} scheduled_job_count={len(synced_job_ids)} "
+                f"catch_up_count={len(catch_up_job_ids)} misfire_grace_seconds={grace_seconds}"
+            ),
+            meta={
+                "timezone": settings.timezone,
+                "scheduled_job_count": len(synced_job_ids),
+                "catch_up_count": len(catch_up_job_ids),
+                "catch_up_job_ids": catch_up_job_ids,
+                "misfire_grace_seconds": grace_seconds,
+                "path": str(ROOMS_PATH),
+            },
+        )
         logger.info(
             "scheduled jobs reloaded count=%s catch_up_count=%s timezone=%s path=%s",
             len(synced_job_ids),
@@ -286,6 +348,11 @@ def _reload_schedule_config_job(scheduler: Any) -> None:
             ROOMS_PATH,
         )
     except Exception as exc:
+        _safe_record_scheduler_event(
+            "reload_failed",
+            f"reload failed path={ROOMS_PATH} error={exc}",
+            meta={"path": str(ROOMS_PATH), "error": str(exc)},
+        )
         logger.exception("scheduled jobs reload failed path=%s", ROOMS_PATH, exc_info=exc)
 
 
@@ -293,10 +360,16 @@ def register_jobs(scheduler: Any, settings: Any) -> None:
     global _ROOMS_CONFIG_MTIME_NS
 
     if scheduler is None or CronTrigger is None:
+        _safe_record_scheduler_event(
+            "disabled",
+            "APScheduler is unavailable. Scheduled jobs are disabled.",
+            meta={"timezone": getattr(settings, "timezone", None)},
+        )
         return
 
+    grace_seconds = _get_recent_misfire_grace_seconds(settings)
     synced_job_ids = _sync_room_jobs(scheduler, settings.timezone)
-    catch_up_job_ids = _deliver_recently_due_jobs(settings.timezone)
+    catch_up_job_ids = _deliver_recently_due_jobs(settings.timezone, grace_seconds)
 
     if scheduler.get_job("system:rooms_config_watch") is None:
         scheduler.add_job(
@@ -313,11 +386,26 @@ def register_jobs(scheduler: Any, settings: Any) -> None:
 
     _ROOMS_CONFIG_MTIME_NS = _get_rooms_config_mtime_ns()
     scheduler.start()
+    _safe_record_scheduler_event(
+        "started",
+        (
+            f"started timezone={settings.timezone} scheduled_job_count={len(synced_job_ids)} "
+            f"catch_up_count={len(catch_up_job_ids)} misfire_grace_seconds={grace_seconds}"
+        ),
+        meta={
+            "timezone": settings.timezone,
+            "scheduled_job_count": len(synced_job_ids),
+            "catch_up_count": len(catch_up_job_ids),
+            "catch_up_job_ids": catch_up_job_ids,
+            "misfire_grace_seconds": grace_seconds,
+        },
+    )
     logger.info(
-        "scheduler started timezone=%s scheduled_job_count=%s catch_up_count=%s",
+        "scheduler started timezone=%s scheduled_job_count=%s catch_up_count=%s recent_misfire_grace_seconds=%s",
         settings.timezone,
         len(synced_job_ids),
         len(catch_up_job_ids),
+        grace_seconds,
     )
 
 

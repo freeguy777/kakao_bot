@@ -1,0 +1,149 @@
+# HanAll/Immunovant 24h briefing source registry.
+# - collectors.<source>.enabled: toggle an entire official API source family on/off.
+# - rss.feeds[*].enabled: toggle stage2 RSS enrichment feeds on/off.
+# - MFDS/data.go.kr endpoints are approval-gated in practice; keep non-approved
+#   datasets disabled even when the collector itself is enabled.
+# - Edit only the listed endpoints below. Do not invent additional paths in runtime code.
+collectors:
+  sec_api:
+    # MVP: Query API / form-8k / insider-trading / litigation endpoints are POST JSON only.
+    # Prefer Authorization header first and probe token query param once only on auth failures.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: true
+    endpoints:
+      api_root: "https://api.sec-api.io"
+      full_text_search: "https://api.sec-api.io/full-text-search"
+      xbrl_to_json: "https://api.sec-api.io/xbrl-to-json"
+      insider_trading: "https://api.sec-api.io/insider-trading"
+      form_8k: "https://api.sec-api.io/form-8k"
+      sec_litigation_releases: "https://api.sec-api.io/sec-litigation-releases"
+  opendart:
+    # corpCode.xml may return either a zip payload or a raw XML error body.
+    # Treat non-000 XML status/message auth failures as auth_invalid/api_error, not request_error.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: true
+    endpoints:
+      corp_code: "https://opendart.fss.or.kr/api/corpCode.xml"
+      list: "https://opendart.fss.or.kr/api/list.json"
+      company: "https://opendart.fss.or.kr/api/company.json"
+      eng_single_account_all: "https://engopendart.fss.or.kr/engapi/fnlttSinglAcntAll.json"
+  openfda:
+    # API key is optional. If a keyed call returns API_KEY_INVALID, retry once without api_key.
+    # enforcement 404 + NOT_FOUND/No matches found! is a no_match classification, not a route failure.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    endpoints:
+      drugsfda: "https://api.fda.gov/drug/drugsfda.json"
+      label: "https://api.fda.gov/drug/label.json"
+      event: "https://api.fda.gov/drug/event.json"
+      enforcement: "https://api.fda.gov/drug/enforcement.json"
+      shortages: "https://api.fda.gov/drug/shortages.json"
+      crl: "https://api.fda.gov/transparency/crl.json"
+  clinicaltrials:
+    # The v2 API sort param must use fielded syntax such as LastUpdatePostDate:desc.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    endpoints:
+      studies: "https://clinicaltrials.gov/api/v2/studies"
+      study_by_id: "https://clinicaltrials.gov/api/v2/studies/{NCT_ID}"
+  cris:
+    # data.go.kr serviceKey env may already be percent-encoded; decode once before passing via requests params.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: true
+    endpoints:
+      list: "http://apis.data.go.kr/1352159/crisinfodataview/list"
+  mfds:
+    # data.go.kr serviceKey handling matches CRIS. All configured MFDS datasets are enabled.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: true
+    approval_gated: true
+    # Example: after approval, enable the collector and then opt in per dataset.
+    # enabled: true
+    # services:
+    #   drug_safe_letter: true
+    services:
+      drug_product_permission: true
+      drug_safe_letter: true
+      medicine_clinical_test_info: true
+      clinical_exam_plan_detail: true
+      clinical_exam_plan_selection_standard: true
+      clinical_exam_plan_exclusion_standard: true
+      clinical_exam_plan_test_pscg: true
+      medicine_supply_lack: true
+      domestic_low_price_medicine: true
+      paragraph_iv_target_medicine: true
+      biologic_overseas_clinical_status: true
+    endpoints:
+      drug_product_permission: "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
+      drug_safe_letter: "http://apis.data.go.kr/1471000/DrugSafeLetterService02/getDrugSafeLetterList02"
+      medicine_clinical_test_info: "http://apis.data.go.kr/1471000/MdcinClincTestInfoService02/getMdcinClincTestInfoList02"
+      clinical_exam_plan_detail: "http://apis.data.go.kr/1471000/ClncExamPlanDtlService2/getClncExamPlanDtlInq2"
+      clinical_exam_plan_selection_standard: "http://apis.data.go.kr/1471000/ClncExamPlanSlctnStndrdService2/getClncExamPlanSlctnStndrdInq2"
+      clinical_exam_plan_exclusion_standard: "http://apis.data.go.kr/1471000/ClncExamPlanExStndrdService02/getClncExamPlanExStndrdInq02"
+      clinical_exam_plan_test_pscg: "http://apis.data.go.kr/1471000/ClncExamPlanTestPscgService03/getClncExamPlanTestPscgInq03"
+      medicine_supply_lack: "http://apis.data.go.kr/1471000/MdcinSuplyLackService03/getMdcinSuplyLackList01"
+      domestic_low_price_medicine: "http://apis.data.go.kr/1471000/DmstcLwstMdcinInfoService02/getMdcinRefreeSttusList02"
+      paragraph_iv_target_medicine: "http://apis.data.go.kr/1471000/ParagraphIVTrgetMdcinService02/getParagraphIVSearchsList02"
+      biologic_overseas_clinical_status: "http://apis.data.go.kr/1471000/BioMdcinOvseaClncAprvStus/getBioMdcinOvseaClncAprvStus"
+  ncbi:
+    # Include tool/email on every request. If any endpoint rejects the configured api_key,
+    # force no-key mode for the rest of that collection run and log auth_mode accordingly.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    base_url: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    endpoints:
+      esearch: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+      esummary: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+      efetch: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+      elink: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
+  europe_pmc:
+    # Use the EBI runtime search endpoint with GET + query/format/resultType/pageSize params.
+    # Prefer a simple Immunovant probe first, then canonical terms; split per-term if the giant OR query is unstable.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    endpoints:
+      search: "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+  crossref:
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    endpoints:
+      api_root: "https://api.crossref.org/"
+      works: "https://api.crossref.org/works"
+      work_by_doi: "https://api.crossref.org/works/{doi}"
+  biorxiv:
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    endpoints:
+      details_interval: "https://api.biorxiv.org/details/[server]/[interval]/[cursor]/[format]"
+      details_doi: "https://api.biorxiv.org/details/[server]/[DOI]/na/[format]"
+      pubs_interval: "https://api.biorxiv.org/pubs/[server]/[interval]/[cursor]"
+      pubs_doi: "https://api.biorxiv.org/pubs/[server]/[DOI]/na/[format]"
+
+rss:
+  enabled: true
+  timeout_seconds: 10
+  max_items_per_feed: 5
+  # RSS is stage2-only enrichment input. Disable individual feeds with feeds[*].enabled.
+  feeds:
+    - name: "google_news_hanall_immunovant"
+      enabled: true
+      category: "company_watch"
+      url: "https://news.google.com/rss/search?q=%22HanAll%20Biopharma%22%20OR%20Immunovant%20OR%20IMVT&hl=en-US&gl=US&ceid=US:en"
+    - name: "google_news_asset_watch"
+      enabled: true
+      category: "asset_watch"
+      url: "https://news.google.com/rss/search?q=batoclimab%20OR%20IMVT-1401%20OR%20IMVT-1402%20OR%20tanfanercept&hl=en-US&gl=US&ceid=US:en"
+    - name: "google_news_fcrn_competitors"
+      enabled: true
+      category: "competitor_watch"
+      url: "https://news.google.com/rss/search?q=FcRn%20argenx%20nipocalimab%20rozanolixizumab&hl=en-US&gl=US&ceid=US:en"

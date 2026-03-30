@@ -217,10 +217,18 @@ class MessageEventUseCase:
                 )
                 meta["delivery"] = {
                     "ok": False,
-                    "via": "inline_fallback",
+                    "transport": "polling",
+                    "via": "error",
+                    "queued": False,
+                    "delivered": False,
+                    "trace_id": trace_id,
+                    "room_key": room_key,
+                    "messages": queued_messages,
+                    "ack": None,
                     "error": str(exc),
                     "outbox_ids": [],
                 }
+                meta["delivery_mode"] = "error"
 
         logger.info(
             "message handled trace_id=%s room_key=%s sender=%s action=%s message_count=%s",

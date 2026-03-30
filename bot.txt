@@ -15,6 +15,7 @@ var CONFIG = {
   COMMAND_PREFIX: "@",
   ADMIN_ROOM_NAME: "김휘태",
   ADMIN_CHANNEL_ID: "464174551530382",
+  KAKAO_PACKAGE_NAME: "com.kakao.talk",
   SOCKET_PACKAGE_NAME: "com.kakao.talk",
   ENABLE_LOG: true,
   STARTUP_NOTIFY_ADMIN: true,
@@ -422,6 +423,10 @@ function getPackageName(msg) {
   return trimString(msg ? msg.packageName : "");
 }
 
+function getKakaoPackageName() {
+  return trimString(CONFIG.KAKAO_PACKAGE_NAME) || trimString(CONFIG.SOCKET_PACKAGE_NAME);
+}
+
 function getIsGroupChat(msg) {
   var room = getRoomObject(msg);
   if (room && room.isGroupChat !== undefined && room.isGroupChat !== null) {
@@ -587,7 +592,7 @@ function cacheRoom(msg) {
   item.channelId = channelId;
   item.room = roomName;
   item.isGroupChat = getIsGroupChat(msg);
-  item.packageName = getPackageName(msg) || CONFIG.SOCKET_PACKAGE_NAME;
+  item.packageName = getPackageName(msg) || getKakaoPackageName();
   item.lastAuthor = getAuthorName(msg);
   item.lastLogId = getLogId(msg);
   item.lastSeenAt = nowIsoString();
@@ -710,7 +715,7 @@ function buildYamlSnippet(item, roomKey) {
 // ===== 9. Send Helpers =====
 function botSendRoom(roomName, text, packageName) {
   var resolvedRoomName = trimString(roomName);
-  var resolvedPackage = trimString(packageName) || CONFIG.SOCKET_PACKAGE_NAME;
+  var resolvedPackage = trimString(packageName) || getKakaoPackageName();
   var result = false;
 
   if (!resolvedRoomName || !trimString(text)) {
@@ -767,7 +772,7 @@ function sendMessagesToRoom(roomName, messages, packageName, traceId) {
 
 function sendMessagesToCurrentRoomAsync(msg, messages, traceId) {
   var roomName = getRoomName(msg);
-  var packageName = getPackageName(msg) || CONFIG.SOCKET_PACKAGE_NAME;
+  var packageName = getPackageName(msg) || getKakaoPackageName();
   if (!enqueueAsyncTask("send_current_room:" + safeString(traceId), function() {
     sendMessagesToRoom(roomName, messages, packageName, traceId);
   })) {
@@ -776,7 +781,7 @@ function sendMessagesToCurrentRoomAsync(msg, messages, traceId) {
 }
 
 function notifyAdmin(text) {
-  botSendRoom(CONFIG.ADMIN_ROOM_NAME, text, CONFIG.SOCKET_PACKAGE_NAME);
+  botSendRoom(CONFIG.ADMIN_ROOM_NAME, text, getKakaoPackageName());
 }
 
 function notifyAdminAsync(text) {
@@ -789,7 +794,7 @@ function notifyAdminAsync(text) {
 
 function replyAdminCommand(msg, text) {
   var roomName = getRoomName(msg) || CONFIG.ADMIN_ROOM_NAME;
-  var packageName = getPackageName(msg) || CONFIG.SOCKET_PACKAGE_NAME;
+  var packageName = getPackageName(msg) || getKakaoPackageName();
   if (!enqueueAsyncTask("reply_admin_command", function() {
     sendMessagesToRoom(roomName, [text], packageName, "admin-command");
   })) {
@@ -884,7 +889,7 @@ function shouldForwardToFastApi(msg) {
     return false;
   }
 
-  if (packageName && packageName !== CONFIG.SOCKET_PACKAGE_NAME) {
+  if (packageName && packageName !== getKakaoPackageName()) {
     return false;
   }
 
@@ -979,6 +984,7 @@ function buildStatusText() {
     "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
     "api: " + CONFIG.API_BASE_URL + "\n" +
     "cachedRooms: " + String(roomCount()) + "\n" +
+    "activeTransport: polling_outbox\n" +
     "deliveryMode: polling_outbox\n" +
     "onlyForwardYouTube: " + String(CONFIG.ONLY_FORWARD_YOUTUBE)
   );
@@ -1024,6 +1030,7 @@ function buildCurrentRoomText(msg) {
 function buildHelpText() {
   var lines = [];
   lines.push("[관리자 명령]");
+  lines.push("activeTransport: polling_outbox");
   lines.push("도움말 / @도움말");
   lines.push("핑 / @핑");
   lines.push("연동상태 / @연동상태");
@@ -1083,7 +1090,7 @@ function resolveOutboxTarget(item) {
     return {
       roomName: trimString(cached.room),
       channelId: trimString(cached.channelId || channelId),
-      packageName: trimString(cached.packageName) || CONFIG.SOCKET_PACKAGE_NAME
+      packageName: trimString(cached.packageName) || getKakaoPackageName()
     };
   }
 
@@ -1102,7 +1109,7 @@ function resolveOutboxTarget(item) {
   return {
     roomName: roomName,
     channelId: channelId,
-    packageName: trimString(cached && cached.packageName) || CONFIG.SOCKET_PACKAGE_NAME
+    packageName: trimString(cached && cached.packageName) || getKakaoPackageName()
   };
 }
 

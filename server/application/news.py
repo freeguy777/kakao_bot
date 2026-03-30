@@ -7,8 +7,11 @@ import requests
 
 from server.application.delivery import deliver_room_messages
 from server.application.errors import FeatureExecutionError
-from server.application.hanall_research import build_hanall_known_events_context
-from server.application.prompting import run_prompt_by_key_raw
+from server.application.hanall_news_pipeline import (
+    _final_text_has_required_sections,
+    normalize_hanall_final_text,
+    run_hanall_news_pipeline,
+)
 from server.config import get_admin_room_key
 from server.utils import make_trace_id, now_kst
 
@@ -20,18 +23,17 @@ def get_news_summary() -> str:
 
 
 def _normalize_hanall_news_text(raw_text: str) -> str:
-    normalized = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = normalize_hanall_final_text(raw_text)
     if not normalized:
         raise ValueError("LLM 응답이 비어 있습니다.")
-    normalized = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", normalized, count=1)
-    normalized = re.sub(r"\s*```$", "", normalized, count=1)
-    normalized = normalized.strip()
     normalized = normalized.replace("**", "").replace("__", "").replace("`", "")
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     if not normalized:
         raise ValueError("정리 후 브리핑 텍스트가 비어 있습니다.")
     if not normalized.startswith("[한올/Immunovant 24시간 브리핑]"):
         normalized = f"[한올/Immunovant 24시간 브리핑]\n{normalized}"
+    if not _final_text_has_required_sections(normalized):
+        raise ValueError("최종 브리핑 필수 섹션이 누락되었습니다.")
     return normalized
 
 
@@ -77,10 +79,11 @@ def build_hanall_news_brief(
     send_raw_to_admin: bool = False,
 ) -> str:
     try:
-        raw_response = run_prompt_by_key_raw("hanall_news_prompt")
+        pipeline_result = run_hanall_news_pipeline()
+        raw_response = pipeline_result.raw_output_text
         if send_raw_to_admin:
             _send_hanall_news_raw_to_admin(room_key=room_key, raw_text=raw_response)
-        normalized = _normalize_hanall_news_text(raw_response)
+        normalized = _normalize_hanall_news_text(pipeline_result.final_text)
         return normalized
     except TimeoutError as exc:
         logger.warning("hanall news brief timed out error=%s", exc)

@@ -1,0 +1,4 @@
+{
+  "status": 403,
+  "error": "API token invalid. Please get a valid token from sec-api.io"
+}

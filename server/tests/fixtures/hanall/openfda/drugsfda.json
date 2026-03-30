@@ -1,0 +1,15 @@
+{
+  "results": [
+    {
+      "application_number": "BLA761999",
+      "submission_type": "ORIG",
+      "sponsor_name": "Immunovant Sciences GmbH",
+      "effective_time": "20260327",
+      "id": "drugsfda-1",
+      "openfda": {
+        "generic_name": ["batoclimab"],
+        "brand_name": ["IMVT-1401"]
+      }
+    }
+  ]
+}

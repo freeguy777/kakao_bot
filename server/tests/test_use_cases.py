@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from server.application.use_cases.delivery_dispatch import DeliveryDispatchUseCase
 from server.application.use_cases.message_events import MessageEventUseCase
-from server.application.use_cases.outbox_polling import OutboxPollingUseCase
+from server.application.use_cases.outbox_polling import OutboxPollingUseCase, reset_polling_status
 
 
 def build_room(*, youtube_summary: bool = True, message_length_limit: int = 3000) -> SimpleNamespace:
@@ -62,7 +62,10 @@ class MessageEventUseCaseTest(unittest.TestCase):
         deliverer = Mock(
             return_value={
                 "ok": True,
+                "transport": "polling",
                 "via": "polling_outbox",
+                "queued": True,
+                "delivered": False,
                 "trace_id": "trace-youtube",
                 "room_key": "room-alpha",
                 "messages": ["요약 결과"],
@@ -129,7 +132,10 @@ class MessageEventUseCaseTest(unittest.TestCase):
         deliverer = Mock(
             return_value={
                 "ok": True,
+                "transport": "polling",
                 "via": "polling_outbox",
+                "queued": True,
+                "delivered": False,
                 "trace_id": "trace-youtube-failed",
                 "room_key": "room-alpha",
                 "messages": [
@@ -262,10 +268,17 @@ class MessageEventUseCaseTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["action"], "youtube_summary")
         self.assertEqual(result["messages"], ["요약 결과"])
-        self.assertEqual(result["meta"]["delivery"]["via"], "inline_fallback")
+        self.assertEqual(result["meta"]["delivery"]["transport"], "polling")
+        self.assertEqual(result["meta"]["delivery"]["via"], "error")
+        self.assertFalse(result["meta"]["delivery"]["queued"])
+        self.assertFalse(result["meta"]["delivery"]["delivered"])
+        self.assertEqual(result["meta"]["delivery_mode"], "error")
 
 
 class OutboxPollingUseCaseTest(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_polling_status()
+
     def test_pull_builds_standard_response(self) -> None:
         puller = Mock(
             return_value=[
@@ -286,6 +299,7 @@ class OutboxPollingUseCaseTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["action"], "fallback.outbox.pull")
         self.assertEqual(result["meta"]["count"], 1)
+        self.assertEqual(result["meta"]["active_transport"], "polling_outbox")
         puller.assert_called_once_with("room-alpha", None, 3)
 
     def test_ack_enables_retry_increment_on_failure_by_default(self) -> None:
@@ -300,6 +314,7 @@ class OutboxPollingUseCaseTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["action"], "polling.outbox.ack")
         self.assertEqual(result["meta"]["updated_count"], 2)
+        self.assertEqual(result["meta"]["active_transport"], "polling_outbox")
         acker.assert_called_once_with([10, 20], False, True)
 
 
@@ -317,7 +332,10 @@ class DeliveryDispatchUseCaseTest(unittest.TestCase):
         deliverer = Mock(
             return_value={
                 "ok": True,
+                "transport": "polling",
                 "via": "polling_outbox",
+                "queued": True,
+                "delivered": False,
                 "trace_id": "trace-send",
                 "room_key": "room-alpha",
                 "messages": ["hello"],
@@ -335,6 +353,7 @@ class DeliveryDispatchUseCaseTest(unittest.TestCase):
 
         self.assertEqual(result.status_code, 200)
         self.assertTrue(result.payload["ok"])
+        self.assertEqual(result.payload["action"], "polling.outbox.enqueue")
         self.assertEqual(result.payload["messages"], ["delivery queued for polling"])
         deliverer.assert_called_once()
 

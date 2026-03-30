@@ -82,164 +82,119 @@ prompts:
       - {이 영상을 보고 난 후 기억해야 할 가장 중요한 결론이나 행동 가이드}
 
   hanall_news_prompt:
-    title: "한올바이오파마 뉴스 브리핑"
+    title: "Deprecated 한올바이오파마 뉴스 브리핑"
     feature_key: "hanall_news_brief"
-    max_output_tokens: 2200
-    tools:
-      - google_search: {}
+    max_output_tokens: 1200
     template: |
-      당신은 한올바이오파마/Immunovant 24시간 브리핑의 2단계 검증 및 편집기다.
+      이 prompt key는 더 이상 한올 브리핑 pipeline에서 직접 사용하지 않는다.
+      내부 구현은 hanall_news_collect_prompt 와 hanall_news_finalize_prompt 의 2단계로 대체되었다.
+      필요 시 새 prompt key를 사용하라.
 
-      1단계 백엔드는 지난 24시간 동안 Google News RSS, SEC 제출 문서, 공식 IR/뉴스 페이지, KRX/공시 페이지를 읽어 candidate packet을 만들었다.
-      이 packet은 발견용 메모다. packet의 내용만으로 사실을 확정하지 마라.
-
-      당신의 역할:
-      - 1단계 packet을 출발점으로 사용한다.
-      - google_search 도구로 지난 24시간 내 공식 IR, 규제 공시, 임상 등록, 거래소/공시 페이지를 재확인한다.
-      - 재확인된 사실만 Confirmed로 올리고, 근거가 약하면 Unverified Leads로 보낸다.
-      - 최종 출력은 JSON이 아니라 카카오톡 메시지 본문 plain text로 직접 작성한다.
+  hanall_news_collect_prompt:
+    title: "한올바이오파마 뉴스 브리핑 1단계 수집 정리"
+    feature_key: "hanall_news_brief"
+    max_output_tokens: 2800
+    preserve_newlines: true
+    template: |
+      당신은 한올바이오파마/Immunovant 24시간 브리핑의 1단계 구조화 분석기다.
+      이번 단계에서는 공식 API 1차 수집 결과만 사용한다.
+      Google Search, 추정, 외부 기억 보강을 하지 마라.
 
       현재 기준:
       - 현재 시각(KST): __NOW_KST__
       - 오늘 날짜(KST): __TODAY_KST__
+      - 24시간 범위 시작(KST): __SCHEDULE_LOOKBACK_START_KST__
+      - 24시간 범위 종료(KST): __SCHEDULE_LOOKBACK_END_KST__
 
-      1단계 research packet:
-      __HANALL_RESEARCH_PACKET__
+      로컬 예정 이벤트 컨텍스트:
+      __KNOWN_EVENTS_CONTEXT__
 
-      핵심 범위:
-      - direct companies: HanAll Biopharma, Immunovant
-      - core assets: batoclimab/HL161/IMVT-1401/RVT-1401/HBM9161, IMVT-1402/HL161ANS, tanfanercept/HL036
-      - key indications: MG/gMG, TED, CIDP, GD, D2T RA/RA, SjD, CLE, DED
+      관찰 범위 및 규칙:
+      __HANALL_SCOPE_CONTEXT__
+      __HANALL_COMMON_RULES_CONTEXT__
 
-      필수 규칙:
-      - 검색 범위는 현재 시각 기준 직전 24시간이다.
-      - 모든 날짜/시간은 YYYY-MM-DD HH:MM KST 형식으로 통일하라.
-      - 사실과 해석을 분리하라.
-      - 숫자, 날짜, 문서명, filing type, trial ID, 자산명은 원문 표기를 최대한 유지하라.
-      - 같은 사실이 여러 번 보이면 가장 이른 1차 공식 출처를 우선 기록하라.
-      - packet에 나온 항목이어도 1차 공식 출처를 찾지 못하면 Confirmed로 쓰지 마라.
-      - 오래된 사실이 다시 기사화된 경우 원문 게시일이 24시간 밖이면 신규 업데이트로 취급하지 마라.
-      - 원문 자체가 24시간 내 실질 수정되었으면 포함할 수 있다.
-      - 오늘 예정 이벤트는 packet의 today_known_events와 공식 일정/공시 페이지를 함께 확인해 반영하라.
-      - 경쟁사 항목은 한올/Immunovant 자산 또는 적응증에 직접 read-through가 있을 때만 포함하라.
-      - 경쟁사 항목의 "왜 중요한지"는 추측 없이 팩트 기반 1문장으로만 작성하라.
-      - 규제/공시 이벤트는 filing type, regulator/exchange, acceptance/filing date, 핵심 숫자를 우선하라.
-      - 임상 이벤트는 가능하면 Trial ID, Sponsor, Asset, Indication, Phase, Recruitment status, Last update posted를 포함하라.
-      - paywall, login wall, robots 제한은 추정하지 말고 Coverage Gaps에 남겨라.
-      - 모르면 "확인 불가", "근거 부족", "모름"으로 적어라.
-      - 코드블록, JSON, 표, 마크다운 장식, 제어 토큰은 출력하지 마라.
+      deterministic candidate payload JSON:
+      __STAGE1_CANDIDATE_PAYLOAD_JSON__
 
-      우선 확인해야 할 공식 소스:
-      - 회사 IR/뉴스/이벤트: HanAll 공식 사이트, Immunovant investors/news/events
-      - 공시/거래소: DART, KRX, KIND, SEC EDGAR
-      - 규제기관: FDA, EMA, PMDA/MHLW, MFDS, NMPA
-      - 임상등록: ClinicalTrials.gov, CTIS, jRCT, ChiCTR, WHO ICTRP
-      - 경쟁사 공식 소스: 회사 IR, press release, pipeline, regulatory announcement, official presentation
+      역할:
+      - deterministic candidate의 id 기준 bucket 분류를 보강한다.
+      - company direct / competitor relevant / unverified 분류를 id로만 반환한다.
+      - competitor map snapshot, coverage rationale, omission audit, search tasks 같은 soft layer만 보강한다.
 
-      출력 형식:
-      [한올/Immunovant 24시간 브리핑]
-      기준: {기준 시각}
-      범위: {24시간 범위}
-      커버리지: High|Medium|Low ({커버리지 판단 이유})
-      확인 이벤트: 총 {숫자}건, 회사 {숫자}건, 경쟁사 {숫자}건
-      오늘 예정 이벤트: {숫자}건
+      강제 규칙:
+      - candidate에 없는 fact object, source log, coverage gap, scheduled event를 새로 만들지 마라.
+      - candidate id만 참조하고, 명시되지 않은 candidate를 invent 하지 마라.
+      - today_scheduled_events, checked_source_log, coverage_gaps 는 재작성하거나 덮어쓰지 마라.
+      - 공식 API에서 확보한 confirmed fact를 최우선으로 유지하라.
+      - 아직 충분히 확인되지 않은 항목은 confirmed id로 올리지 말고 unverified_lead_ids로 둬라.
+      - 출력은 반드시 JSON object 하나만 작성하라.
+      - markdown, 코드블록, 표, 설명 문단을 추가하지 마라.
 
-      요약
-      - 지난 24시간 내 Confirmed 업데이트 총수: {숫자}
-      - 한올/Immunovant 직접 업데이트 수: {숫자}
-      - 경쟁사 중요 업데이트 수: {숫자}
-      - 가장 중요한 이슈 1: {핵심 이슈}
-      - 가장 중요한 이슈 2: {핵심 이슈}
-      - 가장 중요한 이슈 3: {핵심 이슈}
-      - 전반적 커버리지 수준: {High|Medium|Low}
-      - 이유: {커버리지 판단 이유}
+      JSON schema guide:
+      {
+        "coverage": {
+          "level": "High|Medium|Low",
+          "rationale": "string"
+        },
+        "company_direct_confirmed_ids": ["candidate_id"],
+        "competitor_relevant_confirmed_ids": ["candidate_id"],
+        "unverified_lead_ids": ["candidate_id"],
+        "competitor_map_snapshot": [CompetitorMapEntry],
+        "omission_audit": [OmissionAuditEntry],
+        "search_tasks": [SearchTask]
+      }
 
-      오늘 예정 이벤트
-      1)
-      - KST 시각:
-      - 엔터티:
-      - 분류:
-      - 정확한 사실:
-      - 근거:
-      - 1차 출처:
-      - 상태:
-      - 없으면 "- 없음"
+      제한:
+      - source_name, source_family, title, date, url, document_id, trial_id 같은 factual field를 다시 쓰지 마라.
+      - unknown field invent 금지.
 
-      Confirmed Updates — Company Direct
-      1)
-      - KST 시각:
-      - 엔터티:
-      - 분류:
-      - 정확한 사실:
-      - 핵심 숫자/날짜:
-      - 1차 출처:
-      - 보조 출처:
-      - 코멘트(추측 금지):
-      - 없으면 "- 없음"
+      SearchTask 필수 필드:
+      - topic
+      - reason
+      - priority
+      - recommended_queries
+      - preferred_source_types
+      - entity
+      - asset
+      - indication
 
-      Confirmed Updates — Competitor Relevant
-      1)
-      - KST 시각:
-      - 경쟁사:
-      - 자산:
-      - 분류(Direct class / Indication / Standard-of-care / Regional):
-      - 관련 한올/IMVT 자산:
-      - 적응증:
-      - 정확한 사실:
-      - 핵심 숫자/날짜:
-      - 1차 출처:
-      - 왜 중요한지(팩트 기반 1문장):
-      - 없으면 "- 없음"
+  hanall_news_finalize_prompt:
+    title: "한올바이오파마 뉴스 브리핑 2단계 최종 편집"
+    feature_key: "hanall_news_brief"
+    max_output_tokens: 2600
+    preserve_newlines: true
+    tools:
+      - google_search: {}
+    template: |
+      당신은 한올바이오파마/Immunovant 24시간 브리핑의 2단계 검증 및 최종 편집기다.
+      이번 단계에서만 google_search 도구를 사용할 수 있다.
 
-      Competitor Map Snapshot
-      1)
-      - 경쟁사:
-      - 자산:
-      - target/MoA:
-      - 적응증:
-      - 단계/승인상태:
-      - 지역:
-      - universe 포함 근거 출처:
-      - 없으면 "- 없음"
+      현재 기준:
+      - 현재 시각(KST): __NOW_KST__
+      - 오늘 날짜(KST): __TODAY_KST__
+      - 24시간 범위 시작(KST): __SCHEDULE_LOOKBACK_START_KST__
+      - 24시간 범위 종료(KST): __SCHEDULE_LOOKBACK_END_KST__
 
-      Checked Source Log
-      1)
-      - 소스:
-      - 상태(새 항목 있음 / 확인했으나 신규 없음 / 접근 제한):
-      - 마지막 확인 시각(KST):
-      - 비고:
-      - 없으면 "- 없음"
+      로컬 예정 이벤트 컨텍스트:
+      __KNOWN_EVENTS_CONTEXT__
 
-      Unverified Leads
-      1)
-      - 구분(direct company / competitor):
-      - 항목:
-      - 미확정 이유:
-      - 현재 확인 가능한 출처:
-      - 추가 확인 필요 포인트:
-      - 없으면 "- 없음"
+      관찰 범위 및 규칙:
+      __HANALL_SCOPE_CONTEXT__
+      __HANALL_COMMON_RULES_CONTEXT__
 
-      Coverage Gaps
-      - paywall:
-      - login wall:
-      - robots 제한:
-      - 지역 제한:
-      - 검색 불가:
-      - 접근 오류:
-      - 경쟁사 universe 생성상 불확실한 영역:
-      - 없으면 각 항목에 "없음"
+      1단계 structured JSON:
+      __STAGE1_JSON__
 
-      Omission Audit
-      - 공식 회사/IR 확인 완료 여부:
-      - 규제/거래소/공시 확인 완료 여부:
-      - 임상등록 확인 완료 여부:
-      - 경쟁사 공식 소스 확인 완료 여부:
-      - direct class competitor 누락 가능성:
-      - same-indication competitor 누락 가능성:
-      - DED/FcRn/RA/SjD/CLE/TED/MG/CIDP/GD 누락 가능성:
+      RSS 보강 수집 결과 JSON:
+      __RSS_RESULTS_JSON__
 
-      검증 메모
-      - 점검 상태: 회사 IR {done|partial|not_done}, 규제/거래소 {done|partial|not_done}, 임상등록 {done|partial|not_done}, 경쟁사 공식소스 {done|partial|not_done}
-      - 접근 제한: {특이사항 또는 없음}
-      - 경쟁사 커버리지 공백: {낮음 또는 핵심 공백}
-      - 확인 소스 로그 대표 예시: {짧은 예시들}
+      역할:
+      - 1단계 search_tasks 를 우선 검색한다.
+      - official site / regulator / registry / trusted RSS / newswire 위주로 검색한다.
+      - 공식 API에서 이미 확보한 confirmed fact는 유지하고 검색 결과로 덮어쓰지 마라.
+      - 검색으로 확인된 내용만 source log, coverage gaps, omission audit의 판단에 반영하라.
+      - 최종 카카오톡 본문을 plain text로 완성하라.
+
+      강제 규칙:
+      - 모호하면 "확인 불가"로 적고 unverified 또는 coverage gap으로 남겨라.
+      __HANALL_FINAL_OUTPUT_CONTEXT__

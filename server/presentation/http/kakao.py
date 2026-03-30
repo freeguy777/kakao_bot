@@ -56,7 +56,7 @@ async def outbox_pull(payload: OutboxPullRequest) -> JSONResponse:
     response = await run_in_threadpool(
         OUTBOX_POLLING_USE_CASE.pull,
         payload,
-        action="fallback.outbox.pull",
+        action="polling.outbox.pull.alias",
     )
     return build_payload_response(response)
 
@@ -66,7 +66,7 @@ async def outbox_ack(payload: OutboxAckRequest) -> JSONResponse:
     response = await run_in_threadpool(
         OUTBOX_POLLING_USE_CASE.ack,
         payload,
-        action="fallback.outbox.ack",
+        action="polling.outbox.ack.alias",
     )
     return build_payload_response(response)
 
@@ -80,4 +80,10 @@ async def polling_pull(payload: OutboxPullRequest) -> JSONResponse:
 @router.post("/polling/ack")
 async def polling_ack(payload: OutboxAckRequest) -> JSONResponse:
     response = await run_in_threadpool(OUTBOX_POLLING_USE_CASE.ack, payload, action="polling.outbox.ack")
+    return build_payload_response(response)
+
+
+@router.get("/polling/status")
+async def polling_status() -> JSONResponse:
+    response = await run_in_threadpool(RUNTIME_HEALTH_USE_CASE.build_polling_status)
     return build_payload_response(response)

@@ -16,6 +16,34 @@ from server.utils import make_trace_id
 logger = logging.getLogger(__name__)
 DEFAULT_SOURCE_TYPE = "server_push"
 DEFAULT_DELIVERY_VIA = "polling_outbox"
+DEFAULT_DELIVERY_TRANSPORT = "polling"
+
+
+def _build_delivery_result(
+    *,
+    ok: bool,
+    via: str,
+    trace_id: str,
+    room_key: str,
+    messages: list[str],
+    outbox_ids: list[int] | None = None,
+    error: str | None = None,
+    queued: bool = False,
+    delivered: bool = False,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "transport": DEFAULT_DELIVERY_TRANSPORT,
+        "via": via,
+        "queued": queued,
+        "delivered": delivered,
+        "trace_id": trace_id,
+        "room_key": room_key,
+        "messages": messages,
+        "ack": None,
+        "outbox_ids": list(outbox_ids or []),
+        "error": error,
+    }
 
 
 def _normalize_messages(raw_messages: Any, raw_message: Any | None = None) -> list[str]:
@@ -145,44 +173,66 @@ def deliver_room_messages(
         trace_id=resolved_trace_id,
         ttl_seconds=dedupe_ttl_seconds,
     ):
-        return {
-            "ok": True,
-            "via": "dedupe_skip",
-            "trace_id": resolved_trace_id,
-            "room_key": room_key,
-            "messages": normalized_messages,
-            "ack": None,
-            "outbox_ids": [],
-            "error": None,
-        }
-
-    outbox_ids: list[int] = []
-    for item in normalized_messages:
-        outbox_ids.append(
-            enqueue_outbox_message(
-                room_key=room_key,
-                message_text=item,
-                source_type=source_type,
-                trace_id=resolved_trace_id,
-                meta={
-                    "delivery_mode": DEFAULT_DELIVERY_VIA,
-                    "original_meta": meta or {},
-                    "dedupe_key": resolved_dedupe_key,
-                    "allow_fallback": bool(allow_fallback),
-                },
-            )
+        return _build_delivery_result(
+            ok=True,
+            via="dedupe_skip",
+            trace_id=resolved_trace_id,
+            room_key=room_key,
+            messages=normalized_messages,
+            outbox_ids=[],
+            error=None,
+            queued=False,
+            delivered=False,
         )
 
-    return {
-        "ok": True,
-        "via": DEFAULT_DELIVERY_VIA,
-        "trace_id": resolved_trace_id,
-        "room_key": room_key,
-        "messages": normalized_messages,
-        "ack": None,
-        "outbox_ids": outbox_ids,
-        "error": None,
-    }
+    try:
+        outbox_ids: list[int] = []
+        for item in normalized_messages:
+            outbox_ids.append(
+                enqueue_outbox_message(
+                    room_key=room_key,
+                    message_text=item,
+                    source_type=source_type,
+                    trace_id=resolved_trace_id,
+                    meta={
+                        "delivery_mode": DEFAULT_DELIVERY_VIA,
+                        "transport": DEFAULT_DELIVERY_TRANSPORT,
+                        "original_meta": meta or {},
+                        "dedupe_key": resolved_dedupe_key,
+                        "allow_fallback": bool(allow_fallback),
+                    },
+                )
+            )
+        return _build_delivery_result(
+            ok=True,
+            via=DEFAULT_DELIVERY_VIA,
+            trace_id=resolved_trace_id,
+            room_key=room_key,
+            messages=normalized_messages,
+            outbox_ids=outbox_ids,
+            error=None,
+            queued=True,
+            delivered=False,
+        )
+    except Exception as exc:
+        logger.exception(
+            "polling outbox enqueue failed room_key=%s trace_id=%s source_type=%s",
+            room_key,
+            resolved_trace_id,
+            source_type,
+            exc_info=exc,
+        )
+        return _build_delivery_result(
+            ok=False,
+            via="error",
+            trace_id=resolved_trace_id,
+            room_key=room_key,
+            messages=normalized_messages,
+            outbox_ids=[],
+            error=str(exc),
+            queued=False,
+            delivered=False,
+        )
 
 
 def flush_pending_outbox_messages(limit: int | None = None) -> dict[str, Any]:

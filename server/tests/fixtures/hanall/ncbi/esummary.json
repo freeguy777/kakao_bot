@@ -1,0 +1,23 @@
+{
+  "result": {
+    "401001": {
+      "uid": "401001",
+      "title": "Batoclimab in generalized myasthenia gravis",
+      "authors": [
+        {
+          "name": "Kim J"
+        }
+      ],
+      "fulljournalname": "Clinical Immunology",
+      "pubdate": "2026 Mar 28"
+    },
+    "401002": {
+      "uid": "401002",
+      "title": "FcRn review with Immunovant context",
+      "sortfirstauthor": "Lee S",
+      "source": "BioDrugs",
+      "pubdate": "Fri, 27 Mar 2026 12:00:00 GMT"
+    },
+    "uids": ["401001", "401002"]
+  }
+}
