@@ -8,7 +8,15 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from server.config import DeliveryPolicy, _normalize_room_policy
-from server.scheduler import JOB_BUILDERS, _build_scheduler_job_id, _deliver_job_message, _deliver_recently_due_jobs, _iter_room_job_specs
+from server.scheduler import (
+    JOB_BUILDERS,
+    _build_scheduler_job_id,
+    _deliver_job_message,
+    _deliver_recently_due_jobs,
+    _iter_room_job_specs,
+    _sync_room_jobs,
+    register_jobs,
+)
 
 
 class RoomScheduleConfigTest(unittest.TestCase):
@@ -172,6 +180,53 @@ class SchedulerCatchUpTest(unittest.TestCase):
         mocked_record.assert_not_called()
 
 
+class SchedulerJobRegistrationTest(unittest.TestCase):
+    def test_sync_room_jobs_sets_misfire_guard_and_coalesce(self) -> None:
+        scheduler = Mock()
+        scheduler.get_jobs.return_value = []
+        builder = Mock()
+        spec = SimpleNamespace(
+            room_key="openchat_test",
+            job_name="hanall_news_brief",
+            job_index=2,
+            builder=builder,
+            trigger={"day_of_week": "mon-fri", "hour": 11, "minute": 15},
+            trigger_index=1,
+        )
+
+        with patch("server.scheduler._iter_room_job_specs", return_value=[spec]):
+            job_ids = _sync_room_jobs(scheduler, "Asia/Seoul", 900)
+
+        self.assertEqual(job_ids, ["openchat_test:hanall_news_brief:2:1"])
+        scheduler.add_job.assert_called_once()
+        kwargs = scheduler.add_job.call_args.kwargs
+        self.assertEqual(kwargs["misfire_grace_time"], 900)
+        self.assertTrue(kwargs["coalesce"])
+        self.assertEqual(kwargs["max_instances"], 1)
+
+    def test_register_jobs_snapshots_rooms_mtime_before_initial_sync(self) -> None:
+        scheduler = Mock()
+        scheduler.get_job.return_value = None
+        settings = SimpleNamespace(timezone="Asia/Seoul", scheduler_recent_misfire_grace_seconds=900)
+
+        with (
+            patch("server.scheduler.reload_settings", return_value=settings),
+            patch("server.scheduler._get_rooms_config_mtime_ns", return_value=123456789),
+            patch("server.scheduler._sync_room_jobs", return_value=["job-1"]) as mocked_sync,
+            patch("server.scheduler._deliver_recently_due_jobs", return_value=[]),
+            patch("server.scheduler._safe_record_scheduler_event"),
+        ):
+            register_jobs(scheduler, settings)
+
+        mocked_sync.assert_called_once_with(scheduler, "Asia/Seoul", 900)
+        self.assertIsNotNone(scheduler.add_job.call_args)
+        self.assertEqual(scheduler.add_job.call_args.kwargs["id"], "system:rooms_config_watch")
+        from server import scheduler as scheduler_module
+
+        self.assertEqual(scheduler_module._ROOMS_CONFIG_MTIME_NS, 123456789)
+        scheduler.start.assert_called_once()
+
+
 class SchedulerDeliveryResultTest(unittest.TestCase):
     def test_hanall_job_builder_disables_raw_admin_payload(self) -> None:
         with patch("server.scheduler.build_hanall_news_brief", return_value="brief") as mocked_build:
@@ -182,6 +237,7 @@ class SchedulerDeliveryResultTest(unittest.TestCase):
             room_key="admin_test_room",
             raise_on_error=True,
             send_raw_to_admin=False,
+            send_detailed_to_admin=True,
         )
 
     def test_deliver_job_message_records_queued_for_polling(self) -> None:

@@ -21,7 +21,10 @@ var CONFIG = {
   STARTUP_NOTIFY_ADMIN: true,
   NOTIFY_ADMIN_ON_NEW_ROOM: true,
   ONLY_FORWARD_YOUTUBE: true,
-  HTTP_TIMEOUT_MS: 120000,
+  HTTP_TIMEOUT_MS: 12000,
+  MESSAGE_EVENT_TIMEOUT_MS: 10000,
+  POLLING_PULL_TIMEOUT_MS: 9000,
+  POLLING_ACK_TIMEOUT_MS: 7000,
   SEND_DELAY_MS: 250,
   POLLING_ENABLED: true,
   POLLING_AUTO_START: true,
@@ -30,38 +33,31 @@ var CONFIG = {
   POLLING_ACK_INCREMENT_RETRY_ON_FAILURE: true,
   POLLING_NOTIFY_ADMIN: true,
   POLLING_ERROR_NOTIFY_INTERVAL_MS: 300000,
-  ASYNC_WORKER_COUNT: 2,
-  ASYNC_QUEUE_CAPACITY: 200,
+  ASYNC_WORKER_COUNT: 4,
+  ASYNC_QUEUE_CAPACITY: 300,
   MAX_RECENT_ROOMS: 100,
   RECENT_EVENT_TTL_MS: 30000,
-  RECENT_COMMAND_TTL_MS: 1500
+  RECENT_COMMAND_TTL_MS: 1500,
+  DIAGNOSTIC_LOG_THROTTLE_MS: 60000,
+  ADMIN_ALERT_THROTTLE_MS: 300000,
+  ADMIN_DIAGNOSTIC_NOTIFY_ENABLED: true,
+  ADMIN_DIAGNOSTIC_NOTIFY_INTERVAL_MS: 600000,
+  HTTP_SLOW_LOG_THRESHOLD_MS: 7000,
+  POLLING_SLOW_LOG_THRESHOLD_MS: 10000
 };
 
-// ===== 3. State =====
-var STATE = {
-  roomsByChannelId: {},
-  roomOrder: [],
-  recentHandledEvents: {},
-  pollingEnabled: false,
-  pollingThreadRunning: false,
-  pollingBusy: false,
-  pollingCycleCount: 0,
-  pollingLastStartedAt: "",
-  pollingLastPolledAt: "",
-  pollingLastSuccessAt: "",
-  pollingLastPulledCount: 0,
-  pollingLastSentCount: 0,
-  pollingLastAckSuccessCount: 0,
-  pollingLastAckFailCount: 0,
-  pollingLastError: "",
-  pollingLastErrorNotifiedAtMs: 0,
-  asyncWorkersStarted: false,
-  asyncTaskQueue: null,
-  asyncEnqueuedCount: 0,
-  asyncExecutedCount: 0,
-  asyncDroppedCount: 0,
-  asyncLastError: ""
-};
+// ===== 3. Runtime / State =====
+var RUNTIME_REGISTRY = getRuntimeRegistry();
+var RUNTIME_SLOT_KEY = trimString(ACTUAL_BOT_NAME || CONFIG.BOT_NAME || "default") || "default";
+var RUNTIME_SLOT = getOrCreateRuntimeSlot(RUNTIME_REGISTRY, RUNTIME_SLOT_KEY);
+var PREVIOUS_RUNTIME = RUNTIME_SLOT.current || null;
+var CURRENT_BOOT_ID = generateInstanceId();
+var DUPLICATE_BOOT_ATTEMPT = !!(PREVIOUS_RUNTIME && PREVIOUS_RUNTIME.initialized);
+var RUNTIME = createRuntime(CURRENT_BOOT_ID, (RUNTIME_SLOT.startupCount || 0) + 1);
+var STATE = RUNTIME.state;
+
+RUNTIME_SLOT.startupCount = RUNTIME.startupCount;
+RUNTIME_SLOT.current = RUNTIME;
 
 // ===== 4. Logging =====
 var Log = {
@@ -81,6 +77,162 @@ var Log = {
 };
 
 // ===== 5. Utils =====
+function getScriptGlobalScope() {
+  try {
+    return (function() {
+      return this;
+    })();
+  } catch (e) {
+    return null;
+  }
+}
+
+function getRuntimeRegistry() {
+  var registryKey = "__PPIRAE_RUNTIME_REGISTRY__";
+  var holder = null;
+  var registry = null;
+
+  try {
+    holder = getScriptGlobalScope();
+    if (holder && holder[registryKey]) {
+      return holder[registryKey];
+    }
+  } catch (e) {}
+
+  try {
+    if (bot && bot[registryKey]) {
+      return bot[registryKey];
+    }
+  } catch (e2) {}
+
+  registry = {};
+
+  try {
+    if (holder) {
+      holder[registryKey] = registry;
+      return registry;
+    }
+  } catch (e3) {}
+
+  try {
+    if (bot) {
+      bot[registryKey] = registry;
+      return registry;
+    }
+  } catch (e4) {}
+
+  return registry;
+}
+
+function getOrCreateRuntimeSlot(registry, key) {
+  var normalizedKey = trimString(key) || "default";
+  if (!registry[normalizedKey] || typeof registry[normalizedKey] !== "object") {
+    registry[normalizedKey] = {
+      startupCount: 0,
+      current: null
+    };
+  }
+  return registry[normalizedKey];
+}
+
+function createInitialState(instanceId, startupCount) {
+  return {
+    instanceId: trimString(instanceId),
+    startupCount: startupCount || 1,
+    bootedAt: nowIsoString(),
+    duplicateBootDetected: false,
+    previousInstanceId: "",
+    roomCacheEvictionCount: 0,
+    roomsByChannelId: {},
+    roomOrder: [],
+    recentHandledEvents: {},
+    recentHandledCleanupCount: 0,
+    adminDiagnosticSentCount: 0,
+    adminDiagnosticSkipCount: 0,
+    adminDiagnosticLastAt: "",
+    adminDiagnosticLastKind: "",
+    lastSuccessAt: "",
+    lastError: "",
+    lastErrorAt: "",
+    lastErrorSource: "",
+    logThrottleAtMs: {},
+    adminAlertThrottleAtMs: {},
+    pollingEnabled: false,
+    pollingThreadRunning: false,
+    pollingLoopStartCount: 0,
+    pollingBusy: false,
+    pollingSyncQueued: false,
+    pollingSyncRunning: false,
+    pollingSyncSkipCount: 0,
+    pollingCycleCount: 0,
+    pollingLastStartedAt: "",
+    pollingLastPolledAt: "",
+    pollingLastSuccessAt: "",
+    pollingLastPulledCount: 0,
+    pollingLastSentCount: 0,
+    pollingLastAckSuccessCount: 0,
+    pollingLastAckFailCount: 0,
+    pollingLastError: "",
+    pollingLastErrorNotifiedAtMs: 0,
+    pollingLastDurationMs: 0,
+    pollingLastTrigger: "",
+    pollingLastCycleAt: "",
+    asyncWorkersStarted: false,
+    asyncWorkerStartedCount: 0,
+    asyncTaskQueue: null,
+    asyncEnqueuedCount: 0,
+    asyncEnqueueFailCount: 0,
+    asyncExecutedCount: 0,
+    asyncDroppedCount: 0,
+    asyncQueueHighWaterMark: 0,
+    asyncLastError: "",
+    asyncLastEnqueueLabel: "",
+    taskLabelCounts: {},
+    messageEventCount: 0,
+    messageEventDroppedCount: 0,
+    lastMessageEventDurationMs: 0,
+    messageEventLastSuccessAt: "",
+    messageEventLastError: "",
+    sendAttemptCount: 0,
+    sendFailureCount: 0,
+    sendLastDurationMs: 0,
+    sendLastSuccessAt: "",
+    sendLastError: "",
+    httpCallCount: 0,
+    httpLastEndpoint: "",
+    httpLastStartedAt: "",
+    httpLastFinishedAt: "",
+    httpLastDurationMs: 0,
+    httpLastStatus: "",
+    httpLastError: "",
+    httpStatsByEndpoint: {}
+  };
+}
+
+function createRuntime(instanceId, startupCount) {
+  return {
+    instanceId: trimString(instanceId),
+    startupCount: startupCount || 1,
+    createdAt: nowIsoString(),
+    initialized: false,
+    stopRequested: false,
+    listeners: {},
+    workerThreads: [],
+    pollingThread: null,
+    state: createInitialState(instanceId, startupCount || 1)
+  };
+}
+
+function generateInstanceId() {
+  var randomPart = "0";
+  try {
+    randomPart = java.lang.Long.toHexString(
+      java.lang.Double.doubleToLongBits(java.lang.Math.random())
+    );
+  } catch (e) {}
+  return String(nowMillis()) + "-" + String(randomPart);
+}
+
 function safeString(value) {
   if (value === null || value === undefined) {
     return "";
@@ -94,6 +246,65 @@ function trimString(value) {
 
 function isArray(value) {
   return Object.prototype.toString.call(value) === "[object Array]";
+}
+
+function countObjectKeys(value) {
+  var count = 0;
+  var key;
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  for (key in value) {
+    if (value.hasOwnProperty(key)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function runtimeMemoryInfo() {
+  var runtime;
+  var total;
+  var free;
+  var max;
+  var used;
+
+  try {
+    runtime = java.lang.Runtime.getRuntime();
+    total = runtime.totalMemory();
+    free = runtime.freeMemory();
+    max = runtime.maxMemory();
+    used = total - free;
+    return {
+      used: used,
+      free: free,
+      total: total,
+      max: max
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function formatBytes(value) {
+  var bytes = parseInt(value, 10);
+  if (!bytes && bytes !== 0) {
+    return "-";
+  }
+  return String(Math.round((bytes / 1024 / 1024) * 10) / 10) + "MB";
+}
+
+function buildMemoryText() {
+  var info = runtimeMemoryInfo();
+  if (!info) {
+    return "memory: unavailable";
+  }
+  return (
+    "memoryUsed: " + formatBytes(info.used) + "\n" +
+    "memoryFree: " + formatBytes(info.free) + "\n" +
+    "memoryTotal: " + formatBytes(info.total) + "\n" +
+    "memoryMax: " + formatBytes(info.max)
+  );
 }
 
 function toPlainArray(value) {
@@ -149,6 +360,221 @@ function nowMillis() {
   return java.lang.System.currentTimeMillis();
 }
 
+function normalizeTaskLabelForStats(label) {
+  var normalized = trimString(label) || "async-task";
+  var index = normalized.indexOf(":");
+  if (index > 0) {
+    normalized = normalized.substring(0, index);
+  }
+  return normalized;
+}
+
+function updateTaskLabelStats(label) {
+  var key = normalizeTaskLabelForStats(label);
+  if (!STATE.taskLabelCounts[key]) {
+    STATE.taskLabelCounts[key] = 0;
+  }
+  STATE.taskLabelCounts[key] += 1;
+}
+
+function updateAsyncQueueHighWaterMark() {
+  var size = getAsyncQueueSize();
+  if (size > STATE.asyncQueueHighWaterMark) {
+    STATE.asyncQueueHighWaterMark = size;
+  }
+  return size;
+}
+
+function logThrottled(level, throttleKey, message, intervalMs) {
+  var key = trimString(throttleKey) || "default";
+  var now = nowMillis();
+  var interval = intervalMs || CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS;
+  var lastAt = STATE.logThrottleAtMs[key] || 0;
+
+  if (lastAt && now - lastAt < interval) {
+    return false;
+  }
+
+  STATE.logThrottleAtMs[key] = now;
+  if (level === "error") {
+    Log.e(message);
+  } else {
+    Log.i(message);
+  }
+  return true;
+}
+
+function recordLastError(source, message) {
+  STATE.lastErrorSource = trimString(source) || "-";
+  STATE.lastError = safeString(message);
+  STATE.lastErrorAt = nowIsoString();
+}
+
+function recordLastSuccess(source) {
+  STATE.lastSuccessAt = nowIsoString();
+}
+
+function notifyAdminAsyncThrottled(throttleKey, text, intervalMs) {
+  var key = trimString(throttleKey) || "admin";
+  var now = nowMillis();
+  var interval = intervalMs || CONFIG.ADMIN_ALERT_THROTTLE_MS;
+  var lastAt = STATE.adminAlertThrottleAtMs[key] || 0;
+
+  if (lastAt && now - lastAt < interval) {
+    return false;
+  }
+
+  STATE.adminAlertThrottleAtMs[key] = now;
+  notifyAdminAsync(text);
+  return true;
+}
+
+function buildCompactDiagnosticSnapshot() {
+  var memory = runtimeMemoryInfo();
+  var memoryUsed = memory ? formatBytes(memory.used) : "-";
+  return (
+    "instanceId=" + safeString(STATE.instanceId) +
+    " queue=" + String(getAsyncQueueSize()) +
+    " highWater=" + String(STATE.asyncQueueHighWaterMark) +
+    " dropped=" + String(STATE.asyncDroppedCount) +
+    " pollingRunning=" + String(STATE.pollingThreadRunning) +
+    " syncQ=" + String(STATE.pollingSyncQueued) +
+    " syncRun=" + String(STATE.pollingSyncRunning) +
+    " cycle=" + String(STATE.pollingCycleCount) +
+    " lastPollMs=" + String(STATE.pollingLastDurationMs) +
+    " rooms=" + String(STATE.roomOrder.length) + "/" + String(roomCount()) +
+    " recent=" + String(getRecentHandledEventCount()) +
+    " memUsed=" + memoryUsed
+  );
+}
+
+function notifyAdminDiagnosticThrottled(kind, detail) {
+  var normalizedKind = trimString(kind) || "diagnostic";
+  var text;
+  var key = "__diagnostic_global__";
+  var now = nowMillis();
+  var interval = CONFIG.ADMIN_DIAGNOSTIC_NOTIFY_INTERVAL_MS;
+  var lastAt = STATE.adminAlertThrottleAtMs[key] || 0;
+
+  if (!CONFIG.ADMIN_DIAGNOSTIC_NOTIFY_ENABLED) {
+    return false;
+  }
+
+  if (lastAt && now - lastAt < interval) {
+    STATE.adminDiagnosticSkipCount += 1;
+    return false;
+  }
+
+  text =
+    "[운영진단]\n" +
+    "kind: " + normalizedKind + "\n" +
+    "detail: " + safeString(detail) + "\n" +
+    buildCompactDiagnosticSnapshot() + "\n" +
+    "lastErrorSource: " + safeString(STATE.lastErrorSource) + "\n" +
+    "lastError: " + previewText(STATE.lastError, 160);
+
+  STATE.adminAlertThrottleAtMs[key] = now;
+  STATE.adminDiagnosticSentCount += 1;
+  STATE.adminDiagnosticLastAt = nowIsoString();
+  STATE.adminDiagnosticLastKind = normalizedKind;
+
+  try {
+    if (!enqueueAsyncTask("notify_admin_diagnostic:" + normalizedKind, function() {
+      notifyAdmin(text);
+    })) {
+      STATE.adminDiagnosticSkipCount += 1;
+      logThrottled(
+        "error",
+        "notify_admin_diagnostic_drop",
+        "admin diagnostic enqueue failed kind=" + normalizedKind +
+        " detail=" + safeString(detail),
+        CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS
+      );
+      return false;
+    }
+  } catch (e) {
+    STATE.adminDiagnosticSkipCount += 1;
+    logThrottled(
+      "error",
+      "notify_admin_diagnostic_exception",
+      "admin diagnostic exception kind=" + normalizedKind +
+      " error=" + safeString(e),
+      CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS
+    );
+    return false;
+  }
+
+  return true;
+}
+
+function getRecentHandledEventCount() {
+  cleanupRecentHandledEvents();
+  return countObjectKeys(STATE.recentHandledEvents);
+}
+
+function recordHttpCall(endpoint, startedAtMs, status, errorText) {
+  var finishedAtMs = nowMillis();
+  var elapsedMs = finishedAtMs - startedAtMs;
+  var key = trimString(endpoint) || "http";
+  var stats = STATE.httpStatsByEndpoint[key];
+  var finalError = trimString(errorText);
+
+  if (!stats) {
+    stats = {
+      count: 0,
+      lastStatus: "",
+      lastElapsedMs: 0,
+      lastError: "",
+      lastAt: ""
+    };
+  }
+
+  stats.count += 1;
+  stats.lastStatus = String(status);
+  stats.lastElapsedMs = elapsedMs;
+  stats.lastError = finalError;
+  stats.lastAt = nowIsoString();
+  STATE.httpStatsByEndpoint[key] = stats;
+
+  STATE.httpCallCount += 1;
+  STATE.httpLastEndpoint = key;
+  STATE.httpLastStartedAt = safeString(startedAtMs);
+  STATE.httpLastFinishedAt = stats.lastAt;
+  STATE.httpLastDurationMs = elapsedMs;
+  STATE.httpLastStatus = String(status);
+  STATE.httpLastError = finalError;
+
+  if (finalError) {
+    recordLastError("http:" + key, finalError);
+  }
+
+  Log.i(
+    "http completed endpoint=" + key +
+    " status=" + String(status) +
+    " elapsedMs=" + String(elapsedMs) +
+    " error=" + (finalError || "-")
+  );
+
+  if (finalError) {
+    notifyAdminDiagnosticThrottled(
+      "http_error",
+      "endpoint=" + key +
+      " status=" + String(status) +
+      " elapsedMs=" + String(elapsedMs) +
+      " error=" + finalError
+    );
+  } else if (elapsedMs >= CONFIG.HTTP_SLOW_LOG_THRESHOLD_MS) {
+    notifyAdminDiagnosticThrottled(
+      "slow_http",
+      "endpoint=" + key +
+      " status=" + String(status) +
+      " elapsedMs=" + String(elapsedMs)
+    );
+  }
+
+  return elapsedMs;
+}
+
 function sleepMs(ms) {
   try {
     java.lang.Thread.sleep(ms);
@@ -174,6 +600,50 @@ function startThread(runFn, threadName) {
   return thread;
 }
 
+function cleanupRuntime(runtime, reason) {
+  var normalizedReason = trimString(reason) || "duplicate_boot";
+
+  if (!runtime) {
+    return;
+  }
+
+  runtime.stopRequested = true;
+
+  try {
+    if (runtime.state) {
+      runtime.state.pollingEnabled = false;
+      runtime.state.pollingSyncQueued = false;
+    }
+  } catch (e) {}
+
+  try {
+    if (bot && typeof bot.removeListener === "function" && runtime.listeners) {
+      if (runtime.listeners.message) {
+        try {
+          bot.removeListener(Event.MESSAGE, runtime.listeners.message);
+        } catch (e2) {}
+      }
+      if (runtime.listeners.command) {
+        try {
+          bot.removeListener(Event.COMMAND, runtime.listeners.command);
+        } catch (e3) {}
+      }
+    }
+  } catch (e4) {}
+
+  Log.i(
+    "runtime cleanup requested instanceId=" + safeString(runtime.instanceId) +
+    " reason=" + normalizedReason
+  );
+
+  notifyAdminDiagnosticThrottled(
+    "duplicate_boot",
+    "previousInstanceId=" + safeString(runtime.instanceId) +
+    " reason=" + normalizedReason +
+    " newInstanceId=" + safeString(STATE.instanceId)
+  );
+}
+
 function getAsyncQueueSize() {
   try {
     if (!STATE.asyncTaskQueue) {
@@ -187,6 +657,7 @@ function getAsyncQueueSize() {
 
 function ensureAsyncWorkersStarted() {
   var i;
+  var thread;
 
   if (STATE.asyncWorkersStarted) {
     return;
@@ -194,24 +665,34 @@ function ensureAsyncWorkersStarted() {
 
   STATE.asyncTaskQueue = new java.util.concurrent.LinkedBlockingQueue(CONFIG.ASYNC_QUEUE_CAPACITY);
   STATE.asyncWorkersStarted = true;
+  RUNTIME.workerThreads = [];
 
   for (i = 0; i < CONFIG.ASYNC_WORKER_COUNT; i++) {
     (function(workerIndex) {
-      startThread(
+      thread = startThread(
         function() {
           var task;
           var taskLabel;
 
-          Log.i("async worker started index=" + String(workerIndex));
-          while (true) {
+          STATE.asyncWorkerStartedCount += 1;
+          Log.i(
+            "async worker started index=" + String(workerIndex) +
+            " instanceId=" + safeString(STATE.instanceId)
+          );
+          while (!RUNTIME.stopRequested) {
             try {
-              task = STATE.asyncTaskQueue.take();
+              task = STATE.asyncTaskQueue.poll(1000, java.util.concurrent.TimeUnit.MILLISECONDS);
             } catch (takeError) {
               STATE.asyncLastError =
                 "async queue take failed worker=" + String(workerIndex) +
                 " error=" + safeString(takeError);
+              recordLastError("async_take", STATE.asyncLastError);
               Log.e(STATE.asyncLastError);
               sleepMs(500);
+              continue;
+            }
+
+            if (!task) {
               continue;
             }
 
@@ -223,31 +704,50 @@ function ensureAsyncWorkersStarted() {
             try {
               task.run();
               STATE.asyncExecutedCount += 1;
+              recordLastSuccess("async:" + normalizeTaskLabelForStats(taskLabel));
             } catch (taskError) {
               STATE.asyncLastError =
                 "async task failed worker=" + String(workerIndex) +
                 " label=" + taskLabel +
                 " error=" + safeString(taskError);
+              recordLastError("async_task", STATE.asyncLastError);
               Log.e(STATE.asyncLastError);
             }
           }
+          Log.i(
+            "async worker stopped index=" + String(workerIndex) +
+            " instanceId=" + safeString(STATE.instanceId)
+          );
         },
         "PpiraeAsyncWorker-" + String(workerIndex)
       );
+      RUNTIME.workerThreads.push(thread);
     })(i + 1);
   }
 
   Log.i(
     "async workers started count=" + String(CONFIG.ASYNC_WORKER_COUNT) +
-    " queueCapacity=" + String(CONFIG.ASYNC_QUEUE_CAPACITY)
+    " queueCapacity=" + String(CONFIG.ASYNC_QUEUE_CAPACITY) +
+    " instanceId=" + safeString(STATE.instanceId)
   );
 }
 
 function enqueueAsyncTask(label, runFn) {
   var normalizedLabel = trimString(label) || "async-task";
   var offered = false;
+  var queueSize;
 
   if (typeof runFn !== "function") {
+    return false;
+  }
+
+  if (RUNTIME.stopRequested) {
+    STATE.asyncDroppedCount += 1;
+    STATE.asyncEnqueueFailCount += 1;
+    STATE.asyncLastError =
+      "async enqueue skipped after stop label=" + normalizedLabel;
+    recordLastError("async_enqueue_stopped", STATE.asyncLastError);
+    logThrottled("error", "async_enqueue_stopped", STATE.asyncLastError, CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS);
     return false;
   }
 
@@ -259,23 +759,46 @@ function enqueueAsyncTask(label, runFn) {
       run: runFn
     });
   } catch (e) {
+    STATE.asyncEnqueueFailCount += 1;
     STATE.asyncLastError =
       "async enqueue failed label=" + normalizedLabel +
       " error=" + safeString(e);
+    recordLastError("async_enqueue_exception", STATE.asyncLastError);
     Log.e(STATE.asyncLastError);
     return false;
   }
 
   if (!offered) {
     STATE.asyncDroppedCount += 1;
+    STATE.asyncEnqueueFailCount += 1;
     STATE.asyncLastError =
       "async queue full label=" + normalizedLabel +
       " size=" + String(getAsyncQueueSize());
+    recordLastError("async_queue_full", STATE.asyncLastError);
     Log.e(STATE.asyncLastError);
     return false;
   }
 
   STATE.asyncEnqueuedCount += 1;
+  STATE.asyncLastEnqueueLabel = normalizedLabel;
+  updateTaskLabelStats(normalizedLabel);
+  queueSize = updateAsyncQueueHighWaterMark();
+  if (queueSize >= Math.max(10, Math.floor(CONFIG.ASYNC_QUEUE_CAPACITY * 0.7))) {
+    logThrottled(
+      "info",
+      "async_queue_pressure",
+      "async queue pressure size=" + String(queueSize) +
+      " highWater=" + String(STATE.asyncQueueHighWaterMark) +
+      " lastLabel=" + normalizedLabel,
+      CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS
+    );
+    notifyAdminDiagnosticThrottled(
+      "async_queue_pressure",
+      "size=" + String(queueSize) +
+      " highWater=" + String(STATE.asyncQueueHighWaterMark) +
+      " lastLabel=" + normalizedLabel
+    );
+  }
   return true;
 }
 
@@ -334,6 +857,7 @@ function cleanupRecentHandledEvents() {
     }
     if (now - entry > ttl) {
       delete STATE.recentHandledEvents[key];
+      STATE.recentHandledCleanupCount += 1;
     }
   }
 }
@@ -456,6 +980,8 @@ function isKnownAdminCommand(command) {
     value === "yaml" ||
     value === "연동상태" ||
     value === "폴링상태" ||
+    value === "진단상태" ||
+    value === "디버그상태" ||
     value === "폴링시작" ||
     value === "폴링중지" ||
     value === "폴링재시작" ||
@@ -541,6 +1067,7 @@ function isAdminRoom(msg) {
 // ===== 8. Room Cache =====
 function addRoomOrder(channelId) {
   var i;
+  var evictedChannelId;
   for (i = 0; i < STATE.roomOrder.length; i++) {
     if (STATE.roomOrder[i] === channelId) {
       STATE.roomOrder.splice(i, 1);
@@ -549,7 +1076,19 @@ function addRoomOrder(channelId) {
   }
   STATE.roomOrder.unshift(channelId);
   while (STATE.roomOrder.length > CONFIG.MAX_RECENT_ROOMS) {
-    STATE.roomOrder.pop();
+    evictedChannelId = STATE.roomOrder.pop();
+    if (evictedChannelId && STATE.roomsByChannelId[evictedChannelId]) {
+      delete STATE.roomsByChannelId[evictedChannelId];
+      STATE.roomCacheEvictionCount += 1;
+      logThrottled(
+        "info",
+        "room_cache_evict",
+        "room cache evicted channelId=" + safeString(evictedChannelId) +
+        " roomOrder=" + String(STATE.roomOrder.length) +
+        " cachedRooms=" + String(roomCount()),
+        CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS
+      );
+    }
   }
 }
 
@@ -748,19 +1287,30 @@ function sendMessagesToRoom(roomName, messages, packageName, traceId) {
   var ok = true;
   var sentCount = 0;
   var lastError = "";
+  var startedAtMs = nowMillis();
 
   for (i = 0; i < normalized.length; i++) {
+    STATE.sendAttemptCount += 1;
     if (!botSendRoom(roomName, normalized[i], packageName)) {
       ok = false;
+      STATE.sendFailureCount += 1;
       lastError =
         "bot.send failed at index=" + String(i + 1) +
         " traceId=" + safeString(traceId);
+      STATE.sendLastError = lastError;
+      recordLastError("send", lastError);
       break;
     }
     sentCount += 1;
     if (i < normalized.length - 1) {
       sleepMs(CONFIG.SEND_DELAY_MS);
     }
+  }
+
+  STATE.sendLastDurationMs = nowMillis() - startedAtMs;
+  if (ok) {
+    STATE.sendLastSuccessAt = nowIsoString();
+    recordLastSuccess("send");
   }
 
   return {
@@ -770,13 +1320,25 @@ function sendMessagesToRoom(roomName, messages, packageName, traceId) {
   };
 }
 
+function handleAsyncDrop(label, detail) {
+  var normalizedLabel = trimString(label) || "async-drop";
+  var message =
+    "async task dropped label=" + normalizedLabel +
+    " detail=" + safeString(detail) +
+    " queueSize=" + String(getAsyncQueueSize()) +
+    " highWater=" + String(STATE.asyncQueueHighWaterMark);
+  recordLastError("async_drop", message);
+  logThrottled("error", "async_drop:" + normalizeTaskLabelForStats(normalizedLabel), message, CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS);
+  notifyAdminDiagnosticThrottled("async_drop", message);
+}
+
 function sendMessagesToCurrentRoomAsync(msg, messages, traceId) {
   var roomName = getRoomName(msg);
   var packageName = getPackageName(msg) || getKakaoPackageName();
   if (!enqueueAsyncTask("send_current_room:" + safeString(traceId), function() {
     sendMessagesToRoom(roomName, messages, packageName, traceId);
   })) {
-    Log.e("failed to enqueue current room send traceId=" + safeString(traceId));
+    handleAsyncDrop("send_current_room:" + safeString(traceId), "traceId=" + safeString(traceId));
   }
 }
 
@@ -788,7 +1350,7 @@ function notifyAdminAsync(text) {
   if (!enqueueAsyncTask("notify_admin", function() {
     notifyAdmin(text);
   })) {
-    notifyAdmin(text);
+    handleAsyncDrop("notify_admin", previewText(text, 80));
   }
 }
 
@@ -798,15 +1360,23 @@ function replyAdminCommand(msg, text) {
   if (!enqueueAsyncTask("reply_admin_command", function() {
     sendMessagesToRoom(roomName, [text], packageName, "admin-command");
   })) {
-    sendMessagesToRoom(roomName, [text], packageName, "admin-command");
+    handleAsyncDrop("reply_admin_command", previewText(text, 80));
   }
 }
 
 // ===== 10. HTTP =====
-function httpPostJson(url, payload) {
+function httpPostJson(url, payload, options) {
   var response;
   var body;
   var parsed;
+  var endpoint = trimString(options && options.endpoint) || "http_post";
+  var timeoutMs = parseInt(options && options.timeoutMs, 10);
+  var startedAtMs = nowMillis();
+  var elapsedMs;
+
+  if (!(timeoutMs > 0)) {
+    timeoutMs = CONFIG.HTTP_TIMEOUT_MS;
+  }
 
   try {
     response = org.jsoup.Jsoup.connect(url)
@@ -816,7 +1386,7 @@ function httpPostJson(url, payload) {
       .header("Accept", "application/json")
       .requestBody(JSON.stringify(payload))
       .method(org.jsoup.Connection.Method.POST)
-      .timeout(CONFIG.HTTP_TIMEOUT_MS)
+      .timeout(timeoutMs)
       .execute();
 
     body = response.body();
@@ -825,20 +1395,25 @@ function httpPostJson(url, payload) {
       parsed = JSON.parse(body);
     } catch (parseError) {}
 
+    elapsedMs = recordHttpCall(endpoint, startedAtMs, response.statusCode(), "");
+
     return {
       ok: response.statusCode() >= 200 && response.statusCode() < 300,
       status: response.statusCode(),
       body: body,
       json: parsed,
-      error: ""
+      error: "",
+      elapsedMs: elapsedMs
     };
   } catch (e) {
+    elapsedMs = recordHttpCall(endpoint, startedAtMs, -1, safeString(e));
     return {
       ok: false,
       status: -1,
       body: "",
       json: null,
-      error: safeString(e)
+      error: safeString(e),
+      elapsedMs: elapsedMs
     };
   }
 }
@@ -856,6 +1431,10 @@ function postMessageEvent(msg) {
       user_hash: getUserHash(msg),
       is_group_chat: getIsGroupChat(msg),
       received_at: nowIsoString()
+    },
+    {
+      endpoint: "message_event_post",
+      timeoutMs: CONFIG.MESSAGE_EVENT_TIMEOUT_MS
     }
   );
 }
@@ -865,6 +1444,10 @@ function postPollingPull(limit) {
     CONFIG.API_BASE_URL + "/polling/pull",
     {
       limit: limit || CONFIG.POLLING_LIMIT
+    },
+    {
+      endpoint: "polling_pull",
+      timeoutMs: CONFIG.POLLING_PULL_TIMEOUT_MS
     }
   );
 }
@@ -876,6 +1459,10 @@ function postPollingAck(messageIds, success, incrementRetry) {
       message_ids: messageIds,
       success: !!success,
       increment_retry: !!incrementRetry
+    },
+    {
+      endpoint: "polling_ack",
+      timeoutMs: CONFIG.POLLING_ACK_TIMEOUT_MS
     }
   );
 }
@@ -952,12 +1539,26 @@ function handleMessageEventResponse(msg, response) {
 }
 
 function forwardMessageAsync(msg) {
-  if (!enqueueAsyncTask("forward_message_event:" + getLogId(msg), function() {
+  var taskLabel = "forward_message_event:" + getLogId(msg);
+  if (!enqueueAsyncTask(taskLabel, function() {
     var response;
+    var startedAtMs = nowMillis();
     try {
       response = postMessageEvent(msg);
       handleMessageEventResponse(msg, response);
+      STATE.messageEventCount += 1;
+      STATE.lastMessageEventDurationMs = nowMillis() - startedAtMs;
+      STATE.messageEventLastSuccessAt = nowIsoString();
+      recordLastSuccess("message_event");
+      Log.i(
+        "message event processed logId=" + safeString(getLogId(msg)) +
+        " elapsedMs=" + String(STATE.lastMessageEventDurationMs) +
+        " status=" + String(response && response.status)
+      );
     } catch (e) {
+      STATE.lastMessageEventDurationMs = nowMillis() - startedAtMs;
+      STATE.messageEventLastError = safeString(e);
+      recordLastError("message_event", STATE.messageEventLastError);
       notifyAdminAsync(
         "[이벤트예외]\n" +
         "room: " + getRoomName(msg) + "\n" +
@@ -968,25 +1569,113 @@ function forwardMessageAsync(msg) {
       );
     }
   })) {
-    notifyAdmin(
-      "[이벤트큐포화]\n" +
-      "room: " + getRoomName(msg) + "\n" +
-      "channelId: " + getChannelId(msg) + "\n" +
-      "logId: " + getLogId(msg)
+    STATE.messageEventDroppedCount += 1;
+    handleAsyncDrop(
+      taskLabel,
+      "room=" + getRoomName(msg) +
+      " channelId=" + getChannelId(msg) +
+      " logId=" + getLogId(msg)
     );
   }
 }
 
 // ===== 12. Polling =====
+function topTaskLabelSummary(limit) {
+  var entries = [];
+  var key;
+  var i;
+  var item;
+  var max = limit || 8;
+
+  for (key in STATE.taskLabelCounts) {
+    if (STATE.taskLabelCounts.hasOwnProperty(key)) {
+      entries.push({
+        label: key,
+        count: STATE.taskLabelCounts[key]
+      });
+    }
+  }
+
+  entries.sort(function(a, b) {
+    return b.count - a.count;
+  });
+
+  if (entries.length === 0) {
+    return "-";
+  }
+
+  var parts = [];
+  for (i = 0; i < entries.length && i < max; i++) {
+    item = entries[i];
+    parts.push(item.label + "=" + String(item.count));
+  }
+  return parts.join(", ");
+}
+
+function buildHttpStatsText() {
+  var lines = [];
+  var key;
+  var stats;
+
+  lines.push("[HTTP]");
+  lines.push("count: " + String(STATE.httpCallCount));
+  lines.push("lastEndpoint: " + safeString(STATE.httpLastEndpoint));
+  lines.push("lastDurationMs: " + String(STATE.httpLastDurationMs));
+  lines.push("lastStatus: " + safeString(STATE.httpLastStatus));
+  lines.push("lastError: " + safeString(STATE.httpLastError));
+
+  for (key in STATE.httpStatsByEndpoint) {
+    if (!STATE.httpStatsByEndpoint.hasOwnProperty(key)) {
+      continue;
+    }
+    stats = STATE.httpStatsByEndpoint[key];
+    lines.push(
+      "- " + key +
+      " | count=" + String(stats.count) +
+      " | lastStatus=" + safeString(stats.lastStatus) +
+      " | lastElapsedMs=" + String(stats.lastElapsedMs) +
+      " | lastAt=" + safeString(stats.lastAt) +
+      " | lastError=" + (safeString(stats.lastError) || "-")
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function buildStatusText() {
   return (
     "[연동 상태]\n" +
     "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
+    "instanceId: " + safeString(STATE.instanceId) + "\n" +
+    "startupCount: " + String(STATE.startupCount) + "\n" +
+    "bootedAt: " + safeString(STATE.bootedAt) + "\n" +
+    "duplicateBootDetected: " + String(STATE.duplicateBootDetected) + "\n" +
+    "previousInstanceId: " + safeString(STATE.previousInstanceId) + "\n" +
     "api: " + CONFIG.API_BASE_URL + "\n" +
     "cachedRooms: " + String(roomCount()) + "\n" +
+    "roomOrderLength: " + String(STATE.roomOrder.length) + "\n" +
+    "roomsByChannelIdCount: " + String(roomCount()) + "\n" +
+    "roomCacheEvictionCount: " + String(STATE.roomCacheEvictionCount) + "\n" +
+    "recentHandledEventsCount: " + String(getRecentHandledEventCount()) + "\n" +
+    "messageEventCount: " + String(STATE.messageEventCount) + "\n" +
+    "messageEventDroppedCount: " + String(STATE.messageEventDroppedCount) + "\n" +
+    "lastMessageEventDurationMs: " + String(STATE.lastMessageEventDurationMs) + "\n" +
+    "sendAttemptCount: " + String(STATE.sendAttemptCount) + "\n" +
+    "sendFailureCount: " + String(STATE.sendFailureCount) + "\n" +
+    "sendLastDurationMs: " + String(STATE.sendLastDurationMs) + "\n" +
+    "sendLastError: " + safeString(STATE.sendLastError) + "\n" +
+    "adminDiagnosticSentCount: " + String(STATE.adminDiagnosticSentCount) + "\n" +
+    "adminDiagnosticSkipCount: " + String(STATE.adminDiagnosticSkipCount) + "\n" +
+    "adminDiagnosticLastAt: " + safeString(STATE.adminDiagnosticLastAt) + "\n" +
+    "adminDiagnosticLastKind: " + safeString(STATE.adminDiagnosticLastKind) + "\n" +
+    "lastSuccessAt: " + safeString(STATE.lastSuccessAt) + "\n" +
+    "lastErrorSource: " + safeString(STATE.lastErrorSource) + "\n" +
+    "lastErrorAt: " + safeString(STATE.lastErrorAt) + "\n" +
+    "lastError: " + safeString(STATE.lastError) + "\n" +
     "activeTransport: polling_outbox\n" +
     "deliveryMode: polling_outbox\n" +
-    "onlyForwardYouTube: " + String(CONFIG.ONLY_FORWARD_YOUTUBE)
+    "onlyForwardYouTube: " + String(CONFIG.ONLY_FORWARD_YOUTUBE) + "\n" +
+    buildMemoryText()
   );
 }
 
@@ -997,23 +1686,44 @@ function buildPollingStatusText() {
     "autoStart: " + String(CONFIG.POLLING_AUTO_START) + "\n" +
     "running: " + String(STATE.pollingThreadRunning) + "\n" +
     "busy: " + String(STATE.pollingBusy) + "\n" +
+    "pollingSyncQueued: " + String(STATE.pollingSyncQueued) + "\n" +
+    "pollingSyncRunning: " + String(STATE.pollingSyncRunning) + "\n" +
+    "pollingSyncSkipCount: " + String(STATE.pollingSyncSkipCount) + "\n" +
     "intervalMs: " + String(CONFIG.POLLING_INTERVAL_MS) + "\n" +
     "limit: " + String(CONFIG.POLLING_LIMIT) + "\n" +
+    "loopStartCount: " + String(STATE.pollingLoopStartCount) + "\n" +
     "cycleCount: " + String(STATE.pollingCycleCount) + "\n" +
     "lastStartedAt: " + safeString(STATE.pollingLastStartedAt) + "\n" +
     "lastPolledAt: " + safeString(STATE.pollingLastPolledAt) + "\n" +
     "lastSuccessAt: " + safeString(STATE.pollingLastSuccessAt) + "\n" +
+    "lastDurationMs: " + String(STATE.pollingLastDurationMs) + "\n" +
+    "lastTrigger: " + safeString(STATE.pollingLastTrigger) + "\n" +
     "lastPulledCount: " + String(STATE.pollingLastPulledCount) + "\n" +
     "lastSentCount: " + String(STATE.pollingLastSentCount) + "\n" +
     "lastAckSuccessCount: " + String(STATE.pollingLastAckSuccessCount) + "\n" +
     "lastAckFailCount: " + String(STATE.pollingLastAckFailCount) + "\n" +
     "lastError: " + safeString(STATE.pollingLastError) + "\n" +
+    "workerStartedCount: " + String(STATE.asyncWorkerStartedCount) + "\n" +
     "asyncWorkersStarted: " + String(STATE.asyncWorkersStarted) + "\n" +
     "asyncQueueSize: " + String(getAsyncQueueSize()) + "\n" +
+    "asyncQueueHighWaterMark: " + String(STATE.asyncQueueHighWaterMark) + "\n" +
     "asyncEnqueuedCount: " + String(STATE.asyncEnqueuedCount) + "\n" +
+    "asyncEnqueueFailCount: " + String(STATE.asyncEnqueueFailCount) + "\n" +
     "asyncExecutedCount: " + String(STATE.asyncExecutedCount) + "\n" +
     "asyncDroppedCount: " + String(STATE.asyncDroppedCount) + "\n" +
-    "asyncLastError: " + safeString(STATE.asyncLastError)
+    "asyncLastEnqueueLabel: " + safeString(STATE.asyncLastEnqueueLabel) + "\n" +
+    "asyncLastError: " + safeString(STATE.asyncLastError) + "\n" +
+    "taskLabelStats: " + topTaskLabelSummary(8)
+  );
+}
+
+function buildDiagnosticStatusText() {
+  return (
+    buildStatusText() +
+    "\n\n" +
+    buildPollingStatusText() +
+    "\n\n" +
+    buildHttpStatsText()
   );
 }
 
@@ -1035,6 +1745,8 @@ function buildHelpText() {
   lines.push("핑 / @핑");
   lines.push("연동상태 / @연동상태");
   lines.push("폴링상태 / @폴링상태");
+  lines.push("진단상태 / @진단상태");
+  lines.push("디버그상태 / @디버그상태");
   lines.push("폴링시작 / @폴링시작");
   lines.push("폴링중지 / @폴링중지");
   lines.push("폴링재시작 / @폴링재시작");
@@ -1062,7 +1774,7 @@ function notifyPollingError(text) {
   }
 
   STATE.pollingLastErrorNotifiedAtMs = now;
-  notifyAdminAsync("[폴링오류]\n" + normalized);
+  notifyAdminDiagnosticThrottled("polling_error", normalized);
 }
 
 function normalizeOutboxItems(data) {
@@ -1129,6 +1841,7 @@ function ackOutboxItem(messageId, success, incrementRetry, detail) {
       " detail=" + safeString(detail) +
       " status=" + String(response.status) +
       " error=" + safeString(response.error);
+    recordLastError("polling_ack", STATE.pollingLastError);
     notifyPollingError(STATE.pollingLastError);
     return false;
   }
@@ -1148,6 +1861,9 @@ function runSinglePollingCycle(triggerReason) {
   var sentCount = 0;
   var ackSuccessCount = 0;
   var ackFailCount = 0;
+  var startedAtMs = nowMillis();
+  var elapsedMs = 0;
+  var normalizedTrigger = trimString(triggerReason) || "manual";
 
   if (!CONFIG.POLLING_ENABLED) {
     return {
@@ -1168,15 +1884,23 @@ function runSinglePollingCycle(triggerReason) {
   STATE.pollingBusy = true;
   STATE.pollingCycleCount += 1;
   STATE.pollingLastPolledAt = nowIsoString();
+  STATE.pollingLastCycleAt = STATE.pollingLastPolledAt;
+  STATE.pollingLastTrigger = normalizedTrigger;
   STATE.pollingLastError = "";
+  Log.i(
+    "polling cycle start trigger=" + normalizedTrigger +
+    " cycle=" + String(STATE.pollingCycleCount) +
+    " queueSize=" + String(getAsyncQueueSize())
+  );
 
   try {
     response = postPollingPull(CONFIG.POLLING_LIMIT);
     if (!response.ok || !response.json) {
       STATE.pollingLastError =
-        "pull failed trigger=" + safeString(triggerReason) +
+        "pull failed trigger=" + normalizedTrigger +
         " status=" + String(response.status) +
         " error=" + safeString(response.error);
+      recordLastError("polling_pull", STATE.pollingLastError);
       notifyPollingError(STATE.pollingLastError);
       return {
         ok: false,
@@ -1189,8 +1913,9 @@ function runSinglePollingCycle(triggerReason) {
     data = response.json;
     if (!data.ok) {
       STATE.pollingLastError =
-        "pull business error trigger=" + safeString(triggerReason) +
+        "pull business error trigger=" + normalizedTrigger +
         " error=" + safeString(data.error);
+      recordLastError("polling_pull_business", STATE.pollingLastError);
       notifyPollingError(STATE.pollingLastError);
       return {
         ok: false,
@@ -1252,6 +1977,7 @@ function runSinglePollingCycle(triggerReason) {
           "delivery failed id=" + String(item.id) +
           " room=" + safeString(target.roomName) +
           " error=" + safeString(sendResult.error);
+        recordLastError("polling_send", STATE.pollingLastError);
         Log.e(STATE.pollingLastError);
       }
     }
@@ -1260,18 +1986,43 @@ function runSinglePollingCycle(triggerReason) {
     STATE.pollingLastSentCount = sentCount;
     STATE.pollingLastAckSuccessCount = ackSuccessCount;
     STATE.pollingLastAckFailCount = ackFailCount;
+    elapsedMs = nowMillis() - startedAtMs;
+    STATE.pollingLastDurationMs = elapsedMs;
+    recordLastSuccess("polling");
+    Log.i(
+      "polling cycle end trigger=" + normalizedTrigger +
+      " ok=true pulled=" + String(items.length) +
+      " sent=" + String(sentCount) +
+      " ackSuccess=" + String(ackSuccessCount) +
+      " ackFail=" + String(ackFailCount) +
+      " elapsedMs=" + String(elapsedMs)
+    );
+
+    if (elapsedMs >= CONFIG.POLLING_SLOW_LOG_THRESHOLD_MS) {
+      notifyAdminDiagnosticThrottled(
+        "slow_polling",
+        "trigger=" + normalizedTrigger +
+        " pulled=" + String(items.length) +
+        " sent=" + String(sentCount) +
+        " ackSuccess=" + String(ackSuccessCount) +
+        " ackFail=" + String(ackFailCount) +
+        " elapsedMs=" + String(elapsedMs)
+      );
+    }
 
     return {
       ok: true,
       pulled: items.length,
       sent: sentCount,
       ackSuccessCount: ackSuccessCount,
-      ackFailCount: ackFailCount
+      ackFailCount: ackFailCount,
+      elapsedMs: elapsedMs
     };
   } catch (e) {
     STATE.pollingLastError =
-      "polling exception trigger=" + safeString(triggerReason) +
+      "polling exception trigger=" + normalizedTrigger +
       " error=" + safeString(e);
+    recordLastError("polling_exception", STATE.pollingLastError);
     notifyPollingError(STATE.pollingLastError);
     return {
       ok: false,
@@ -1280,14 +2031,58 @@ function runSinglePollingCycle(triggerReason) {
       error: STATE.pollingLastError
     };
   } finally {
+    STATE.pollingLastDurationMs = nowMillis() - startedAtMs;
     STATE.pollingBusy = false;
   }
 }
 
 function triggerPollingSyncNow(triggerReason) {
-  return enqueueAsyncTask("polling_sync:" + safeString(triggerReason || "manual"), function() {
-    runSinglePollingCycle(triggerReason || "manual");
-  });
+  var normalizedTrigger = trimString(triggerReason) || "manual";
+
+  if (!CONFIG.POLLING_ENABLED) {
+    return false;
+  }
+
+  if (STATE.pollingSyncQueued || STATE.pollingSyncRunning) {
+    STATE.pollingSyncSkipCount += 1;
+    logThrottled(
+      "info",
+      "polling_sync_skip",
+      "polling sync skipped trigger=" + normalizedTrigger +
+      " queued=" + String(STATE.pollingSyncQueued) +
+      " running=" + String(STATE.pollingSyncRunning) +
+      " busy=" + String(STATE.pollingBusy) +
+      " skipCount=" + String(STATE.pollingSyncSkipCount),
+      CONFIG.DIAGNOSTIC_LOG_THROTTLE_MS
+    );
+    notifyAdminDiagnosticThrottled(
+      "polling_sync_backpressure",
+      "trigger=" + normalizedTrigger +
+      " queued=" + String(STATE.pollingSyncQueued) +
+      " running=" + String(STATE.pollingSyncRunning) +
+      " busy=" + String(STATE.pollingBusy) +
+      " skipCount=" + String(STATE.pollingSyncSkipCount)
+    );
+    return false;
+  }
+
+  STATE.pollingSyncQueued = true;
+
+  if (!enqueueAsyncTask("polling_sync:" + normalizedTrigger, function() {
+    STATE.pollingSyncQueued = false;
+    STATE.pollingSyncRunning = true;
+    try {
+      runSinglePollingCycle(normalizedTrigger);
+    } finally {
+      STATE.pollingSyncRunning = false;
+    }
+  })) {
+    STATE.pollingSyncQueued = false;
+    handleAsyncDrop("polling_sync:" + normalizedTrigger, "polling sync enqueue failed");
+    return false;
+  }
+
+  return true;
 }
 
 function startPollingLoop() {
@@ -1301,30 +2096,36 @@ function startPollingLoop() {
   STATE.pollingEnabled = true;
   STATE.pollingThreadRunning = true;
   STATE.pollingLastStartedAt = nowIsoString();
+  STATE.pollingLoopStartCount += 1;
 
-  startThread(function() {
+  RUNTIME.pollingThread = startThread(function() {
     var remaining;
-    Log.i("polling loop started intervalMs=" + String(CONFIG.POLLING_INTERVAL_MS));
+    Log.i(
+      "polling loop started intervalMs=" + String(CONFIG.POLLING_INTERVAL_MS) +
+      " startCount=" + String(STATE.pollingLoopStartCount) +
+      " instanceId=" + safeString(STATE.instanceId)
+    );
     try {
-      while (STATE.pollingEnabled) {
+      while (STATE.pollingEnabled && !RUNTIME.stopRequested) {
         runSinglePollingCycle("loop");
         remaining = Math.max(1000, CONFIG.POLLING_INTERVAL_MS);
-        while (STATE.pollingEnabled && remaining > 0) {
+        while (STATE.pollingEnabled && !RUNTIME.stopRequested && remaining > 0) {
           sleepMs(Math.min(1000, remaining));
           remaining -= 1000;
         }
       }
     } finally {
       STATE.pollingThreadRunning = false;
-      Log.i("polling loop stopped");
+      Log.i("polling loop stopped instanceId=" + safeString(STATE.instanceId));
     }
-  });
+  }, "PpiraePollingLoop");
 
   return true;
 }
 
 function stopPollingLoop() {
   STATE.pollingEnabled = false;
+  STATE.pollingSyncQueued = false;
 }
 
 function restartPollingLoop() {
@@ -1431,6 +2232,11 @@ function handleAdminCommand(msg, parsedCommand) {
     return true;
   }
 
+  if (command === "진단상태" || command === "디버그상태") {
+    replyAdminCommand(msg, buildDiagnosticStatusText());
+    return true;
+  }
+
   if (command === "폴링시작") {
     startPollingLoop();
     triggerPollingSyncNow("admin_start");
@@ -1469,8 +2275,13 @@ function handleAdminCommand(msg, parsedCommand) {
 function onMessage(chat) {
   var messageText;
   var parsedCommand;
+  var startedAtMs = nowMillis();
 
   try {
+    if (RUNTIME.stopRequested) {
+      return;
+    }
+
     cacheRoom(chat);
     messageText = getMessageText(chat);
 
@@ -1487,9 +2298,12 @@ function onMessage(chat) {
     }
   } catch (e) {
     Log.e("onMessage error: " + safeString(e));
+    recordLastError("onMessage", safeString(e));
     if (isAdminRoom(chat)) {
       notifyAdminAsync("[메시지이벤트오류]\nerror: " + safeString(e));
     }
+  } finally {
+    STATE.lastMessageEventDurationMs = nowMillis() - startedAtMs;
   }
 }
 
@@ -1497,6 +2311,10 @@ function onCommand(chat) {
   var parsedCommand;
 
   try {
+    if (RUNTIME.stopRequested) {
+      return;
+    }
+
     cacheRoom(chat);
     if (!isAdminRoom(chat)) {
       return;
@@ -1510,6 +2328,7 @@ function onCommand(chat) {
     handleAdminCommand(chat, parsedCommand);
   } catch (e) {
     Log.e("onCommand error: " + safeString(e));
+    recordLastError("onCommand", safeString(e));
     if (isAdminRoom(chat)) {
       notifyAdminAsync("[명령이벤트오류]\nerror: " + safeString(e));
     }
@@ -1517,29 +2336,76 @@ function onCommand(chat) {
 }
 
 // ===== 15. Register =====
-bot.setCommandPrefix(CONFIG.COMMAND_PREFIX);
-bot.addListener(Event.MESSAGE, onMessage);
-bot.addListener(Event.COMMAND, onCommand);
-ensurePollingLoopStarted();
-ensureAsyncWorkersStarted();
+function initializeBotRuntime() {
+  if (PREVIOUS_RUNTIME && DUPLICATE_BOOT_ATTEMPT) {
+    STATE.duplicateBootDetected = true;
+    STATE.previousInstanceId = safeString(PREVIOUS_RUNTIME.instanceId);
+    cleanupRuntime(PREVIOUS_RUNTIME, "duplicate_boot_attempt");
+    Log.i(
+      "duplicate boot detected previousInstanceId=" + safeString(PREVIOUS_RUNTIME.instanceId) +
+      " newInstanceId=" + safeString(STATE.instanceId)
+    );
+  } else {
+    Log.i("fresh boot instanceId=" + safeString(STATE.instanceId));
+  }
 
-// ===== 16. Startup =====
-Log.i("==================");
-Log.i((ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + " loaded");
-Log.i("API_BASE_URL=" + CONFIG.API_BASE_URL);
-Log.i("DELIVERY_MODE=polling_outbox");
-Log.i("POLLING_AUTO_START=" + String(CONFIG.POLLING_AUTO_START));
-Log.i("POLLING_INTERVAL_MS=" + String(CONFIG.POLLING_INTERVAL_MS));
-Log.i("ASYNC_WORKER_COUNT=" + String(CONFIG.ASYNC_WORKER_COUNT));
-Log.i("==================");
+  if (RUNTIME.initialized) {
+    Log.i("runtime already initialized instanceId=" + safeString(STATE.instanceId));
+    return;
+  }
 
-if (CONFIG.STARTUP_NOTIFY_ADMIN) {
-  notifyAdminAsync(
-    "[삐래봇 로드됨]\n" +
-    "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
-    "adminRoom: " + CONFIG.ADMIN_ROOM_NAME + "\n" +
-    "adminChannelId: " + CONFIG.ADMIN_CHANNEL_ID + "\n" +
-    "api: " + CONFIG.API_BASE_URL + "\n" +
-    "mode: polling_outbox"
-  );
+  try {
+    bot.setCommandPrefix(CONFIG.COMMAND_PREFIX);
+  } catch (prefixError) {
+    recordLastError("setCommandPrefix", safeString(prefixError));
+    Log.e("failed to set command prefix error=" + safeString(prefixError));
+  }
+
+  try {
+    bot.addListener(Event.MESSAGE, onMessage);
+    RUNTIME.listeners.message = onMessage;
+  } catch (messageListenerError) {
+    recordLastError("addListener:message", safeString(messageListenerError));
+    Log.e("failed to add message listener error=" + safeString(messageListenerError));
+  }
+
+  try {
+    bot.addListener(Event.COMMAND, onCommand);
+    RUNTIME.listeners.command = onCommand;
+  } catch (commandListenerError) {
+    recordLastError("addListener:command", safeString(commandListenerError));
+    Log.e("failed to add command listener error=" + safeString(commandListenerError));
+  }
+
+  ensurePollingLoopStarted();
+  ensureAsyncWorkersStarted();
+  RUNTIME.initialized = true;
+
+  Log.i("==================");
+  Log.i((ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + " loaded");
+  Log.i("instanceId=" + safeString(STATE.instanceId));
+  Log.i("startupCount=" + String(STATE.startupCount));
+  Log.i("API_BASE_URL=" + CONFIG.API_BASE_URL);
+  Log.i("DELIVERY_MODE=polling_outbox");
+  Log.i("POLLING_AUTO_START=" + String(CONFIG.POLLING_AUTO_START));
+  Log.i("POLLING_INTERVAL_MS=" + String(CONFIG.POLLING_INTERVAL_MS));
+  Log.i("ASYNC_WORKER_COUNT=" + String(CONFIG.ASYNC_WORKER_COUNT));
+  Log.i("ASYNC_QUEUE_CAPACITY=" + String(CONFIG.ASYNC_QUEUE_CAPACITY));
+  Log.i("==================");
+
+  if (CONFIG.STARTUP_NOTIFY_ADMIN) {
+    notifyAdminAsync(
+      "[삐래봇 로드됨]\n" +
+      "bot: " + (ACTUAL_BOT_NAME || CONFIG.BOT_NAME) + "\n" +
+      "instanceId: " + safeString(STATE.instanceId) + "\n" +
+      "startupCount: " + String(STATE.startupCount) + "\n" +
+      "duplicateBootDetected: " + String(STATE.duplicateBootDetected) + "\n" +
+      "adminRoom: " + CONFIG.ADMIN_ROOM_NAME + "\n" +
+      "adminChannelId: " + CONFIG.ADMIN_CHANNEL_ID + "\n" +
+      "api: " + CONFIG.API_BASE_URL + "\n" +
+      "mode: polling_outbox"
+    );
+  }
 }
+
+initializeBotRuntime();

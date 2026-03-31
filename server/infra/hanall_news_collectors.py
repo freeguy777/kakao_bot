@@ -15,18 +15,31 @@ from xml.etree import ElementTree
 
 import requests
 
+from server.application.hanall_page_items import (
+    build_generated_known_events_from_page_items,
+    build_page_item_canonical_payload,
+    build_page_item_fingerprint,
+    build_page_item_identity,
+    parse_known_event_kst,
+)
 from server.application.hanall_research import (
     COMPETITOR_TERMS,
     DIRECT_TERMS,
     INDICATION_TERMS,
+    _extract_anchor_items,
+    _extract_visible_lines,
 )
 from server.config import get_hanall_sources_config
 from server.core.hanall_news_models import (
     CheckedSourceLogEntry,
     CoverageGap,
     OfficialCollectionResult,
+    OfficialPageItem,
     RawFinding,
 )
+from server.infra.hanall_page_parsers import parse_official_page_items, promote_official_page_item_to_finding
+from server.infra.hanall_detail_parsers import parse_detail_page, should_follow_detail
+from server.infra.sqlite_store import record_page_observation
 from server.settings import AppSettings, get_settings
 from server.utils import now_kst, smart_truncate
 
@@ -68,6 +81,52 @@ STRICT_RELEVANCE_TERMS = (
     "hl036",
     "tanfanercept",
 )
+TARGET_MOA_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("batoclimab", "hl161", "imvt-1401", "rvt-1401", "hbm9161", "imvt-1402", "hl161ans", "fcrn"), "FcRn antagonist"),
+    (("tanfanercept", "hl036", "tnfr"), "TNFR1 fusion protein / anti-inflammatory biologic"),
+    (("efgartigimod", "vyvgart", "rozanolixizumab", "rystiggo", "nipocalimab"), "FcRn antagonist"),
+    (("teprotumumab", "tepezza"), "IGF-1R inhibitor"),
+)
+
+
+def _apply_page_item_detail_fields(page_item: OfficialPageItem, detail_fields: dict[str, Any]) -> None:
+    for field_name, field_value in detail_fields.items():
+        if field_value in (None, "", [], {}):
+            continue
+        if field_name == "published_at_kst":
+            page_item.published_at_kst = _safe_text(field_value)
+            parsed = parse_known_event_kst(page_item.published_at_kst)
+            if parsed is not None:
+                page_item.published_at = parsed
+            continue
+        if field_name == "updated_at_kst":
+            page_item.updated_at_kst = _safe_text(field_value)
+            parsed = parse_known_event_kst(page_item.updated_at_kst)
+            if parsed is not None:
+                page_item.updated_at = parsed
+            continue
+        setattr(page_item, field_name, field_value)
+
+
+def _format_kst_text(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(now_kst().tzinfo).strftime("%Y-%m-%d %H:%M KST")
+
+
+def _infer_target_moa(*values: Any) -> str | None:
+    lowered = " ".join(_stringify_values(values)).lower()
+    if not lowered:
+        return None
+    for aliases, target_moa in TARGET_MOA_RULES:
+        if any(alias in lowered for alias in aliases):
+            return target_moa
+    return None
+
+
+def _numeric_field_text(value: Any) -> str | None:
+    text = _safe_text(value)
+    return text or None
 
 
 def _ensure_dict(value: Any) -> dict[str, Any]:
@@ -450,6 +509,7 @@ def _is_low_precision_relevant(finding: RawFinding) -> bool:
 class BaseHanallCollector(ABC):
     source_name: str
     source_family: str
+    source_group: str = "regulator_disclosure"
 
     def __init__(self, settings: AppSettings, collector_config: dict[str, Any]) -> None:
         self.settings = settings
@@ -512,6 +572,7 @@ class BaseHanallCollector(ABC):
         return CheckedSourceLogEntry(
             source_family=self.source_family,
             source_name=self.source_name,
+            source_group=self.source_group,
             status=status,
             checked_at_kst=checked_at.strftime("%Y-%m-%d %H:%M KST"),
             note=_mask_secret_text(note),
@@ -531,6 +592,7 @@ class BaseHanallCollector(ABC):
         return CoverageGap(
             source_family=self.source_family,
             source_name=self.source_name,
+            source_group=self.source_group,
             gap_type=gap_type,
             detail=_mask_secret_text(detail),
             severity=severity,
@@ -821,12 +883,34 @@ class BaseHanallCollector(ABC):
         secondary_source_url: str | None = None,
         source_note: str | None = None,
         confidence: float = 0.6,
+        aliases: list[str] | None = None,
+        sponsor: str | None = None,
+        target_moa: str | None = None,
+        phase: str | None = None,
+        recruitment_status: str | None = None,
+        enrollment: str | None = None,
+        primary_completion_date: str | None = None,
+        last_update_posted: str | None = None,
+        site_countries: list[str] | None = None,
+        changed_fields: list[str] | None = None,
+        regulator: str | None = None,
+        exchange: str | None = None,
+        filed_at: str | None = None,
+        accepted_at: str | None = None,
+        event_action: str | None = None,
+        key_numbers: list[str] | None = None,
+        insider_person: str | None = None,
+        insider_role: str | None = None,
+        insider_quantity: str | None = None,
+        insider_price: str | None = None,
+        trade_date: str | None = None,
         raw_payload: dict[str, Any] | None = None,
     ) -> RawFinding:
         resolved_entity, category = _classify_entity(title, summary, entity=entity)
         return RawFinding(
             source_family=self.source_family,
             source_name=self.source_name,
+            source_group=self.source_group,
             source_tier="official_api",
             entity=resolved_entity,
             entity_type="company" if category == "company_direct" else "competitor",
@@ -840,8 +924,29 @@ class BaseHanallCollector(ABC):
             filing_type=filing_type,
             trial_id=trial_id,
             asset=asset,
+            aliases=aliases or [],
+            sponsor=sponsor,
+            target_moa=target_moa,
             indication=indication,
             region=region,
+            phase=phase,
+            recruitment_status=recruitment_status,
+            enrollment=enrollment,
+            primary_completion_date=primary_completion_date,
+            last_update_posted=last_update_posted,
+            site_countries=site_countries or [],
+            changed_fields=changed_fields or [],
+            regulator=regulator,
+            exchange=exchange,
+            filed_at=filed_at,
+            accepted_at=accepted_at,
+            event_action=event_action,
+            key_numbers=key_numbers or [],
+            insider_person=insider_person,
+            insider_role=insider_role,
+            insider_quantity=insider_quantity,
+            insider_price=insider_price,
+            trade_date=trade_date,
             primary_source_url=primary_source_url,
             secondary_source_url=secondary_source_url,
             source_note=source_note,
@@ -864,6 +969,7 @@ class BaseHanallCollector(ABC):
 class SecApiCollector(BaseHanallCollector):
     source_name = "sec_api"
     source_family = "sec"
+    source_group = "regulator_disclosure"
 
     def _api_key(self) -> str | None:
         value = self.settings.sec_api_key.strip()
@@ -911,6 +1017,21 @@ class SecApiCollector(BaseHanallCollector):
         findings: list[RawFinding] = []
         stats = _new_parser_stats()
         for item in items[:DEFAULT_RESULT_LIMIT]:
+            filed_at_dt = self._pick_datetime(
+                item,
+                "filedAt",
+                "periodOfReport",
+                "filingDate",
+                field_name="filed_at",
+                stats=stats,
+            )
+            accepted_at_dt = self._pick_datetime(
+                item,
+                "acceptedAt",
+                "filedAt",
+                field_name="accepted_at",
+                stats=stats,
+            )
             title = self._pick_text(
                 item,
                 "description",
@@ -921,16 +1042,6 @@ class SecApiCollector(BaseHanallCollector):
                 "formType",
                 field_name="title",
                 default=f"SEC API {endpoint_key}",
-                stats=stats,
-            )
-            filed_at = self._pick_datetime(
-                item,
-                "filedAt",
-                "acceptedAt",
-                "periodOfReport",
-                "filingDate",
-                "transactionDate",
-                field_name="published_at",
                 stats=stats,
             )
             entity = self._pick_text(
@@ -991,11 +1102,60 @@ class SecApiCollector(BaseHanallCollector):
                 self._build_finding(
                     title=title,
                     summary=summary,
-                    published_at=filed_at,
+                    published_at=accepted_at_dt or filed_at_dt or self._pick_datetime(
+                        item,
+                        "transactionDate",
+                        field_name="published_at",
+                        stats=None,
+                    ),
                     entity=entity,
                     document_type="sec_filing",
                     document_id=accession_no,
                     filing_type=filing_type,
+                    regulator="SEC",
+                    exchange=self._pick_text(item, "exchange", "issuerExchange", field_name="exchange", stats=None),
+                    filed_at=_format_kst_text(filed_at_dt) or self._pick_text(item, "filingDate", field_name="filed_at_text", stats=None),
+                    accepted_at=_format_kst_text(accepted_at_dt),
+                    event_action=self._pick_text(
+                        item,
+                        "transactionCode",
+                        "documentType",
+                        "formType",
+                        field_name="event_action",
+                        stats=None,
+                    ),
+                    key_numbers=[
+                        value
+                        for value in [
+                            _numeric_field_text(_deep_get(item, "transactionShares")),
+                            _numeric_field_text(_deep_get(item, "transactionPricePerShare")),
+                            _numeric_field_text(_deep_get(item, "sharesOwnedFollowingTransaction")),
+                        ]
+                        if value
+                    ],
+                    insider_person=self._pick_text(item, "ownerName", field_name="insider_person", stats=None),
+                    insider_role=self._pick_text(
+                        item,
+                        "officerTitle",
+                        "ownerRelationship",
+                        field_name="insider_role",
+                        stats=None,
+                    ),
+                    insider_quantity=self._pick_text(
+                        item,
+                        "transactionShares",
+                        "amountOfShares",
+                        field_name="insider_quantity",
+                        stats=None,
+                    ),
+                    insider_price=self._pick_text(
+                        item,
+                        "transactionPricePerShare",
+                        "price",
+                        field_name="insider_price",
+                        stats=None,
+                    ),
+                    trade_date=self._pick_text(item, "transactionDate", field_name="trade_date", stats=None),
                     primary_source_url=primary_url,
                     secondary_source_url=endpoint,
                     source_note=f"endpoint={endpoint_key}",
@@ -1138,6 +1298,7 @@ class SecApiCollector(BaseHanallCollector):
 class OpenDartCollector(BaseHanallCollector):
     source_name = "opendart"
     source_family = "opendart"
+    source_group = "regulator_disclosure"
 
     def _api_key(self) -> str | None:
         value = self.settings.opendart_api_key.strip()
@@ -1337,6 +1498,19 @@ class OpenDartCollector(BaseHanallCollector):
                             document_type="dart_filing",
                             document_id=self._pick_text(item, "rcept_no", "receipt_no", field_name="document_id", stats=stats),
                             filing_type=self._pick_text(item, "report_nm", "rpt_nm", field_name="filing_type", stats=None),
+                            regulator="OpenDART / FSS",
+                            exchange="KRX",
+                            filed_at=_format_kst_text(self._pick_datetime(item, "rcept_dt", "receipt_dt", field_name="filed_at", stats=None)),
+                            accepted_at=_format_kst_text(self._pick_datetime(item, "rcept_dt", "receipt_dt", field_name="accepted_at", stats=None)),
+                            event_action=self._pick_text(item, "report_nm", "rpt_nm", field_name="event_action", stats=None),
+                            key_numbers=[
+                                value
+                                for value in [
+                                    self._pick_text(item, "rcept_no", field_name="rcept_no", stats=None),
+                                    self._pick_text(item, "rm", field_name="remark", stats=None),
+                                ]
+                                if value
+                            ],
                             primary_source_url=list_endpoint,
                             source_note="OpenDART list.json",
                             raw_payload=item,
@@ -1491,6 +1665,7 @@ class OpenDartCollector(BaseHanallCollector):
 class CrisCollector(BaseHanallCollector):
     source_name = "cris"
     source_family = "cris"
+    source_group = "trial_registry"
 
     def _api_key(self) -> str | None:
         value = self.settings.data_go_kr_api_key.strip()
@@ -1563,6 +1738,10 @@ class CrisCollector(BaseHanallCollector):
                         document_type="clinical_trial",
                         document_id=self._pick_text(item, "crisNo", "taskNo", "id", field_name="document_id", stats=stats),
                         trial_id=self._pick_text(item, "crisNo", "taskNo", "id", field_name="trial_id", stats=None),
+                        sponsor=self._pick_text(item, "resrchInstNm", "researchInstituteName", field_name="sponsor", stats=None),
+                        phase=self._pick_text(item, "resrchPhaseNm", "phase", field_name="phase", stats=None),
+                        recruitment_status=self._pick_text(item, "recruitStatus", field_name="recruitment_status", stats=None),
+                        regulator="CRIS",
                         primary_source_url=endpoint,
                         source_note="CRIS OpenAPI",
                         raw_payload=item,
@@ -1595,6 +1774,7 @@ class CrisCollector(BaseHanallCollector):
 class MfdsCollector(BaseHanallCollector):
     source_name = "mfds"
     source_family = "mfds"
+    source_group = "regulator_disclosure"
 
     def collect(self, session: requests.Session, *, current_now: datetime | None = None) -> OfficialCollectionResult:
         checked_at = self._current_kst(current_now)
@@ -1789,6 +1969,17 @@ class MfdsCollector(BaseHanallCollector):
                             document_id=document_id,
                             trial_id=trial_id,
                             asset=asset,
+                            sponsor=entity if document_type == "clinical_trial" else None,
+                            phase=self._pick_text(
+                                item,
+                                "CLINIC_STEP_NAME",
+                                "clinicStepName",
+                                field_name="phase",
+                                stats=None,
+                            )
+                            if document_type == "clinical_trial"
+                            else None,
+                            regulator="MFDS",
                             primary_source_url=endpoint_text,
                             source_note=f"mfds_service={service_key}",
                             raw_payload=item,
@@ -1850,6 +2041,7 @@ class MfdsCollector(BaseHanallCollector):
 class OpenFdaCollector(BaseHanallCollector):
     source_name = "openfda"
     source_family = "openfda"
+    source_group = "regulator_disclosure"
 
     def _api_key(self) -> str | None:
         value = self.settings.openfda_api_key.strip()
@@ -1970,6 +2162,23 @@ class OpenFdaCollector(BaseHanallCollector):
                                 field_name="document_id",
                                 stats=stats,
                             ),
+                            regulator="FDA",
+                            event_action=self._pick_text(
+                                item,
+                                "classification",
+                                "reason_for_recall",
+                                "submission_type",
+                                field_name="event_action",
+                                stats=None,
+                            ),
+                            key_numbers=[
+                                value
+                                for value in [
+                                    self._pick_text(item, "application_number", field_name="application_number", stats=None),
+                                    self._pick_text(item, "report_number", "recall_number", field_name="report_number", stats=None),
+                                ]
+                                if value
+                            ],
                             primary_source_url=endpoint,
                             source_note=f"endpoint={endpoint_key}",
                             asset=(
@@ -1977,6 +2186,7 @@ class OpenFdaCollector(BaseHanallCollector):
                                 if "batoclimab" in summary.lower() or "batoclimab" in title.lower() or "batoclimab" in generic_names.lower()
                                 else None
                             ),
+                            target_moa=_infer_target_moa(title, summary, generic_names, brand_names),
                             raw_payload=item if isinstance(item, dict) else {},
                         )
                     )
@@ -2050,6 +2260,7 @@ class OpenFdaCollector(BaseHanallCollector):
 class ClinicalTrialsCollector(BaseHanallCollector):
     source_name = "clinicaltrials"
     source_family = "clinicaltrials"
+    source_group = "trial_registry"
 
     def _collect(self, session: requests.Session, *, checked_at: datetime) -> OfficialCollectionResult:
         endpoint = _safe_text(self.endpoints.get("studies"))
@@ -2085,6 +2296,9 @@ class ClinicalTrialsCollector(BaseHanallCollector):
                 status = _ensure_dict(protocol.get("statusModule"))
                 conditions = _ensure_dict(protocol.get("conditionsModule"))
                 interventions = _ensure_dict(protocol.get("armsInterventionsModule"))
+                design = _ensure_dict(protocol.get("designModule"))
+                contacts_locations = _ensure_dict(protocol.get("contactsLocationsModule"))
+                sponsor_module = _ensure_dict(protocol.get("sponsorCollaboratorsModule"))
                 title = self._pick_text(
                     identification,
                     "officialTitle",
@@ -2112,6 +2326,29 @@ class ClinicalTrialsCollector(BaseHanallCollector):
                 interventions_list = interventions.get("interventions", []) if isinstance(interventions, dict) else []
                 if interventions_list and isinstance(interventions_list[0], dict):
                     intervention_name = self._pick_text(interventions_list[0], "name", field_name="asset", stats=None)
+                sponsor_name = self._pick_text(
+                    sponsor_module,
+                    "leadSponsor.name",
+                    field_name="sponsor",
+                    default=self._pick_text(identification, "organization.fullName", field_name="organization_name", stats=None) or "ClinicalTrials.gov",
+                    stats=stats,
+                )
+                phase = self._pick_text(
+                    design,
+                    "phases.0",
+                    "phaseList.phase.0",
+                    "phaseList.phase",
+                    field_name="phase",
+                    stats=None,
+                )
+                enrollment = self._pick_text(
+                    design,
+                    "enrollmentInfo.count",
+                    "enrollmentInfo.enrollmentCount",
+                    field_name="enrollment",
+                    stats=None,
+                )
+                site_countries = _stringify_values(_deep_get(contacts_locations, "locations.country"))
                 findings.append(
                     self._build_finding(
                         title=title,
@@ -2141,7 +2378,29 @@ class ClinicalTrialsCollector(BaseHanallCollector):
                         document_id=nct_id,
                         trial_id=nct_id,
                         asset=intervention_name,
+                        aliases=[intervention_name] if intervention_name else [],
+                        sponsor=sponsor_name,
+                        target_moa=_infer_target_moa(title, summary, intervention_name),
                         indication=self._pick_text(conditions, "conditions", field_name="indication", stats=None),
+                        phase=phase,
+                        recruitment_status=self._pick_text(status, "overallStatus", field_name="recruitment_status", stats=None),
+                        enrollment=enrollment,
+                        primary_completion_date=self._pick_text(
+                            status,
+                            "primaryCompletionDateStruct.date",
+                            "primaryCompletionDate",
+                            field_name="primary_completion_date",
+                            stats=None,
+                        ),
+                        last_update_posted=self._pick_text(
+                            status,
+                            "lastUpdatePostDateStruct.date",
+                            "lastUpdatePostDate",
+                            field_name="last_update_posted",
+                            stats=None,
+                        ),
+                        site_countries=site_countries,
+                        regulator="ClinicalTrials.gov",
                         primary_source_url=f"{endpoint}/{nct_id}" if nct_id else endpoint,
                         source_note="ClinicalTrials.gov v2 study result",
                         raw_payload=item if isinstance(item, dict) else {},
@@ -2213,6 +2472,7 @@ class ClinicalTrialsCollector(BaseHanallCollector):
 class NcbiCollector(BaseHanallCollector):
     source_name = "ncbi"
     source_family = "ncbi"
+    source_group = "discovery_only"
 
     def _api_key(self) -> str | None:
         value = self.settings.ncbi_api_key.strip()
@@ -2436,6 +2696,7 @@ class NcbiCollector(BaseHanallCollector):
 class EuropePmcCollector(BaseHanallCollector):
     source_name = "europe_pmc"
     source_family = "europe_pmc"
+    source_group = "discovery_only"
 
     def _europe_pmc_params(self, query: str, *, page_size: int = 5) -> dict[str, Any]:
         return {
@@ -2590,6 +2851,7 @@ class EuropePmcCollector(BaseHanallCollector):
 class CrossrefCollector(BaseHanallCollector):
     source_name = "crossref"
     source_family = "crossref"
+    source_group = "discovery_only"
 
     def _collect(self, session: requests.Session, *, checked_at: datetime) -> OfficialCollectionResult:
         endpoint = _safe_text(self.endpoints.get("works"))
@@ -2688,6 +2950,7 @@ class CrossrefCollector(BaseHanallCollector):
 class BiorxivCollector(BaseHanallCollector):
     source_name = "biorxiv"
     source_family = "biorxiv"
+    source_group = "discovery_only"
 
     def _collect(self, session: requests.Session, *, checked_at: datetime) -> OfficialCollectionResult:
         template = _safe_text(self.endpoints.get("details_interval"))
@@ -2802,6 +3065,371 @@ class BiorxivCollector(BaseHanallCollector):
         return OfficialCollectionResult(findings=findings, checked_source_log=source_logs, coverage_gaps=coverage_gaps)
 
 
+def _page_check_latest_item(
+    *,
+    html_text: str,
+    base_url: str,
+    include_keywords: list[str],
+    exclude_keywords: list[str],
+) -> tuple[str | None, str | None]:
+    include = [keyword.lower() for keyword in include_keywords if _safe_text(keyword)]
+    exclude = [keyword.lower() for keyword in exclude_keywords if _safe_text(keyword)]
+    for label, href in _extract_anchor_items(html_text, base_url):
+        lowered = f"{label} {href}".lower()
+        if include and not any(keyword in lowered for keyword in include):
+            continue
+        if exclude and any(keyword in lowered for keyword in exclude):
+            continue
+        if len(_safe_text(label)) < 4:
+            continue
+        return label, href
+    visible_lines = _extract_visible_lines(html_text)
+    for line in visible_lines:
+        lowered = line.lower()
+        if include and not any(keyword in lowered for keyword in include):
+            continue
+        if exclude and any(keyword in lowered for keyword in exclude):
+            continue
+        if len(line) < 8:
+            continue
+        return line, base_url
+    return None, None
+
+
+def _page_check_access_restriction(html_text: str) -> str | None:
+    lowered = html_text.lower()
+    if "access denied" in lowered or "forbidden" in lowered:
+        return "access_denied"
+    if "sign in" in lowered or "log in" in lowered or "login" in lowered:
+        return "login_wall"
+    if "robots" in lowered and "disallow" in lowered:
+        return "robots_notice"
+    return None
+
+
+def _page_check_event_finding(
+    *,
+    source_name: str,
+    source_group: str,
+    entity: str,
+    checked_at: datetime,
+    latest_item_title: str | None,
+    latest_item_url: str | None,
+    source_label: str,
+) -> RawFinding | None:
+    title = _safe_text(latest_item_title)
+    if not title:
+        return None
+    current_date_markers = (
+        checked_at.strftime("%Y-%m-%d"),
+        checked_at.strftime("%Y.%m.%d"),
+        checked_at.strftime("%Y/%m/%d"),
+        checked_at.strftime("%b %d, %Y"),
+        checked_at.strftime("%B %d, %Y"),
+    )
+    if not any(marker in title for marker in current_date_markers):
+        return None
+    return RawFinding(
+        source_family=source_group,
+        source_name=source_name,
+        source_group=source_group,
+        source_tier="page_check",
+        entity=entity or "HanAll/Immunovant watch",
+        entity_type="company",
+        category="scheduled_event",
+        title=title,
+        summary=f"official page-check detected same-day event candidate from {source_label}",
+        published_at=checked_at,
+        published_at_kst=_format_kst_text(checked_at),
+        primary_source_url=latest_item_url or None,
+        source_note=f"page_check_source={source_label}",
+        confidence=0.55,
+    )
+
+
+def collect_hanall_page_checks(
+    *,
+    session: requests.Session,
+    page_check_config: dict[str, Any],
+    checked_at: datetime,
+) -> OfficialCollectionResult:
+    sources = page_check_config.get("sources", [])
+    if not isinstance(sources, list) or not sources:
+        return OfficialCollectionResult()
+
+    timeout_seconds = int(page_check_config.get("timeout_seconds", 12) or 12)
+    findings: list[RawFinding] = []
+    page_items: list[OfficialPageItem] = []
+    checked_source_log: list[CheckedSourceLogEntry] = []
+    coverage_gaps: list[CoverageGap] = []
+    for raw_source in sources:
+        if not isinstance(raw_source, dict):
+            continue
+        if not bool(raw_source.get("enabled", True)):
+            continue
+
+        source_name = _safe_text(raw_source.get("name") or raw_source.get("source_name")) or "page_check"
+        source_group = _safe_text(raw_source.get("source_group")) or "discovery_only"
+        url = _safe_text(raw_source.get("url"))
+        entity = _safe_text(raw_source.get("entity")) or "HanAll/Immunovant watch"
+        source_label = _safe_text(raw_source.get("source_label")) or source_name
+        discovery_only = bool(raw_source.get("discovery_only", source_group == "discovery_only"))
+        include_keywords = [
+            keyword
+            for keyword in _stringify_values(raw_source.get("include_keywords"))
+            if _safe_text(keyword)
+        ]
+        exclude_keywords = [
+            keyword
+            for keyword in _stringify_values(raw_source.get("exclude_keywords"))
+            if _safe_text(keyword)
+        ]
+        if not url:
+            checked_source_log.append(
+                CheckedSourceLogEntry(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    status="invalid_config",
+                    checked_at_kst=checked_at.strftime("%Y-%m-%d %H:%M KST"),
+                    note="page-check url missing",
+                    endpoint="-",
+                    discovery_only=discovery_only,
+                )
+            )
+            coverage_gaps.append(
+                CoverageGap(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    gap_type="invalid_config",
+                    detail="page-check url missing",
+                    severity="high",
+                    endpoint="-",
+                    discovery_only=discovery_only,
+                )
+            )
+            continue
+
+        try:
+            request_headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+            }
+            response = session.get(
+                url,
+                headers=request_headers,
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            html_text = response.text
+            access_restriction = _page_check_access_restriction(html_text)
+            latest_item_title: str | None = None
+            latest_item_url: str | None = None
+            latest_item_date: str | None = None
+            latest_item_type: str | None = None
+            latest_freshness: str | None = None
+            structured_items, parser_warnings = parse_official_page_items(
+                source_config=raw_source,
+                html_text=html_text,
+            )
+            if access_restriction == "login_wall":
+                parser_warnings.append(("login_wall", "page appears to require login"))
+            elif access_restriction == "robots_notice":
+                parser_warnings.append(("robots_blocked", "page contains robots/disallow notice"))
+
+            if structured_items:
+                for item in structured_items:
+                    item.access_restriction = access_restriction
+                    item.login_wall = access_restriction == "login_wall"
+                    item.robots_blocked = access_restriction == "robots_notice"
+                    if not item.login_wall and not item.robots_blocked and should_follow_detail(item, raw_source):
+                        try:
+                            detail_response = session.get(
+                                item.item_url or item.page_url,
+                                headers=request_headers,
+                                timeout=timeout_seconds,
+                            )
+                            detail_response.raise_for_status()
+                            detail_fields, detail_warnings = parse_detail_page(
+                                page_item=item,
+                                html_text=detail_response.text,
+                            )
+                            _apply_page_item_detail_fields(item, detail_fields)
+                            if detail_fields:
+                                item.detection_method = f"{item.detection_method or 'html_anchor_and_visible_line'}+detail_followup"
+                                item.raw_snapshot["detail_followup_url"] = item.item_url or item.page_url
+                                item.raw_snapshot["detail_followup_fields"] = sorted(detail_fields.keys())
+                            parser_warnings.extend(detail_warnings)
+                        except requests.HTTPError as detail_exc:
+                            status_code = detail_exc.response.status_code if detail_exc.response is not None else None
+                            parser_warnings.append(
+                                (
+                                    f"detail_http_{status_code}" if status_code else "detail_http_error",
+                                    _response_body_excerpt(detail_exc.response) or _masked_exception_text(detail_exc),
+                                )
+                            )
+                        except requests.RequestException as detail_exc:
+                            parser_warnings.append(("detail_request_error", _masked_exception_text(detail_exc)))
+                    item.item_identity_key, item.source_specific_identity_json = build_page_item_identity(item)
+                    item.content_fingerprint = build_page_item_fingerprint(item)
+                    structured_payload = build_page_item_canonical_payload(item)
+                    observation_item_url = item.item_url if item.item_url and item.item_url != item.page_url else ""
+                    observation = record_page_observation(
+                        source_name=item.source_name,
+                        page_name=item.page_name,
+                        item_url=observation_item_url,
+                        item_identity_key=item.item_identity_key,
+                        item_title=item.item_title,
+                        content_fingerprint=item.content_fingerprint or "",
+                        observed_at_kst=checked_at.strftime("%Y-%m-%d %H:%M KST"),
+                        published_at_kst=item.published_at_kst,
+                        updated_at_kst=item.updated_at_kst or item.scheduled_for_kst,
+                        structured_payload=structured_payload,
+                        source_specific_identity=item.source_specific_identity_json,
+                    )
+                    item.freshness_state = observation.freshness_state
+                    item.changed_fields = observation.changed_fields or []
+                    item.first_seen_at_kst = observation.first_seen_at_kst
+                    item.last_seen_at_kst = observation.last_seen_at_kst
+                    if item.changed_fields:
+                        item.raw_snapshot["changed_fields"] = item.changed_fields
+                    page_items.append(item)
+                    promoted_finding = promote_official_page_item_to_finding(
+                        page_item=item,
+                        checked_at=checked_at,
+                        discovery_only=discovery_only,
+                    )
+                    if promoted_finding is not None:
+                        findings.append(promoted_finding)
+
+                latest_item = structured_items[0]
+                latest_item_title = latest_item.item_title
+                latest_item_url = latest_item.item_url
+                latest_item_date = latest_item.scheduled_for_kst or latest_item.updated_at_kst or latest_item.published_at_kst
+                latest_item_type = latest_item.item_type
+                latest_freshness = latest_item.freshness_state
+            else:
+                latest_item_title, latest_item_url = _page_check_latest_item(
+                    html_text=html_text,
+                    base_url=url,
+                    include_keywords=include_keywords,
+                    exclude_keywords=exclude_keywords,
+                )
+
+            note_bits = [f"latest_title={_safe_text(latest_item_title) or '-'}"]
+            if latest_item_url:
+                note_bits.append(f"latest_url={latest_item_url}")
+            if latest_item_date:
+                note_bits.append(f"latest_date={latest_item_date}")
+            if latest_item_type:
+                note_bits.append(f"item_type={latest_item_type}")
+            if latest_freshness:
+                note_bits.append(f"freshness={latest_freshness}")
+            if access_restriction:
+                note_bits.append(f"access={access_restriction}")
+            checked_source_log.append(
+                CheckedSourceLogEntry(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    status="checked",
+                    checked_at_kst=checked_at.strftime("%Y-%m-%d %H:%M KST"),
+                    note=" | ".join(note_bits),
+                    endpoint=url,
+                    latest_item_title=latest_item_title,
+                    latest_item_url=latest_item_url,
+                    access_restriction=access_restriction,
+                    discovery_only=discovery_only,
+                )
+            )
+            seen_gap_keys: set[str] = set()
+            for gap_type, detail in parser_warnings:
+                normalized_gap_type = _safe_text(gap_type) or "parse_failed"
+                gap_key = f"{normalized_gap_type}|{detail}"
+                if gap_key in seen_gap_keys:
+                    continue
+                seen_gap_keys.add(gap_key)
+                coverage_gaps.append(
+                    CoverageGap(
+                        source_family=source_group,
+                        source_name=source_name,
+                        source_group=source_group,
+                        gap_type=normalized_gap_type,
+                        detail=_safe_text(detail) or "page parser warning",
+                        severity="low" if discovery_only else "medium",
+                        endpoint=url,
+                        discovery_only=discovery_only,
+                    )
+                )
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            detail = _response_body_excerpt(exc.response) or _masked_exception_text(exc)
+            restriction = "login_wall" if status_code in {401, 403} else None
+            checked_source_log.append(
+                CheckedSourceLogEntry(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    status=f"http_{status_code}" if status_code else "http_error",
+                    checked_at_kst=checked_at.strftime("%Y-%m-%d %H:%M KST"),
+                    note=detail,
+                    endpoint=url,
+                    http_status=status_code,
+                    access_restriction=restriction,
+                    discovery_only=discovery_only,
+                )
+            )
+            coverage_gaps.append(
+                CoverageGap(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    gap_type=f"http_{status_code}" if status_code else "http_error",
+                    detail=detail,
+                    severity="medium" if discovery_only else "high",
+                    endpoint=url,
+                    http_status=status_code,
+                    discovery_only=discovery_only,
+                )
+            )
+        except requests.RequestException as exc:
+            checked_source_log.append(
+                CheckedSourceLogEntry(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    status="request_error",
+                    checked_at_kst=checked_at.strftime("%Y-%m-%d %H:%M KST"),
+                    note=_masked_exception_text(exc),
+                    endpoint=url,
+                    discovery_only=discovery_only,
+                )
+            )
+            coverage_gaps.append(
+                CoverageGap(
+                    source_family=source_group,
+                    source_name=source_name,
+                    source_group=source_group,
+                    gap_type="request_error",
+                    detail=_masked_exception_text(exc),
+                    severity="low" if discovery_only else "medium",
+                    endpoint=url,
+                    discovery_only=discovery_only,
+                )
+            )
+
+    generated_known_events = build_generated_known_events_from_page_items(page_items, current_now=checked_at)
+    return OfficialCollectionResult(
+        findings=findings,
+        page_items=page_items,
+        generated_known_events=generated_known_events,
+        checked_source_log=checked_source_log,
+        coverage_gaps=coverage_gaps,
+    )
+
+
 COLLECTOR_CLASSES = {
     "sec_api": SecApiCollector,
     "opendart": OpenDartCollector,
@@ -2820,14 +3448,17 @@ def _dedupe_findings(findings: list[RawFinding]) -> list[RawFinding]:
     deduped: list[RawFinding] = []
     seen: set[str] = set()
     for finding in findings:
+        page_item_payload = finding.raw_payload.get("page_item", {}) if isinstance(finding.raw_payload, dict) else {}
         key = "|".join(
             [
                 finding.source_family,
                 finding.source_name,
+                str(page_item_payload.get("item_identity_key") or "-"),
                 finding.document_id or "-",
+                finding.trial_id or "-",
                 finding.primary_source_url or "-",
                 finding.title,
-                finding.published_at_kst or "-",
+                finding.accepted_at or finding.updated_at_kst or finding.published_at_kst or "-",
             ]
         )
         if key in seen:
@@ -2846,11 +3477,14 @@ def collect_hanall_official_findings(
     settings = get_settings()
     config = get_hanall_sources_config()
     collector_config = config.get("collectors", {}) if isinstance(config.get("collectors"), dict) else {}
+    page_check_config = config.get("page_checks", {}) if isinstance(config.get("page_checks"), dict) else {}
     owned_session = session is None
     client = session or requests.Session()
     findings: list[RawFinding] = []
+    page_items: list[OfficialPageItem] = []
     checked_source_log: list[CheckedSourceLogEntry] = []
     coverage_gaps: list[CoverageGap] = []
+    generated_known_events = []
     checked_at = current_now or now_kst()
 
     try:
@@ -2890,6 +3524,8 @@ def collect_hanall_official_findings(
                 continue
 
             findings.extend(result.findings)
+            page_items.extend(result.page_items)
+            generated_known_events.extend(result.generated_known_events)
             checked_source_log.extend(result.checked_source_log)
             coverage_gaps.extend(result.coverage_gaps)
             logger.info(
@@ -2899,6 +3535,26 @@ def collect_hanall_official_findings(
                 len(result.checked_source_log),
                 len(result.coverage_gaps),
                 (perf_counter() - collector_start) * 1000,
+            )
+
+        page_checks_enabled = bool(page_check_config.get("enabled", False))
+        if page_checks_enabled:
+            page_check_result = collect_hanall_page_checks(
+                session=client,
+                page_check_config=page_check_config,
+                checked_at=checked_at,
+            )
+            findings.extend(page_check_result.findings)
+            page_items.extend(page_check_result.page_items)
+            generated_known_events.extend(page_check_result.generated_known_events)
+            checked_source_log.extend(page_check_result.checked_source_log)
+            coverage_gaps.extend(page_check_result.coverage_gaps)
+            logger.info(
+                "hanall page checks completed sources=%s findings=%s source_logs=%s coverage_gaps=%s",
+                len(page_check_config.get("sources", []) if isinstance(page_check_config.get("sources"), list) else []),
+                len(page_check_result.findings),
+                len(page_check_result.checked_source_log),
+                len(page_check_result.coverage_gaps),
             )
 
         deduped_findings = _dedupe_findings(findings)
@@ -2919,6 +3575,8 @@ def collect_hanall_official_findings(
         )
         return OfficialCollectionResult(
             findings=relevant_findings,
+            page_items=page_items,
+            generated_known_events=generated_known_events,
             checked_source_log=checked_source_log,
             coverage_gaps=coverage_gaps,
         )

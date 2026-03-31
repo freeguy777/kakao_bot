@@ -40,6 +40,7 @@ JOB_BUILDERS: dict[str, JobBuilder] = {
         room_key=room_key,
         raise_on_error=True,
         send_raw_to_admin=False,
+        send_detailed_to_admin=True,
     ),
     "test_prompt": _build_test_prompt,
 }
@@ -226,12 +227,13 @@ def _get_rooms_config_mtime_ns(path: Path = ROOMS_PATH) -> int | None:
         return None
 
 
-def _sync_room_jobs(scheduler: Any, timezone: str) -> list[str]:
+def _sync_room_jobs(scheduler: Any, timezone: str, misfire_grace_seconds: int | None = None) -> list[str]:
     if scheduler is None or CronTrigger is None:
         return []
 
     desired_job_ids: list[str] = []
     desired_job_id_set: set[str] = set()
+    resolved_misfire_grace_seconds = max(1, int(misfire_grace_seconds or DEFAULT_RECENT_MISFIRE_GRACE_SECONDS))
     for spec in _iter_room_job_specs():
         job_id = _build_scheduler_job_id(spec.room_key, spec.job_name, spec.job_index, spec.trigger, spec.trigger_index)
         scheduler.add_job(
@@ -244,6 +246,9 @@ def _sync_room_jobs(scheduler: Any, timezone: str) -> list[str]:
             id=job_id,
             name=f"scheduled:{spec.room_key}:{spec.job_name}",
             replace_existing=True,
+            misfire_grace_time=resolved_misfire_grace_seconds,
+            max_instances=1,
+            coalesce=True,
         )
         desired_job_ids.append(job_id)
         desired_job_id_set.add(job_id)
@@ -321,8 +326,8 @@ def _reload_schedule_config_job(scheduler: Any) -> None:
 
     try:
         settings = reload_settings()
-        synced_job_ids = _sync_room_jobs(scheduler, settings.timezone)
         grace_seconds = _get_recent_misfire_grace_seconds(settings)
+        synced_job_ids = _sync_room_jobs(scheduler, settings.timezone, grace_seconds)
         catch_up_job_ids = _deliver_recently_due_jobs(settings.timezone, grace_seconds)
         _ROOMS_CONFIG_MTIME_NS = current_mtime_ns
         _safe_record_scheduler_event(
@@ -367,8 +372,14 @@ def register_jobs(scheduler: Any, settings: Any) -> None:
         )
         return
 
+    # Refresh runtime config again at registration time so scheduler startup
+    # uses the latest rooms.yaml snapshot, not only the snapshot loaded at app
+    # lifespan entry. Capture that mtime before syncing so a mid-startup edit
+    # is still detected by the watch job after startup completes.
+    settings = reload_settings()
+    _ROOMS_CONFIG_MTIME_NS = _get_rooms_config_mtime_ns()
     grace_seconds = _get_recent_misfire_grace_seconds(settings)
-    synced_job_ids = _sync_room_jobs(scheduler, settings.timezone)
+    synced_job_ids = _sync_room_jobs(scheduler, settings.timezone, grace_seconds)
     catch_up_job_ids = _deliver_recently_due_jobs(settings.timezone, grace_seconds)
 
     if scheduler.get_job("system:rooms_config_watch") is None:
@@ -384,7 +395,6 @@ def register_jobs(scheduler: Any, settings: Any) -> None:
         )
         logger.info("scheduled job registered id=system:rooms_config_watch")
 
-    _ROOMS_CONFIG_MTIME_NS = _get_rooms_config_mtime_ns()
     scheduler.start()
     _safe_record_scheduler_event(
         "started",

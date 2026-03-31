@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 import zipfile
 from datetime import datetime
@@ -9,11 +10,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import patch
+from urllib.parse import urljoin
 
 import requests
 
-from server.application.hanall_news_pipeline import build_stage1_deterministic_base, run_hanall_news_pipeline
-from server.core.hanall_news_models import OfficialCollectionResult, RSSCollectionResult
+from server.application.hanall_news_pipeline import (
+    _final_text_has_required_sections,
+    build_stage1_deterministic_base,
+    render_stage1_fallback_text,
+    run_hanall_news_pipeline,
+)
+from server.application.hanall_page_items import build_page_item_identity
+from server.application.hanall_research import get_hanall_known_events
+from server.core.hanall_news_models import OfficialCollectionResult, OfficialPageItem, RSSCollectionResult
 from server.infra.hanall_news_collectors import (
     BiorxivCollector,
     ClinicalTrialsCollector,
@@ -27,7 +36,9 @@ from server.infra.hanall_news_collectors import (
     SecApiCollector,
     _decode_data_go_kr_service_key,
     _mask_secret_text,
+    collect_hanall_page_checks,
 )
+from server.infra.sqlite_store import init_db
 from server.utils import now_kst
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "hanall"
@@ -40,6 +51,10 @@ def _fixture_json(source: str, name: str) -> dict | list:
 
 def _fixture_text(source: str, name: str, suffix: str) -> str:
     return (FIXTURES_DIR / source / f"{name}.{suffix}").read_text(encoding="utf-8")
+
+
+def _fixture_html(name: str) -> str:
+    return (FIXTURES_DIR / "page_checks" / f"{name}.html").read_text(encoding="utf-8")
 
 
 def _zip_xml_fixture(source: str, name: str) -> bytes:
@@ -57,6 +72,16 @@ def _http_error(status_code: int, body: str, *, url: str = "https://example.com/
     response.encoding = "utf-8"
     response.headers["Content-Type"] = "application/json"
     return requests.HTTPError(f"{status_code} error", response=response)
+
+
+def _html_response(body: str, *, url: str = "https://example.com/page") -> requests.Response:
+    response = requests.Response()
+    response.status_code = 200
+    response.url = url
+    response._content = body.encode("utf-8")
+    response.encoding = "utf-8"
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    return response
 
 
 def _stage1_json() -> str:
@@ -714,6 +739,818 @@ class HanallCollectorFixtureRegressionTest(unittest.TestCase):
 
         self.assertEqual(len(result.findings), 1)
         self.assertTrue(any(gap.gap_type == "http_403_forbidden" for gap in result.coverage_gaps))
+
+
+class HanallPageCheckPromotionTest(unittest.TestCase):
+    def _page_check_config(
+        self,
+        *,
+        source_name: str,
+        source_group: str,
+        entity: str,
+        url: str,
+        discovery_only: bool = False,
+        extra_source_fields: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        source = {
+            "name": source_name,
+            "source_group": source_group,
+            "entity": entity,
+            "source_label": source_name,
+            "url": url,
+            "discovery_only": discovery_only,
+            "enabled": True,
+        }
+        if extra_source_fields:
+            source.update(extra_source_fields)
+        return {
+            "timeout_seconds": 12,
+            "sources": [source],
+        }
+
+    def _collect_page_check(
+        self,
+        *,
+        html_name: str,
+        source_name: str,
+        source_group: str,
+        entity: str,
+        checked_at: datetime,
+        url: str,
+        discovery_only: bool = False,
+        detail_pages: dict[str, str] | None = None,
+        extra_source_fields: dict[str, object] | None = None,
+    ) -> OfficialCollectionResult:
+        session = Mock()
+
+        def _get(requested_url: str, **kwargs):
+            if requested_url == url:
+                return _html_response(_fixture_html(html_name), url=requested_url)
+            if detail_pages and requested_url in detail_pages:
+                return _html_response(_fixture_html(detail_pages[requested_url]), url=requested_url)
+            response = requests.Response()
+            response.status_code = 404
+            response.url = requested_url
+            response._content = b"Not Found"
+            response.encoding = "utf-8"
+            response.headers["Content-Type"] = "text/html; charset=utf-8"
+            return response
+
+        session.get.side_effect = _get
+        return collect_hanall_page_checks(
+            session=session,
+            page_check_config=self._page_check_config(
+                source_name=source_name,
+                source_group=source_group,
+                entity=entity,
+                url=url,
+                discovery_only=discovery_only,
+                extra_source_fields=extra_source_fields,
+            ),
+            checked_at=checked_at,
+        )
+
+    def test_ir_calendar_page_item_promotes_to_generated_known_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="immunovant_calendar_today",
+                source_name="immunovant_ir_calendar",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=NOW,
+                url="https://www.immunovant.com/investors/news-events",
+            )
+
+        self.assertEqual(result.findings, [])
+        self.assertEqual(len(result.generated_known_events), 1)
+        event = result.generated_known_events[0]
+        self.assertEqual(event.entity, "Immunovant")
+        self.assertEqual(event.category, "investor_event")
+        self.assertEqual(event.event_source_type, "generated_official")
+        self.assertEqual(event.freshness_status, "due_today")
+        self.assertIn("Jefferies Biotech Conference", event.fact)
+        self.assertIn("page_name=immunovant_ir_calendar", event.basis)
+
+    @patch("server.application.hanall_research._load_hanall_known_event_overrides")
+    def test_generated_known_event_overrides_yaml_event(self, mocked_overrides) -> None:
+        mocked_overrides.return_value = [
+            {
+                "entity": "Immunovant",
+                "category": "investor_event",
+                "scheduled_for_kst": "2026-03-29 20:30 KST",
+                "fact": "Manual YAML event text that should not win",
+                "basis": "manual yaml",
+                "primary_source": "https://example.com/manual",
+                "status_note": "manual fallback",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="immunovant_calendar_today",
+                source_name="immunovant_ir_calendar",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=NOW,
+                url="https://www.immunovant.com/investors/news-events",
+            )
+            events = get_hanall_known_events("2026-03-29", current_now=NOW, generated_events=result.generated_known_events)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_source_type"], "generated_official")
+        self.assertIn("Jefferies Biotech Conference", events[0]["fact"])
+        self.assertNotIn("Manual YAML event text", events[0]["fact"])
+
+    def test_stale_generated_event_does_not_appear_in_today_schedule(self) -> None:
+        stale_now = datetime(2026, 3, 30, 9, 0, tzinfo=NOW.tzinfo)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="hanall_events_today",
+                source_name="hanall_events",
+                source_group="company_official",
+                entity="HanAll Biopharma",
+                checked_at=stale_now,
+                url="https://www.hanall.com/m52.php",
+            )
+
+        base = build_stage1_deterministic_base(
+            official_collection=OfficialCollectionResult(generated_known_events=result.generated_known_events),
+            current_now=stale_now,
+        )
+
+        self.assertEqual(base.output.today_scheduled_events, [])
+        self.assertIn("time inferred", result.generated_known_events[0].status_note)
+        self.assertTrue(any(entry.axis == "known_event" for entry in base.output.omission_audit))
+
+    def test_old_page_item_is_treated_as_resurfaced_old_news(self) -> None:
+        first_check = datetime(2026, 3, 29, 9, 0, tzinfo=NOW.tzinfo)
+        second_check = datetime(2026, 3, 30, 9, 30, tzinfo=NOW.tzinfo)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            first = self._collect_page_check(
+                html_name="immunovant_press_release_old",
+                source_name="immunovant_press_releases",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=first_check,
+                url="https://www.immunovant.com/investors/news-events/press-releases",
+            )
+            second = self._collect_page_check(
+                html_name="immunovant_press_release_old",
+                source_name="immunovant_press_releases",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=second_check,
+                url="https://www.immunovant.com/investors/news-events/press-releases",
+            )
+
+        self.assertEqual(len(first.findings), 1)
+        self.assertEqual(first.page_items[0].freshness_state, "new_item")
+        self.assertEqual(second.findings, [])
+        self.assertEqual(second.page_items[0].freshness_state, "resurfaced_old_news")
+
+    def test_same_url_changed_registry_item_is_treated_as_substantive_update(self) -> None:
+        first_check = datetime(2026, 3, 29, 9, 0, tzinfo=NOW.tzinfo)
+        second_check = datetime(2026, 3, 29, 12, 0, tzinfo=NOW.tzinfo)
+        detail_url = urljoin("https://euclinicaltrials.eu/search-for-clinical-trials/", "/trial/CTIS-2026-000123-45")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            first = self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=first_check,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+                detail_pages={detail_url: "ctis_registry_detail_v1"},
+            )
+            second = self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=second_check,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+                detail_pages={detail_url: "ctis_registry_detail_v2"},
+            )
+
+        self.assertEqual(first.page_items[0].freshness_state, "new_item")
+        self.assertEqual(second.page_items[0].freshness_state, "substantive_update")
+        self.assertEqual(len(second.findings), 1)
+        self.assertEqual(second.findings[0].event_action, "updated")
+        self.assertEqual(second.findings[0].last_update_posted, "2026-03-29")
+        self.assertIn("recruitment_status", second.findings[0].changed_fields)
+        self.assertIn("enrollment", second.findings[0].changed_fields)
+
+    def test_krx_detail_followup_populates_structured_fields_and_changed_fields(self) -> None:
+        first_check = datetime(2026, 3, 29, 9, 0, tzinfo=NOW.tzinfo)
+        second_check = datetime(2026, 3, 29, 10, 0, tzinfo=NOW.tzinfo)
+        detail_url = urljoin("https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do", "/disclosure/viewer.do?noticeNo=20260329000123")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            self._collect_page_check(
+                html_name="krx_kind_notice",
+                source_name="krx",
+                source_group="regulator_disclosure",
+                entity="HanAll Biopharma",
+                checked_at=first_check,
+                url="https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do",
+                detail_pages={detail_url: "krx_kind_notice_detail"},
+            )
+            second = self._collect_page_check(
+                html_name="krx_kind_notice",
+                source_name="krx",
+                source_group="regulator_disclosure",
+                entity="HanAll Biopharma",
+                checked_at=second_check,
+                url="https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do",
+                detail_pages={detail_url: "krx_kind_notice_detail_v2"},
+            )
+
+        self.assertEqual(len(second.findings), 1)
+        finding = second.findings[0]
+        self.assertEqual(finding.filing_type, "shareholder_meeting_notice")
+        self.assertEqual(finding.accepted_at, "2026-03-29 08:45 KST")
+        self.assertEqual(finding.event_action, "accepted")
+        self.assertIn("accepted_at", finding.changed_fields)
+        self.assertIn("key_numbers", finding.changed_fields)
+
+    def test_kind_detail_followup_promotes_structured_finding(self) -> None:
+        detail_url = urljoin("https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do", "/disclosure/viewer.do?noticeNo=20260329000123")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="krx_kind_notice",
+                source_name="kind",
+                source_group="regulator_disclosure",
+                entity="HanAll Biopharma",
+                checked_at=NOW,
+                url="https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do",
+                detail_pages={detail_url: "krx_kind_notice_detail"},
+            )
+
+        self.assertEqual(len(result.findings), 1)
+        finding = result.findings[0]
+        self.assertEqual(finding.regulator, "KIND")
+        self.assertEqual(finding.accepted_at, "2026-03-29 08:40 KST")
+        self.assertEqual(finding.exchange, "KRX")
+        self.assertTrue(finding.key_numbers)
+
+    def test_ctis_detail_followup_parse_populates_structured_fields(self) -> None:
+        detail_url = urljoin("https://euclinicaltrials.eu/search-for-clinical-trials/", "/trial/CTIS-2026-000123-45")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=NOW,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+                detail_pages={detail_url: "ctis_registry_detail_v1"},
+            )
+
+        finding = result.findings[0]
+        self.assertEqual(finding.trial_id, "CTIS-2026-000123-45")
+        self.assertEqual(finding.sponsor, "Immunovant Sciences GmbH")
+        self.assertEqual(finding.phase, "Phase 2")
+        self.assertEqual(finding.recruitment_status, "Recruiting")
+        self.assertEqual(finding.enrollment, "120")
+        self.assertEqual(finding.primary_completion_date, "2027-01-15")
+        self.assertEqual(finding.last_update_posted, "2026-03-29")
+        self.assertEqual(finding.target_moa, "FcRn antagonist")
+        self.assertEqual(finding.site_countries, ["EU", "US"])
+
+    def test_registry_detail_followup_populates_minimum_fields_for_jrct_chictr_and_who(self) -> None:
+        cases = [
+            (
+                "jrct",
+                "jrct_registry",
+                "https://example.com/jrct",
+                urljoin("https://example.com/jrct", "/study/jRCT2031260001"),
+                "jrct_registry_detail",
+                "jRCT2031260001",
+                "Immunovant, Inc.",
+            ),
+            (
+                "chictr",
+                "chictr_registry",
+                "https://example.com/chictr",
+                urljoin("https://example.com/chictr", "/showprojEN.html?proj=ChiCTR2400123456"),
+                "chictr_registry_detail",
+                "ChiCTR2400123456",
+                "Harbour BioMed",
+            ),
+            (
+                "who_ictrp",
+                "who_ictrp_registry",
+                "https://example.com/who_ictrp",
+                urljoin("https://example.com/who_ictrp", "/trial2.aspx?trialid=NCT99887766"),
+                "who_ictrp_registry_detail",
+                "NCT99887766",
+                "HanAll Biopharma",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            for source_name, listing_fixture, url, detail_url, detail_fixture, trial_id, sponsor in cases:
+                result = self._collect_page_check(
+                    html_name=listing_fixture,
+                    source_name=source_name,
+                    source_group="trial_registry",
+                    entity="registry watch",
+                    checked_at=NOW,
+                    url=url,
+                    detail_pages={detail_url: detail_fixture},
+                )
+                finding = result.findings[0]
+                self.assertEqual(finding.trial_id, trial_id)
+                self.assertEqual(finding.sponsor, sponsor)
+                self.assertTrue(finding.recruitment_status)
+                self.assertTrue(finding.updated_at_kst or finding.last_update_posted)
+
+    def test_same_metadata_and_same_detail_is_unchanged_on_repeat(self) -> None:
+        first_check = datetime(2026, 3, 29, 9, 0, tzinfo=NOW.tzinfo)
+        second_check = datetime(2026, 3, 29, 10, 0, tzinfo=NOW.tzinfo)
+        detail_url = urljoin("https://euclinicaltrials.eu/search-for-clinical-trials/", "/trial/CTIS-2026-000123-45")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=first_check,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+                detail_pages={detail_url: "ctis_registry_detail_v1"},
+            )
+            second = self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=second_check,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+                detail_pages={detail_url: "ctis_registry_detail_v1"},
+            )
+
+        self.assertEqual(second.page_items[0].freshness_state, "unchanged")
+        self.assertEqual(second.findings, [])
+
+    def test_regional_regulator_pages_promote_structured_findings(self) -> None:
+        cases = [
+            (
+                "ema",
+                "ema_listing",
+                "https://www.ema.europa.eu/",
+                urljoin("https://www.ema.europa.eu/", "/medicines/ema-batoclimab-cidp"),
+                "ema_detail",
+                "EMA",
+                "approved",
+            ),
+            (
+                "pmda_mhlw",
+                "pmda_listing",
+                "https://www.pmda.go.jp/english/",
+                urljoin("https://www.pmda.go.jp/english/", "/review-services/pmda-batoclimab-mg"),
+                "pmda_detail",
+                "PMDA/MHLW",
+                "updated",
+            ),
+            (
+                "nmpa",
+                "nmpa_listing",
+                "https://english.nmpa.gov.cn/",
+                urljoin("https://english.nmpa.gov.cn/", "/news/nmpa-hbm9161-gmg"),
+                "nmpa_detail",
+                "NMPA",
+                "published",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            for source_name, listing_fixture, url, detail_url, detail_fixture, regulator, action in cases:
+                result = self._collect_page_check(
+                    html_name=listing_fixture,
+                    source_name=source_name,
+                    source_group="regulator_disclosure",
+                    entity="regional regulator",
+                    checked_at=NOW,
+                    url=url,
+                    detail_pages={detail_url: detail_fixture},
+                )
+                finding = result.findings[0]
+                self.assertEqual(finding.regulator, regulator)
+                self.assertEqual(finding.event_action, action)
+                self.assertTrue(finding.document_id)
+                self.assertTrue(finding.regulatory_phrase)
+
+    def test_competitor_official_detail_pages_promote_structured_findings(self) -> None:
+        cases = [
+            (
+                "argenx_official",
+                "argenx_listing",
+                "https://www.argenx.com/",
+                urljoin("https://www.argenx.com/", "/news/argenx-vyvgart-cidp-press-release"),
+                "argenx_detail",
+                "official_pr",
+                "efgartigimod",
+                "CIDP",
+            ),
+            (
+                "ucb_official",
+                "ucb_listing",
+                "https://www.ucb.com/",
+                urljoin("https://www.ucb.com/", "/investors/rystiggo-cidp-presentation"),
+                "ucb_detail",
+                "official_presentation",
+                "rozanolixizumab",
+                "CIDP",
+            ),
+            (
+                "amgen_official",
+                "amgen_listing",
+                "https://www.amgen.com/",
+                urljoin("https://www.amgen.com/", "/careers/tepezza-medical-lead"),
+                "amgen_detail",
+                "official_careers",
+                "teprotumumab",
+                "TED",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            for source_name, listing_fixture, url, detail_url, detail_fixture, document_type, asset, indication in cases:
+                result = self._collect_page_check(
+                    html_name=listing_fixture,
+                    source_name=source_name,
+                    source_group="competitor_official",
+                    entity="competitor watch",
+                    checked_at=NOW,
+                    url=url,
+                    detail_pages={detail_url: detail_fixture},
+                )
+                finding = result.findings[0]
+                self.assertEqual(finding.document_type, document_type)
+                self.assertEqual(finding.asset, asset)
+                self.assertEqual(finding.indication, indication)
+                self.assertEqual(finding.category, "competitor_relevant")
+
+    def test_krx_and_kind_items_are_promoted_to_structured_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            results = []
+            for source_name in ("krx", "kind"):
+                results.append(
+                    self._collect_page_check(
+                        html_name="krx_kind_notice",
+                        source_name=source_name,
+                        source_group="regulator_disclosure",
+                        entity="HanAll Biopharma",
+                        checked_at=NOW,
+                        url="https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do",
+                    )
+                )
+
+        for result, regulator in zip(results, ("KRX", "KIND"), strict=True):
+            self.assertEqual(len(result.findings), 1)
+            finding = result.findings[0]
+            self.assertEqual(finding.document_id, "20260329000123")
+            self.assertEqual(finding.filing_type, "shareholder_meeting_notice")
+            self.assertEqual(finding.regulator, regulator)
+            self.assertEqual(finding.event_action, "published")
+            self.assertTrue(finding.published_at_kst)
+
+    def test_trial_registry_items_from_priority_sources_are_promoted(self) -> None:
+        cases = [
+            ("ctis", "ctis_registry_v1", "CTIS-2026-000123-45", "EU", "Immunovant Sciences GmbH", "CIDP"),
+            ("jrct", "jrct_registry", "jRCT2031260001", "JP", "Immunovant, Inc.", "SjD"),
+            ("chictr", "chictr_registry", "ChiCTR2400123456", "CN", "Harbour BioMed", "MG"),
+            ("who_ictrp", "who_ictrp_registry", "NCT99887766", "US", "HanAll Biopharma", "DED"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            for source_name, fixture_name, trial_id, region, sponsor, indication in cases:
+                result = self._collect_page_check(
+                    html_name=fixture_name,
+                    source_name=source_name,
+                    source_group="trial_registry",
+                    entity="registry watch",
+                    checked_at=NOW,
+                    url=f"https://example.com/{source_name}",
+                )
+                self.assertEqual(len(result.findings), 1)
+                finding = result.findings[0]
+                self.assertEqual(finding.trial_id, trial_id)
+                self.assertEqual(finding.region, region)
+                self.assertEqual(finding.sponsor, sponsor)
+                self.assertEqual(finding.indication, indication)
+                self.assertTrue(finding.last_update_posted)
+
+    def test_access_restriction_page_is_logged_as_gap_without_finding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="login_wall",
+                source_name="immunovant_analyst_coverage",
+                source_group="discovery_only",
+                entity="Immunovant",
+                checked_at=NOW,
+                url="https://www.immunovant.com/investors/analyst-coverage",
+                discovery_only=True,
+            )
+
+        self.assertEqual(result.findings, [])
+        self.assertTrue(any(gap.gap_type == "login_wall" for gap in result.coverage_gaps))
+        self.assertEqual(result.checked_source_log[0].access_restriction, "login_wall")
+
+    def test_page_derived_findings_feed_omission_audit_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=NOW,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+            )
+
+        base = build_stage1_deterministic_base(
+            official_collection=OfficialCollectionResult(
+                findings=result.findings,
+                checked_source_log=result.checked_source_log,
+                coverage_gaps=result.coverage_gaps,
+            ),
+            current_now=NOW,
+        )
+        axes = {entry.axis for entry in base.output.omission_audit}
+        self.assertIn("source_group", axes)
+        self.assertIn("indication", axes)
+        self.assertIn("region", axes)
+        self.assertTrue(any(entry.source_group == "trial_registry" for entry in base.output.omission_audit))
+        self.assertTrue(any(entry.indication == "CIDP" for entry in base.output.omission_audit))
+        self.assertTrue(any(entry.region == "EU" for entry in base.output.omission_audit))
+
+    def test_page_derived_output_keeps_final_plain_text_section_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            event_result = self._collect_page_check(
+                html_name="immunovant_calendar_today",
+                source_name="immunovant_ir_calendar",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=NOW,
+                url="https://www.immunovant.com/investors/news-events",
+            )
+            finding_result = self._collect_page_check(
+                html_name="ctis_registry_v1",
+                source_name="ctis",
+                source_group="trial_registry",
+                entity="EU clinical trials",
+                checked_at=NOW,
+                url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+            )
+
+        official_collection = OfficialCollectionResult(
+            findings=finding_result.findings,
+            generated_known_events=event_result.generated_known_events,
+            checked_source_log=event_result.checked_source_log + finding_result.checked_source_log,
+            coverage_gaps=event_result.coverage_gaps + finding_result.coverage_gaps,
+        )
+        stage1_output = build_stage1_deterministic_base(
+            official_collection=official_collection,
+            current_now=NOW,
+        ).output
+        text = render_stage1_fallback_text(
+            stage1_output=stage1_output,
+            official_collection=official_collection,
+            rss_collection=RSSCollectionResult(),
+            current_now=NOW,
+        )
+
+        headings = [
+            "요약",
+            "오늘 예정 이벤트",
+            "Confirmed Updates — Company Direct",
+            "Confirmed Updates — Competitor Relevant",
+            "Competitor Map Snapshot",
+            "Checked Source Log",
+            "Unverified Leads",
+            "Coverage Gaps",
+            "Omission Audit",
+            "검증 메모",
+        ]
+        lines = text.splitlines()
+        positions = [lines.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(_final_text_has_required_sections(text))
+
+    def test_competitor_pipeline_page_auto_syncs_new_universe_entry_and_overrides_seed_fields(self) -> None:
+        detail_pages = {
+            "https://www.harbourbiomed.com/en/pipeline/hbm9161-gmg": "harbour_pipeline_gmg_detail",
+            "https://www.harbourbiomed.com/en/pipeline/hbm9161-cidp": "harbour_pipeline_cidp_detail",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="harbour_pipeline_multi",
+                source_name="harbour_biomed_pipeline",
+                source_group="competitor_official",
+                entity="Harbour BioMed",
+                checked_at=NOW,
+                url="https://www.harbourbiomed.com/en/pipeline",
+                detail_pages=detail_pages,
+                extra_source_fields={"max_items_per_page": 3},
+            )
+            stage1_output = build_stage1_deterministic_base(
+                official_collection=OfficialCollectionResult(
+                    findings=result.findings,
+                    page_items=result.page_items,
+                    checked_source_log=result.checked_source_log,
+                    coverage_gaps=result.coverage_gaps,
+                ),
+                current_now=NOW,
+            ).output
+
+        cidp_entry = next(
+            entry
+            for entry in stage1_output.competitor_map_snapshot
+            if entry.competitor == "Harbour BioMed" and entry.asset == "HBM9161" and entry.indication == "CIDP"
+        )
+        mg_entry = next(
+            entry
+            for entry in stage1_output.competitor_map_snapshot
+            if entry.competitor == "Harbour BioMed" and entry.asset == "HBM9161" and entry.indication == "MG"
+        )
+        self.assertEqual(cidp_entry.source_type, "pipeline_program")
+        self.assertGreater(cidp_entry.provenance_score or 0.0, 0.8)
+        self.assertEqual(mg_entry.stage_status, "Phase 3 clinical-stage | official page checked")
+
+    def test_multi_item_press_page_collects_multiple_items_and_promotes_each_finding(self) -> None:
+        detail_pages = {
+            "https://www.immunovant.com/investors/news-events/press-releases/immunovant-mg-update": "immunovant_mg_detail",
+            "https://www.immunovant.com/investors/news-events/press-releases/immunovant-cidp-update": "immunovant_cidp_detail",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="immunovant_press_release_multi",
+                source_name="immunovant_press_releases",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=NOW,
+                url="https://www.immunovant.com/investors/news-events/press-releases",
+                detail_pages=detail_pages,
+                extra_source_fields={"max_items_per_page": 2},
+            )
+
+        self.assertEqual(len(result.page_items), 2)
+        self.assertEqual(len(result.findings), 2)
+        self.assertEqual({finding.asset for finding in result.findings}, {"batoclimab", "IMVT-1402"})
+
+    def test_same_day_multiple_generated_events_are_not_over_deduped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="immunovant_calendar_multi",
+                source_name="immunovant_ir_calendar",
+                source_group="company_official",
+                entity="Immunovant",
+                checked_at=NOW,
+                url="https://www.immunovant.com/investors/news-events",
+                extra_source_fields={"max_items_per_page": 3},
+            )
+
+        self.assertEqual(len(result.generated_known_events), 2)
+        self.assertEqual(len({event.event_identity_key for event in result.generated_known_events}), 2)
+
+    def test_regulatory_notice_identity_keeps_same_day_multiple_notices_separate(self) -> None:
+        detail_pages = {
+            "https://kind.krx.co.kr/disclosure/viewer.do?noticeNo=20260329000123": "krx_kind_notice_detail",
+            "https://kind.krx.co.kr/disclosure/viewer.do?noticeNo=20260329000124": "krx_kind_notice_detail_second",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="krx_kind_notice_multi",
+                source_name="kind",
+                source_group="regulator_disclosure",
+                entity="HanAll Biopharma",
+                checked_at=NOW,
+                url="https://kind.krx.co.kr/disclosuretoday/disclosuretoday.do",
+                detail_pages=detail_pages,
+                extra_source_fields={"max_items_per_page": 3},
+            )
+
+        self.assertEqual(len(result.findings), 2)
+        self.assertEqual({finding.document_id for finding in result.findings}, {"20260329000123", "20260329000124"})
+        self.assertEqual({finding.accepted_at for finding in result.findings}, {"2026-03-29 08:40 KST", "2026-03-29 09:10 KST"})
+
+    def test_trial_registry_identity_key_uses_trial_id_and_update_date(self) -> None:
+        first = OfficialPageItem(
+            source_name="ctis",
+            source_group="trial_registry",
+            page_name="CTIS",
+            page_url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+            item_title="CTIS batoclimab CIDP trial update",
+            item_url="https://euclinicaltrials.eu/trial/CTIS-2026-000123-45",
+            item_type="trial_registry_update",
+            entity="Immunovant",
+            asset="batoclimab",
+            indication="CIDP",
+            trial_id="CTIS-2026-000123-45",
+            updated_at_kst="2026-03-29 09:00 KST",
+            last_update_posted="2026-03-29",
+        )
+        second = OfficialPageItem(
+            source_name="ctis",
+            source_group="trial_registry",
+            page_name="CTIS",
+            page_url="https://euclinicaltrials.eu/search-for-clinical-trials/",
+            item_title="CTIS batoclimab CIDP trial update",
+            item_url="https://euclinicaltrials.eu/trial/CTIS-2026-000123-45",
+            item_type="trial_registry_update",
+            entity="Immunovant",
+            asset="batoclimab",
+            indication="CIDP",
+            trial_id="CTIS-2026-000123-45",
+            updated_at_kst="2026-03-30 09:00 KST",
+            last_update_posted="2026-03-30",
+        )
+
+        first_key, _ = build_page_item_identity(first)
+        second_key, _ = build_page_item_identity(second)
+
+        self.assertNotEqual(first_key, second_key)
+        self.assertIn("ctis", first_key)
+        self.assertIn("ctis202600012345", first_key)
+
+    def test_competitor_official_multi_item_updates_promote_distinct_findings(self) -> None:
+        detail_pages = {
+            "https://www.roivant.com/news/roivant-imvt1401-pr": "roivant_pr_detail",
+            "https://www.roivant.com/investors/imvt1402-presentation": "roivant_presentation_detail",
+            "https://www.roivant.com/careers/fcrn-medical-lead": "roivant_careers_detail",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            result = self._collect_page_check(
+                html_name="roivant_updates_multi",
+                source_name="roivant_official",
+                source_group="competitor_official",
+                entity="Roivant",
+                checked_at=NOW,
+                url="https://www.roivant.com/",
+                detail_pages=detail_pages,
+                extra_source_fields={"max_items_per_page": 3},
+            )
+
+        self.assertEqual(len(result.findings), 3)
+        self.assertEqual(
+            {finding.document_type for finding in result.findings},
+            {"official_pr", "official_presentation", "official_careers"},
+        )
+
+    def test_no_news_day_keeps_auto_synced_competitor_snapshot_from_persistence(self) -> None:
+        detail_pages = {
+            "https://www.harbourbiomed.com/en/pipeline/hbm9161-gmg": "harbour_pipeline_gmg_detail",
+            "https://www.harbourbiomed.com/en/pipeline/hbm9161-cidp": "harbour_pipeline_cidp_detail",
+        }
+        next_day = datetime(2026, 3, 30, 9, 0, tzinfo=NOW.tzinfo)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            initial = self._collect_page_check(
+                html_name="harbour_pipeline_multi",
+                source_name="harbour_biomed_pipeline",
+                source_group="competitor_official",
+                entity="Harbour BioMed",
+                checked_at=NOW,
+                url="https://www.harbourbiomed.com/en/pipeline",
+                detail_pages=detail_pages,
+                extra_source_fields={"max_items_per_page": 3},
+            )
+            build_stage1_deterministic_base(
+                official_collection=OfficialCollectionResult(
+                    findings=initial.findings,
+                    page_items=initial.page_items,
+                    checked_source_log=initial.checked_source_log,
+                    coverage_gaps=initial.coverage_gaps,
+                ),
+                current_now=NOW,
+            )
+            empty_stage1 = build_stage1_deterministic_base(
+                official_collection=OfficialCollectionResult(),
+                current_now=next_day,
+            ).output
+
+        self.assertTrue(
+            any(
+                entry.competitor == "Harbour BioMed" and entry.asset == "HBM9161" and entry.indication == "CIDP"
+                for entry in empty_stage1.competitor_map_snapshot
+            )
+        )
 
 
 class HanallPipelineLoggingTest(unittest.TestCase):

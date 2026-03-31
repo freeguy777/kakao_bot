@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from server.application.hanall_page_items import compute_changed_fields
 from server.config import get_room_policy, resolve_room
 from server.settings import get_settings
 from server.utils import now_kst
@@ -26,6 +27,18 @@ OUTBOX_STALE_INFLIGHT_MINUTES = 5
 class AdminAlertThrottleDecision:
     should_send: bool
     suppressed_count: int
+
+
+@dataclass(frozen=True)
+class PageObservationDecision:
+    freshness_state: str
+    is_new_item: bool
+    is_substantive_update: bool
+    is_resurfaced_old_news: bool
+    changed_fields: list[str] | None = None
+    first_seen_at_kst: str | None = None
+    last_seen_at_kst: str | None = None
+    previous_fingerprint: str | None = None
 
 
 def get_db_path() -> str:
@@ -117,6 +130,173 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, 
     logger.info("database column added table=%s column=%s", table_name, column_name)
 
 
+def _ensure_page_observations_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS page_observations (
+            source_name TEXT NOT NULL,
+            page_name TEXT NOT NULL,
+            item_url TEXT NOT NULL,
+            item_identity_key TEXT,
+            item_title TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            structured_payload_json TEXT,
+            source_specific_identity_json TEXT,
+            first_seen_at_kst TEXT NOT NULL,
+            last_seen_at_kst TEXT NOT NULL,
+            last_published_at_kst TEXT,
+            last_updated_at_kst TEXT,
+            PRIMARY KEY (source_name, page_name, item_url)
+        )
+        """
+    )
+    _ensure_column(conn, "page_observations", "item_identity_key", "TEXT")
+    _ensure_column(conn, "page_observations", "structured_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+    _ensure_column(conn, "page_observations", "source_specific_identity_json", "TEXT NOT NULL DEFAULT '{}'")
+
+
+def _ensure_competitor_universe_observations_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS competitor_universe_observations (
+            competitor TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            indication TEXT NOT NULL,
+            stage_status TEXT,
+            region TEXT,
+            primary_source_url TEXT NOT NULL,
+            source_label TEXT,
+            source_type TEXT,
+            content_fingerprint TEXT NOT NULL,
+            aliases_json TEXT,
+            target_moa TEXT,
+            layer TEXT,
+            provenance_score REAL,
+            first_seen_at_kst TEXT NOT NULL,
+            last_seen_at_kst TEXT NOT NULL,
+            last_verified_at_kst TEXT NOT NULL,
+            PRIMARY KEY (competitor, asset, indication, primary_source_url)
+        )
+        """
+    )
+    _ensure_column(conn, "competitor_universe_observations", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "competitor_universe_observations", "target_moa", "TEXT")
+    _ensure_column(conn, "competitor_universe_observations", "layer", "TEXT")
+    _ensure_column(conn, "competitor_universe_observations", "provenance_score", "REAL")
+    _ensure_column(conn, "competitor_universe_observations", "last_verified_at_kst", "TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_stage2_search_evidence_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stage2_search_evidence (
+            trace_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            title TEXT NOT NULL,
+            published_at_kst TEXT,
+            updated_at_kst TEXT,
+            confidence REAL,
+            excerpt TEXT,
+            evidence_kind TEXT,
+            confirms_fields_json TEXT,
+            entity TEXT,
+            asset TEXT,
+            indication TEXT,
+            region TEXT,
+            inserted_at_kst TEXT NOT NULL,
+            PRIMARY KEY (trace_id, evidence_id)
+        )
+        """
+    )
+    _ensure_column(conn, "stage2_search_evidence", "entity", "TEXT")
+    _ensure_column(conn, "stage2_search_evidence", "asset", "TEXT")
+    _ensure_column(conn, "stage2_search_evidence", "indication", "TEXT")
+    _ensure_column(conn, "stage2_search_evidence", "region", "TEXT")
+
+
+def _ensure_stage2_verification_runs_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stage2_verification_runs (
+            trace_id TEXT PRIMARY KEY,
+            room_key TEXT,
+            run_started_at_kst TEXT NOT NULL,
+            run_finished_at_kst TEXT,
+            stage2_status TEXT NOT NULL,
+            used_search_verify INTEGER NOT NULL DEFAULT 0,
+            gap_target_count INTEGER NOT NULL DEFAULT 0,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            backfill_count INTEGER NOT NULL DEFAULT 0,
+            discovered_confirmed_count INTEGER NOT NULL DEFAULT 0,
+            discovered_unverified_count INTEGER NOT NULL DEFAULT 0,
+            coverage_upgrade_count INTEGER NOT NULL DEFAULT 0,
+            error_detail TEXT
+        )
+        """
+    )
+    _ensure_column(conn, "stage2_verification_runs", "coverage_upgrade_count", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+
+
+def _ensure_stage2_finding_provenance_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stage2_finding_provenance (
+            trace_id TEXT NOT NULL,
+            finding_identity TEXT NOT NULL,
+            candidate_id TEXT,
+            field_name TEXT NOT NULL,
+            field_value TEXT,
+            action_type TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_url TEXT,
+            evidence_id TEXT,
+            provenance_strength TEXT,
+            note TEXT,
+            recorded_at_kst TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _ensure_hanall_run_snapshots_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hanall_run_snapshots (
+            trace_id TEXT PRIMARY KEY,
+            room_key TEXT,
+            created_at_kst TEXT NOT NULL,
+            stage1_candidate_summary_json TEXT NOT NULL,
+            stage1_output_json TEXT NOT NULL,
+            merged_stage1_output_json TEXT NOT NULL,
+            stage2_output_json TEXT,
+            search_memory_json TEXT,
+            ranked_issues_json TEXT,
+            summary_lines_json TEXT,
+            final_text TEXT NOT NULL,
+            debug_meta_json TEXT
+        )
+        """
+    )
+
+
+def _parse_kst_text(value: str | None) -> datetime | None:
+    normalized = str(value or "").strip().removesuffix(" KST").strip()
+    if not normalized:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized, fmt).replace(tzinfo=now_kst().tzinfo)
+        except ValueError:
+            continue
+    return None
+
+
 def init_db(sqlite_path: str | None = None) -> None:
     global _DB_PATH
     if sqlite_path:
@@ -201,6 +381,112 @@ def init_db(sqlite_path: str | None = None) -> None:
                 last_sent_at TEXT NOT NULL,
                 suppressed_count INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS page_observations (
+                source_name TEXT NOT NULL,
+                page_name TEXT NOT NULL,
+                item_url TEXT NOT NULL,
+                item_identity_key TEXT,
+                item_title TEXT NOT NULL,
+                content_fingerprint TEXT NOT NULL,
+                structured_payload_json TEXT,
+                source_specific_identity_json TEXT,
+                first_seen_at_kst TEXT NOT NULL,
+                last_seen_at_kst TEXT NOT NULL,
+                last_published_at_kst TEXT,
+                last_updated_at_kst TEXT,
+                PRIMARY KEY (source_name, page_name, item_url)
+            );
+
+            CREATE TABLE IF NOT EXISTS competitor_universe_observations (
+                competitor TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                indication TEXT NOT NULL,
+                stage_status TEXT,
+                region TEXT,
+                primary_source_url TEXT NOT NULL,
+                source_label TEXT,
+                source_type TEXT,
+                content_fingerprint TEXT NOT NULL,
+                aliases_json TEXT,
+                target_moa TEXT,
+                layer TEXT,
+                provenance_score REAL,
+                first_seen_at_kst TEXT NOT NULL,
+                last_seen_at_kst TEXT NOT NULL,
+                last_verified_at_kst TEXT NOT NULL,
+                PRIMARY KEY (competitor, asset, indication, primary_source_url)
+            );
+
+            CREATE TABLE IF NOT EXISTS stage2_search_evidence (
+                trace_id TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_name TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                published_at_kst TEXT,
+                updated_at_kst TEXT,
+                confidence REAL,
+                excerpt TEXT,
+                evidence_kind TEXT,
+                confirms_fields_json TEXT,
+                entity TEXT,
+                asset TEXT,
+                indication TEXT,
+                region TEXT,
+                inserted_at_kst TEXT NOT NULL,
+                PRIMARY KEY (trace_id, evidence_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS stage2_verification_runs (
+                trace_id TEXT PRIMARY KEY,
+                room_key TEXT,
+                run_started_at_kst TEXT NOT NULL,
+                run_finished_at_kst TEXT,
+                stage2_status TEXT NOT NULL,
+                used_search_verify INTEGER NOT NULL DEFAULT 0,
+                gap_target_count INTEGER NOT NULL DEFAULT 0,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                backfill_count INTEGER NOT NULL DEFAULT 0,
+                discovered_confirmed_count INTEGER NOT NULL DEFAULT 0,
+                discovered_unverified_count INTEGER NOT NULL DEFAULT 0,
+                coverage_upgrade_count INTEGER NOT NULL DEFAULT 0,
+                reused_evidence_count INTEGER NOT NULL DEFAULT 0,
+                error_detail TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS stage2_finding_provenance (
+                trace_id TEXT NOT NULL,
+                finding_identity TEXT NOT NULL,
+                candidate_id TEXT,
+                field_name TEXT NOT NULL,
+                field_value TEXT,
+                action_type TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_name TEXT NOT NULL,
+                source_url TEXT,
+                evidence_id TEXT,
+                provenance_strength TEXT,
+                note TEXT,
+                recorded_at_kst TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hanall_run_snapshots (
+                trace_id TEXT PRIMARY KEY,
+                room_key TEXT,
+                created_at_kst TEXT NOT NULL,
+                stage1_candidate_summary_json TEXT NOT NULL,
+                stage1_output_json TEXT NOT NULL,
+                merged_stage1_output_json TEXT NOT NULL,
+                stage2_output_json TEXT,
+                search_memory_json TEXT,
+                ranked_issues_json TEXT,
+                summary_lines_json TEXT,
+                final_text TEXT NOT NULL,
+                debug_meta_json TEXT
+            );
             """
         )
         _ensure_column(conn, "outbox_messages", "last_attempt_at", "TEXT")
@@ -208,7 +494,744 @@ def init_db(sqlite_path: str | None = None) -> None:
         _ensure_column(conn, "scheduler_events", "detail", "TEXT")
         _ensure_column(conn, "scheduler_events", "trace_id", "TEXT")
         _ensure_column(conn, "scheduler_events", "meta_json", "TEXT")
-    logger.info("database initialized path=%s", get_db_path())
+        _ensure_column(conn, "page_observations", "item_identity_key", "TEXT")
+        _ensure_column(conn, "page_observations", "structured_payload_json", "TEXT")
+        _ensure_column(conn, "page_observations", "source_specific_identity_json", "TEXT")
+        _ensure_column(conn, "stage2_search_evidence", "entity", "TEXT")
+        _ensure_column(conn, "stage2_search_evidence", "asset", "TEXT")
+        _ensure_column(conn, "stage2_search_evidence", "indication", "TEXT")
+        _ensure_column(conn, "stage2_search_evidence", "region", "TEXT")
+        _ensure_column(conn, "stage2_verification_runs", "coverage_upgrade_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+        logger.info("database initialized path=%s", get_db_path())
+
+
+def get_page_observation(
+    *,
+    source_name: str,
+    page_name: str,
+    item_url: str,
+    item_identity_key: str | None = None,
+) -> dict[str, Any] | None:
+    normalized_item_url = str(item_url or "").strip()
+    normalized_identity = str(item_identity_key or "").strip()
+    storage_item_url = _page_observation_storage_key(
+        item_url=normalized_item_url,
+        item_identity_key=normalized_identity,
+    )
+    with _get_connection() as conn:
+        _ensure_page_observations_table(conn)
+        row = conn.execute(
+            """
+            SELECT source_name, page_name, item_url, item_identity_key, item_title, content_fingerprint, structured_payload_json,
+                   source_specific_identity_json,
+                   first_seen_at_kst, last_seen_at_kst, last_published_at_kst, last_updated_at_kst
+            FROM page_observations
+            WHERE source_name = ? AND page_name = ? AND item_url = ?
+            """,
+            (source_name, page_name, storage_item_url),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "source_name": str(row["source_name"]).strip(),
+        "page_name": str(row["page_name"]).strip(),
+        "item_url": str(row["item_url"]).strip(),
+        "item_identity_key": str(row["item_identity_key"]).strip() if row["item_identity_key"] else None,
+        "item_title": str(row["item_title"]).strip(),
+        "content_fingerprint": str(row["content_fingerprint"]).strip(),
+        "structured_payload": json.loads(row["structured_payload_json"] or "{}"),
+        "source_specific_identity_json": json.loads(row["source_specific_identity_json"] or "{}"),
+        "first_seen_at_kst": str(row["first_seen_at_kst"]).strip(),
+        "last_seen_at_kst": str(row["last_seen_at_kst"]).strip(),
+        "last_published_at_kst": str(row["last_published_at_kst"]).strip() if row["last_published_at_kst"] else None,
+        "last_updated_at_kst": str(row["last_updated_at_kst"]).strip() if row["last_updated_at_kst"] else None,
+    }
+
+
+def _page_observation_storage_key(*, item_url: str | None, item_identity_key: str | None) -> str:
+    normalized_url = str(item_url or "").strip()
+    normalized_identity = str(item_identity_key or "").strip()
+    return normalized_url or normalized_identity or "-"
+
+
+def record_page_observation(
+    *,
+    source_name: str,
+    page_name: str,
+    item_url: str,
+    item_identity_key: str | None = None,
+    item_title: str,
+    content_fingerprint: str,
+    observed_at_kst: str,
+    published_at_kst: str | None = None,
+    updated_at_kst: str | None = None,
+    structured_payload: dict[str, Any] | None = None,
+    source_specific_identity: dict[str, Any] | None = None,
+) -> PageObservationDecision:
+    normalized_source_name = str(source_name or "").strip()
+    normalized_page_name = str(page_name or "").strip()
+    normalized_item_url = str(item_url or "").strip()
+    normalized_item_identity_key = str(item_identity_key or "").strip() or None
+    storage_item_url = _page_observation_storage_key(
+        item_url=normalized_item_url,
+        item_identity_key=normalized_item_identity_key,
+    )
+    normalized_item_title = str(item_title or "").strip()
+    normalized_fingerprint = str(content_fingerprint or "").strip()
+    normalized_observed_at_kst = str(observed_at_kst or "").strip() or now_kst().strftime("%Y-%m-%d %H:%M KST")
+    normalized_published_at_kst = str(published_at_kst or "").strip() or None
+    normalized_updated_at_kst = str(updated_at_kst or "").strip() or None
+    normalized_structured_payload = structured_payload if isinstance(structured_payload, dict) else {}
+    structured_payload_json = json.dumps(normalized_structured_payload, ensure_ascii=False, sort_keys=True)
+    normalized_source_specific_identity = source_specific_identity if isinstance(source_specific_identity, dict) else {}
+    source_specific_identity_json = json.dumps(normalized_source_specific_identity, ensure_ascii=False, sort_keys=True)
+
+    with _get_connection() as conn:
+        _ensure_page_observations_table(conn)
+        row = conn.execute(
+            """
+            SELECT item_title, content_fingerprint, structured_payload_json, source_specific_identity_json,
+                   first_seen_at_kst, last_seen_at_kst,
+                   last_published_at_kst, last_updated_at_kst
+            FROM page_observations
+            WHERE source_name = ? AND page_name = ? AND item_url = ?
+            """,
+            (normalized_source_name, normalized_page_name, storage_item_url),
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO page_observations (
+                    source_name, page_name, item_url, item_identity_key, item_title, content_fingerprint, structured_payload_json,
+                    source_specific_identity_json,
+                    first_seen_at_kst, last_seen_at_kst, last_published_at_kst, last_updated_at_kst
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_source_name,
+                    normalized_page_name,
+                    storage_item_url,
+                    normalized_item_identity_key,
+                    normalized_item_title,
+                    normalized_fingerprint,
+                    structured_payload_json,
+                    source_specific_identity_json,
+                    normalized_observed_at_kst,
+                    normalized_observed_at_kst,
+                    normalized_published_at_kst,
+                    normalized_updated_at_kst,
+                ),
+            )
+            return PageObservationDecision(
+                freshness_state="new_item",
+                is_new_item=True,
+                is_substantive_update=False,
+                is_resurfaced_old_news=False,
+                changed_fields=[],
+                first_seen_at_kst=normalized_observed_at_kst,
+                last_seen_at_kst=normalized_observed_at_kst,
+            )
+
+        previous_fingerprint = str(row["content_fingerprint"]).strip()
+        previous_structured_payload = json.loads(row["structured_payload_json"] or "{}")
+        first_seen_at_kst = str(row["first_seen_at_kst"]).strip()
+        last_seen_at_kst = str(row["last_seen_at_kst"]).strip()
+        previous_published_at_kst = str(row["last_published_at_kst"]).strip() if row["last_published_at_kst"] else None
+        previous_updated_at_kst = str(row["last_updated_at_kst"]).strip() if row["last_updated_at_kst"] else None
+
+        changed = previous_fingerprint != normalized_fingerprint
+        if not changed and normalized_updated_at_kst and previous_updated_at_kst and normalized_updated_at_kst != previous_updated_at_kst:
+            changed = True
+        if not changed and normalized_item_title and normalized_item_title != str(row["item_title"]).strip():
+            changed = True
+
+        candidate_reference = (
+            _parse_kst_text(previous_updated_at_kst)
+            or _parse_kst_text(previous_published_at_kst)
+            or _parse_kst_text(first_seen_at_kst)
+        )
+        observed_at = _parse_kst_text(normalized_observed_at_kst) or now_kst()
+        is_resurfaced_old_news = not changed and candidate_reference is not None and candidate_reference < observed_at - timedelta(hours=24)
+        freshness_state = "substantive_update" if changed else "resurfaced_old_news" if is_resurfaced_old_news else "unchanged"
+        changed_fields = compute_changed_fields(normalized_structured_payload, previous_structured_payload) if changed else []
+
+        conn.execute(
+            """
+            UPDATE page_observations
+            SET item_title = ?,
+                content_fingerprint = ?,
+                structured_payload_json = ?,
+                source_specific_identity_json = ?,
+                last_seen_at_kst = ?,
+                last_published_at_kst = ?,
+                last_updated_at_kst = ?
+            WHERE source_name = ? AND page_name = ? AND item_url = ?
+            """,
+            (
+                normalized_item_title,
+                normalized_fingerprint,
+                structured_payload_json,
+                source_specific_identity_json,
+                normalized_observed_at_kst,
+                normalized_published_at_kst or previous_published_at_kst,
+                normalized_updated_at_kst or previous_updated_at_kst,
+                normalized_source_name,
+                normalized_page_name,
+                storage_item_url,
+            ),
+        )
+        return PageObservationDecision(
+            freshness_state=freshness_state,
+            is_new_item=False,
+            is_substantive_update=changed,
+            is_resurfaced_old_news=is_resurfaced_old_news,
+            changed_fields=changed_fields,
+            first_seen_at_kst=first_seen_at_kst,
+            last_seen_at_kst=normalized_observed_at_kst,
+            previous_fingerprint=previous_fingerprint,
+        )
+
+
+def record_competitor_universe_observation(
+    *,
+    competitor: str,
+    asset: str,
+    indication: str,
+    stage_status: str | None,
+    region: str | None,
+    primary_source_url: str,
+    source_label: str | None,
+    source_type: str | None,
+    aliases: list[str] | None,
+    target_moa: str | None,
+    layer: str | None,
+    provenance_score: float | None,
+    content_fingerprint: str,
+    observed_at_kst: str,
+) -> None:
+    normalized_competitor = str(competitor or "").strip() or "-"
+    normalized_asset = str(asset or "").strip() or "-"
+    normalized_indication = str(indication or "").strip() or "-"
+    normalized_primary_source_url = str(primary_source_url or "").strip() or "-"
+    aliases_json = json.dumps(list(aliases or []), ensure_ascii=False)
+    with _get_connection() as conn:
+        _ensure_competitor_universe_observations_table(conn)
+        row = conn.execute(
+            """
+            SELECT first_seen_at_kst
+            FROM competitor_universe_observations
+            WHERE competitor = ? AND asset = ? AND indication = ? AND primary_source_url = ?
+            """,
+            (
+                normalized_competitor,
+                normalized_asset,
+                normalized_indication,
+                normalized_primary_source_url,
+            ),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO competitor_universe_observations (
+                    competitor, asset, indication, stage_status, region, primary_source_url, source_label, source_type,
+                    content_fingerprint, aliases_json, target_moa, layer, provenance_score,
+                    first_seen_at_kst, last_seen_at_kst, last_verified_at_kst
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_competitor,
+                    normalized_asset,
+                    normalized_indication,
+                    str(stage_status or "").strip() or None,
+                    str(region or "").strip() or None,
+                    normalized_primary_source_url,
+                    str(source_label or "").strip() or None,
+                    str(source_type or "").strip() or None,
+                    str(content_fingerprint or "").strip(),
+                    aliases_json,
+                    str(target_moa or "").strip() or None,
+                    str(layer or "").strip() or None,
+                    None if provenance_score is None else float(provenance_score),
+                    observed_at_kst,
+                    observed_at_kst,
+                    observed_at_kst,
+                ),
+            )
+            return
+        conn.execute(
+            """
+            UPDATE competitor_universe_observations
+            SET stage_status = ?,
+                region = ?,
+                source_label = ?,
+                source_type = ?,
+                content_fingerprint = ?,
+                aliases_json = ?,
+                target_moa = ?,
+                layer = ?,
+                provenance_score = ?,
+                last_seen_at_kst = ?,
+                last_verified_at_kst = ?
+            WHERE competitor = ? AND asset = ? AND indication = ? AND primary_source_url = ?
+            """,
+            (
+                str(stage_status or "").strip() or None,
+                str(region or "").strip() or None,
+                str(source_label or "").strip() or None,
+                str(source_type or "").strip() or None,
+                str(content_fingerprint or "").strip(),
+                aliases_json,
+                str(target_moa or "").strip() or None,
+                str(layer or "").strip() or None,
+                None if provenance_score is None else float(provenance_score),
+                observed_at_kst,
+                observed_at_kst,
+                normalized_competitor,
+                normalized_asset,
+                normalized_indication,
+                normalized_primary_source_url,
+            ),
+        )
+
+
+def load_competitor_universe_observations() -> list[dict[str, Any]]:
+    with _get_connection() as conn:
+        _ensure_competitor_universe_observations_table(conn)
+        rows = conn.execute(
+            """
+            SELECT competitor, asset, indication, stage_status, region, primary_source_url, source_label, source_type,
+                   content_fingerprint, aliases_json, target_moa, layer, provenance_score,
+                   first_seen_at_kst, last_seen_at_kst, last_verified_at_kst
+            FROM competitor_universe_observations
+            ORDER BY last_verified_at_kst DESC, competitor ASC, asset ASC, indication ASC
+            """
+        ).fetchall()
+    observations: list[dict[str, Any]] = []
+    for row in rows:
+        observations.append(
+            {
+                "competitor": str(row["competitor"]).strip(),
+                "asset": str(row["asset"]).strip(),
+                "indication": str(row["indication"]).strip(),
+                "stage_status": str(row["stage_status"]).strip() if row["stage_status"] else None,
+                "region": str(row["region"]).strip() if row["region"] else None,
+                "primary_source_url": str(row["primary_source_url"]).strip(),
+                "source_label": str(row["source_label"]).strip() if row["source_label"] else None,
+                "source_type": str(row["source_type"]).strip() if row["source_type"] else None,
+                "content_fingerprint": str(row["content_fingerprint"]).strip(),
+                "aliases": json.loads(row["aliases_json"] or "[]"),
+                "target_moa": str(row["target_moa"]).strip() if row["target_moa"] else None,
+                "layer": str(row["layer"]).strip() if row["layer"] else None,
+                "provenance_score": float(row["provenance_score"]) if row["provenance_score"] is not None else None,
+                "first_seen_at_kst": str(row["first_seen_at_kst"]).strip(),
+                "last_seen_at_kst": str(row["last_seen_at_kst"]).strip(),
+                "last_verified_at_kst": str(row["last_verified_at_kst"]).strip(),
+            }
+        )
+    return observations
+
+
+def record_stage2_verification_run_start(
+    *,
+    trace_id: str,
+    room_key: str | None,
+    run_started_at_kst: str,
+    used_search_verify: bool,
+    gap_target_count: int,
+) -> None:
+    with _get_connection() as conn:
+        _ensure_stage2_verification_runs_table(conn)
+        _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO stage2_verification_runs (
+                trace_id, room_key, run_started_at_kst, stage2_status, used_search_verify, gap_target_count,
+                evidence_count, backfill_count, discovered_confirmed_count, discovered_unverified_count,
+                coverage_upgrade_count, reused_evidence_count, error_detail
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL)
+            """,
+            (
+                str(trace_id or "").strip() or "-",
+                str(room_key or "").strip() or None,
+                str(run_started_at_kst or "").strip() or now_kst().strftime("%Y-%m-%d %H:%M KST"),
+                "started",
+                1 if used_search_verify else 0,
+                int(gap_target_count),
+            ),
+        )
+
+
+def finalize_stage2_verification_run(
+    *,
+    trace_id: str,
+    run_finished_at_kst: str,
+    stage2_status: str,
+    evidence_count: int = 0,
+    backfill_count: int = 0,
+    discovered_confirmed_count: int = 0,
+    discovered_unverified_count: int = 0,
+    coverage_upgrade_count: int = 0,
+    reused_evidence_count: int = 0,
+    error_detail: str | None = None,
+) -> None:
+    with _get_connection() as conn:
+        _ensure_stage2_verification_runs_table(conn)
+        _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE stage2_verification_runs
+            SET run_finished_at_kst = ?,
+                stage2_status = ?,
+                evidence_count = ?,
+                backfill_count = ?,
+                discovered_confirmed_count = ?,
+                discovered_unverified_count = ?,
+                coverage_upgrade_count = ?,
+                reused_evidence_count = ?,
+                error_detail = ?
+            WHERE trace_id = ?
+            """,
+            (
+                str(run_finished_at_kst or "").strip() or now_kst().strftime("%Y-%m-%d %H:%M KST"),
+                str(stage2_status or "").strip() or "failed",
+                int(evidence_count),
+                int(backfill_count),
+                int(discovered_confirmed_count),
+                int(discovered_unverified_count),
+                int(coverage_upgrade_count),
+                int(reused_evidence_count),
+                str(error_detail or "").strip() or None,
+                str(trace_id or "").strip() or "-",
+            ),
+        )
+
+
+def persist_stage2_verification_success(
+    *,
+    trace_id: str,
+    run_finished_at_kst: str,
+    stage2_status: str,
+    evidence_catalog: list[dict[str, Any]],
+    provenance_rows: list[dict[str, Any]],
+    backfill_count: int,
+    discovered_confirmed_count: int,
+    discovered_unverified_count: int,
+    coverage_upgrade_count: int,
+    reused_evidence_count: int = 0,
+) -> None:
+    inserted_at_kst = now_kst().strftime("%Y-%m-%d %H:%M KST")
+    with _get_connection() as conn:
+        _ensure_stage2_verification_runs_table(conn)
+        _ensure_stage2_search_evidence_table(conn)
+        _ensure_stage2_finding_provenance_table(conn)
+        _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+        for evidence in evidence_catalog:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO stage2_search_evidence (
+                    trace_id, evidence_id, topic, source_type, source_name, source_url, title,
+                    published_at_kst, updated_at_kst, confidence, excerpt, evidence_kind,
+                    confirms_fields_json, entity, asset, indication, region, inserted_at_kst
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(trace_id or "").strip() or "-",
+                    str(evidence.get("evidence_id") or "").strip() or "-",
+                    str(evidence.get("topic") or "").strip() or "-",
+                    str(evidence.get("source_type") or "").strip() or "official",
+                    str(evidence.get("source_name") or "").strip() or "-",
+                    str(evidence.get("source_url") or "").strip() or "-",
+                    str(evidence.get("title") or "").strip() or "-",
+                    str(evidence.get("published_at_kst") or "").strip() or None,
+                    str(evidence.get("updated_at_kst") or "").strip() or None,
+                    float(evidence.get("confidence") or 0.0),
+                    str(evidence.get("excerpt") or "").strip() or "",
+                    str(evidence.get("evidence_kind") or "").strip() or "field_confirmation",
+                    json.dumps(list(evidence.get("confirms_fields") or []), ensure_ascii=False),
+                    str(evidence.get("entity") or "").strip() or None,
+                    str(evidence.get("asset") or "").strip() or None,
+                    str(evidence.get("indication") or "").strip() or None,
+                    str(evidence.get("region") or "").strip() or None,
+                    inserted_at_kst,
+                ),
+            )
+        for row in provenance_rows:
+            conn.execute(
+                """
+                INSERT INTO stage2_finding_provenance (
+                    trace_id, finding_identity, candidate_id, field_name, field_value, action_type,
+                    source_type, source_name, source_url, evidence_id, provenance_strength, note, recorded_at_kst
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(trace_id or "").strip() or "-",
+                    str(row.get("finding_identity") or "").strip() or "-",
+                    str(row.get("candidate_id") or "").strip() or None,
+                    str(row.get("field_name") or "").strip() or "-",
+                    str(row.get("field_value") or "").strip() or None,
+                    str(row.get("action_type") or "").strip() or "filled_blank",
+                    str(row.get("source_type") or "").strip() or "official",
+                    str(row.get("source_name") or "").strip() or "-",
+                    str(row.get("source_url") or "").strip() or None,
+                    str(row.get("evidence_id") or "").strip() or None,
+                    str(row.get("provenance_strength") or "").strip() or "unknown",
+                    str(row.get("note") or "").strip() or "",
+                    str(row.get("recorded_at_kst") or "").strip() or inserted_at_kst,
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE stage2_verification_runs
+            SET run_finished_at_kst = ?,
+                stage2_status = ?,
+                evidence_count = ?,
+                backfill_count = ?,
+                discovered_confirmed_count = ?,
+                discovered_unverified_count = ?,
+                coverage_upgrade_count = ?,
+                reused_evidence_count = ?,
+                error_detail = NULL
+            WHERE trace_id = ?
+            """,
+            (
+                str(run_finished_at_kst or "").strip() or inserted_at_kst,
+                str(stage2_status or "").strip() or "success",
+                len(evidence_catalog),
+                int(backfill_count),
+                int(discovered_confirmed_count),
+                int(discovered_unverified_count),
+                int(coverage_upgrade_count),
+                int(reused_evidence_count),
+                str(trace_id or "").strip() or "-",
+            ),
+        )
+
+
+def list_stage2_verification_runs(
+    trace_id: str | None = None,
+    *,
+    room_key: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    with _get_connection() as conn:
+        _ensure_stage2_verification_runs_table(conn)
+        _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+        if str(trace_id or "").strip():
+            rows = conn.execute(
+                """
+                SELECT trace_id, room_key, run_started_at_kst, run_finished_at_kst, stage2_status,
+                       used_search_verify, gap_target_count, evidence_count, backfill_count,
+                       discovered_confirmed_count, discovered_unverified_count, coverage_upgrade_count,
+                       reused_evidence_count, error_detail
+                FROM stage2_verification_runs
+                WHERE trace_id = ?
+                ORDER BY run_started_at_kst DESC
+                """,
+                (str(trace_id).strip(),),
+            ).fetchall()
+        else:
+            query = """
+                SELECT trace_id, room_key, run_started_at_kst, run_finished_at_kst, stage2_status,
+                       used_search_verify, gap_target_count, evidence_count, backfill_count,
+                       discovered_confirmed_count, discovered_unverified_count, coverage_upgrade_count,
+                       reused_evidence_count, error_detail
+                FROM stage2_verification_runs
+            """
+            params: list[Any] = []
+            if str(room_key or "").strip():
+                query += " WHERE room_key = ?"
+                params.append(str(room_key).strip())
+            query += " ORDER BY run_started_at_kst DESC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(int(limit))
+            rows = conn.execute(query, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_stage2_search_evidence(
+    trace_id: str | None = None,
+    *,
+    room_key: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    with _get_connection() as conn:
+        _ensure_stage2_search_evidence_table(conn)
+        if str(trace_id or "").strip():
+            rows = conn.execute(
+                """
+                SELECT trace_id, evidence_id, topic, source_type, source_name, source_url, title,
+                       published_at_kst, updated_at_kst, confidence, excerpt, evidence_kind,
+                       confirms_fields_json, entity, asset, indication, region, inserted_at_kst
+                FROM stage2_search_evidence
+                WHERE trace_id = ?
+                ORDER BY inserted_at_kst DESC, evidence_id ASC
+                """,
+                (str(trace_id).strip(),),
+            ).fetchall()
+        else:
+            query = """
+                SELECT e.trace_id, e.evidence_id, e.topic, e.source_type, e.source_name, e.source_url, e.title,
+                       e.published_at_kst, e.updated_at_kst, e.confidence, e.excerpt, e.evidence_kind,
+                       e.confirms_fields_json, e.entity, e.asset, e.indication, e.region, e.inserted_at_kst
+                FROM stage2_search_evidence e
+            """
+            params: list[Any] = []
+            if str(room_key or "").strip():
+                query += " JOIN stage2_verification_runs r ON r.trace_id = e.trace_id WHERE r.room_key = ?"
+                params.append(str(room_key).strip())
+            query += " ORDER BY e.inserted_at_kst DESC, e.evidence_id ASC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(int(limit))
+            rows = conn.execute(query, tuple(params)).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["confirms_fields"] = json.loads(item.pop("confirms_fields_json") or "[]")
+        items.append(item)
+    return items
+
+
+def list_stage2_finding_provenance(trace_id: str | None = None) -> list[dict[str, Any]]:
+    with _get_connection() as conn:
+        _ensure_stage2_finding_provenance_table(conn)
+        if str(trace_id or "").strip():
+            rows = conn.execute(
+                """
+                SELECT trace_id, finding_identity, candidate_id, field_name, field_value, action_type,
+                       source_type, source_name, source_url, evidence_id, provenance_strength, note, recorded_at_kst
+                FROM stage2_finding_provenance
+                WHERE trace_id = ?
+                ORDER BY recorded_at_kst ASC, finding_identity ASC
+                """,
+                (str(trace_id).strip(),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT trace_id, finding_identity, candidate_id, field_name, field_value, action_type,
+                       source_type, source_name, source_url, evidence_id, provenance_strength, note, recorded_at_kst
+                FROM stage2_finding_provenance
+                ORDER BY recorded_at_kst ASC, finding_identity ASC
+                """
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def persist_hanall_run_snapshot(
+    *,
+    trace_id: str,
+    room_key: str | None,
+    created_at_kst: str,
+    stage1_candidate_summary: dict[str, Any],
+    stage1_output: dict[str, Any],
+    merged_stage1_output: dict[str, Any],
+    stage2_output: dict[str, Any] | None,
+    search_memory: dict[str, Any] | None,
+    ranked_issues: list[dict[str, Any]],
+    summary_lines: list[str],
+    final_text: str,
+    debug_meta: dict[str, Any] | None = None,
+) -> None:
+    with _get_connection() as conn:
+        _ensure_hanall_run_snapshots_table(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO hanall_run_snapshots (
+                trace_id, room_key, created_at_kst, stage1_candidate_summary_json, stage1_output_json,
+                merged_stage1_output_json, stage2_output_json, search_memory_json, ranked_issues_json,
+                summary_lines_json, final_text, debug_meta_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(trace_id or "").strip() or "-",
+                str(room_key or "").strip() or None,
+                str(created_at_kst or "").strip() or now_kst().strftime("%Y-%m-%d %H:%M KST"),
+                json.dumps(stage1_candidate_summary or {}, ensure_ascii=False),
+                json.dumps(stage1_output or {}, ensure_ascii=False),
+                json.dumps(merged_stage1_output or {}, ensure_ascii=False),
+                json.dumps(stage2_output, ensure_ascii=False) if isinstance(stage2_output, dict) else None,
+                json.dumps(search_memory or {}, ensure_ascii=False),
+                json.dumps(ranked_issues or [], ensure_ascii=False),
+                json.dumps(list(summary_lines or []), ensure_ascii=False),
+                str(final_text or "").strip(),
+                json.dumps(debug_meta or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def get_hanall_run_snapshot(trace_id: str) -> dict[str, Any] | None:
+    normalized_trace_id = str(trace_id or "").strip()
+    if not normalized_trace_id:
+        return None
+    with _get_connection() as conn:
+        _ensure_hanall_run_snapshots_table(conn)
+        row = conn.execute(
+            """
+            SELECT trace_id, room_key, created_at_kst, stage1_candidate_summary_json, stage1_output_json,
+                   merged_stage1_output_json, stage2_output_json, search_memory_json, ranked_issues_json,
+                   summary_lines_json, final_text, debug_meta_json
+            FROM hanall_run_snapshots
+            WHERE trace_id = ?
+            """,
+            (normalized_trace_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "trace_id": str(row["trace_id"]).strip(),
+        "room_key": str(row["room_key"]).strip() if row["room_key"] else None,
+        "created_at_kst": str(row["created_at_kst"]).strip(),
+        "stage1_candidate_summary": json.loads(row["stage1_candidate_summary_json"] or "{}"),
+        "stage1_output": json.loads(row["stage1_output_json"] or "{}"),
+        "merged_stage1_output": json.loads(row["merged_stage1_output_json"] or "{}"),
+        "stage2_output": json.loads(row["stage2_output_json"] or "{}") if row["stage2_output_json"] else None,
+        "search_memory": json.loads(row["search_memory_json"] or "{}"),
+        "ranked_issues": json.loads(row["ranked_issues_json"] or "[]"),
+        "summary_lines": json.loads(row["summary_lines_json"] or "[]"),
+        "final_text": str(row["final_text"]).strip(),
+        "debug_meta": json.loads(row["debug_meta_json"] or "{}"),
+    }
+
+
+def list_hanall_run_snapshots(limit: int = 20, *, room_key: str | None = None) -> list[dict[str, Any]]:
+    with _get_connection() as conn:
+        _ensure_hanall_run_snapshots_table(conn)
+        query = """
+            SELECT trace_id, room_key, created_at_kst, stage1_candidate_summary_json, stage1_output_json,
+                   merged_stage1_output_json, stage2_output_json, search_memory_json, ranked_issues_json,
+                   summary_lines_json, final_text, debug_meta_json
+            FROM hanall_run_snapshots
+        """
+        params: list[Any] = []
+        if str(room_key or "").strip():
+            query += " WHERE room_key = ?"
+            params.append(str(room_key).strip())
+        query += " ORDER BY created_at_kst DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, tuple(params)).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        items.append(
+            {
+                "trace_id": str(row["trace_id"]).strip(),
+                "room_key": str(row["room_key"]).strip() if row["room_key"] else None,
+                "created_at_kst": str(row["created_at_kst"]).strip(),
+                "stage1_candidate_summary": json.loads(row["stage1_candidate_summary_json"] or "{}"),
+                "stage1_output": json.loads(row["stage1_output_json"] or "{}"),
+                "merged_stage1_output": json.loads(row["merged_stage1_output_json"] or "{}"),
+                "stage2_output": json.loads(row["stage2_output_json"] or "{}") if row["stage2_output_json"] else None,
+                "search_memory": json.loads(row["search_memory_json"] or "{}"),
+                "ranked_issues": json.loads(row["ranked_issues_json"] or "[]"),
+                "summary_lines": json.loads(row["summary_lines_json"] or "[]"),
+                "final_text": str(row["final_text"]).strip(),
+                "debug_meta": json.loads(row["debug_meta_json"] or "{}"),
+            }
+        )
+    return items
 
 
 def reset_inflight_outbox_messages() -> int:

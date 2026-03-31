@@ -13,6 +13,13 @@ from urllib.parse import quote_plus, urljoin
 import requests
 import yaml
 
+from server.application.hanall_page_items import (
+    build_known_events_context,
+    classify_event_freshness,
+    merge_known_events,
+    parse_known_event_kst,
+)
+from server.core.hanall_news_models import GeneratedKnownEvent, OfficialPageItem
 from server.settings import SERVER_DIR
 from server.utils import now_kst, smart_truncate
 
@@ -55,14 +62,14 @@ HANALL_ASSET_ALIAS_RULES = (
 HANALL_FINAL_SECTION_HEADINGS = (
     "요약",
     "오늘 예정 이벤트",
-    "회사 직접 업데이트",
-    "경쟁사 관련 업데이트",
-    "경쟁사 동향 요약",
-    "확인한 자료",
-    "추가 확인 필요",
-    "아직 확인이 필요한 부분",
-    "누락 점검",
-    "참고 메모",
+    "Confirmed Updates — Company Direct",
+    "Confirmed Updates — Competitor Relevant",
+    "Competitor Map Snapshot",
+    "Checked Source Log",
+    "Unverified Leads",
+    "Coverage Gaps",
+    "Omission Audit",
+    "검증 메모",
 )
 
 DIRECT_TERMS = (
@@ -808,42 +815,54 @@ def _load_hanall_known_event_overrides(path: Path = HANALL_KNOWN_EVENTS_PATH) ->
     return list(events) if isinstance(events, list) else []
 
 
-def get_hanall_known_events(as_of_date: str | None = None, *, current_now: datetime | None = None) -> list[dict[str, str]]:
+def get_hanall_known_events(
+    as_of_date: str | None = None,
+    *,
+    current_now: datetime | None = None,
+    generated_events: list[GeneratedKnownEvent] | None = None,
+) -> list[dict[str, str]]:
     normalized_date = str(as_of_date or "").strip()[:10] or now_kst().strftime("%Y-%m-%d")
     reference_now = current_now or now_kst()
     events: list[dict[str, str]] = []
-    for raw_event in _load_hanall_known_event_overrides():
-        if not isinstance(raw_event, dict):
-            continue
-        normalized = _normalize_known_event_copy(raw_event, current_now=reference_now)
+    merged_events = merge_known_events(
+        _load_hanall_known_event_overrides(),
+        generated_events or [],
+        current_now=reference_now,
+    )
+    for merged_event in merged_events:
+        normalized = merged_event.model_dump(mode="json")
         scheduled_for_kst = normalized.get("scheduled_for_kst", "-")
-        scheduled_dt = _parse_known_event_kst(scheduled_for_kst)
+        scheduled_dt = parse_known_event_kst(scheduled_for_kst)
         if scheduled_dt is not None and scheduled_dt.astimezone(reference_now.tzinfo).date().isoformat() > normalized_date:
             continue
+        freshness_status = classify_event_freshness(
+            scheduled_for_kst=scheduled_for_kst,
+            fact=normalized.get("fact", "-"),
+            status_note=normalized.get("status_note", "-"),
+            current_now=reference_now,
+        )
+        if freshness_status == "stale":
+            normalized["aging_status"] = "past_due_without_followup"
+        elif freshness_status == "completed_unknown":
+            normalized["aging_status"] = "confirmed_or_completed"
+        elif freshness_status == "due_today":
+            normalized["aging_status"] = "due_today"
+        else:
+            normalized["aging_status"] = "due_future" if scheduled_dt is not None else "due_today"
         events.append(normalized)
     events.sort(key=lambda item: item.get("scheduled_for_kst", ""))
     return events
 
 
-def build_hanall_known_events_context(as_of_date: str | None = None, *, current_now: datetime | None = None) -> str:
-    blocks: list[str] = []
-    for raw_event in get_hanall_known_events(as_of_date, current_now=current_now):
-        blocks.append(
-            "\n".join(
-                [
-                    f"- entity: {raw_event['entity']}",
-                    f"  category: {raw_event['category']}",
-                    f"  scheduled_for_kst: {raw_event['scheduled_for_kst']}",
-                    f"  fact: {raw_event['fact']}",
-                    f"  basis: {raw_event['basis']}",
-                    f"  primary_source: {raw_event['primary_source']}",
-                    f"  status_note: {raw_event['status_note']}",
-                ]
-            )
-        )
-    if not blocks:
-        return "- 오늘 날짜에 해당하는 로컬 예정 이벤트 없음"
-    return "\n".join(blocks)
+def build_hanall_known_events_context(
+    as_of_date: str | None = None,
+    *,
+    current_now: datetime | None = None,
+    generated_events: list[GeneratedKnownEvent] | None = None,
+) -> str:
+    return build_known_events_context(
+        get_hanall_known_events(as_of_date, current_now=current_now, generated_events=generated_events)
+    )
 
 
 def build_hanall_scope_context() -> str:

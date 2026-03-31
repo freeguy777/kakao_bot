@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,17 @@ from server.application.hanall_news_pipeline import (
     render_stage1_fallback_text,
     run_hanall_news_pipeline,
 )
+from server.application.hanall_reporting import (
+    build_hanall_run_drift_report,
+    build_ranked_issue_list,
+    build_search_plan_from_memory,
+    build_stage2_search_memory,
+    get_hanall_ops_metrics,
+    get_hanall_recent_run_summary,
+    get_hanall_run_debug_bundle,
+    get_hanall_source_health_report,
+    get_latest_hanall_runs,
+)
 from server.application.hanall_research import (
     HanallResearchItem,
     HanallSourceStatus,
@@ -38,7 +50,7 @@ from server.application.hanall_research import (
     build_hanall_research_packet,
     get_hanall_known_events,
 )
-from server.application.news import build_hanall_news_brief
+from server.application.news import _public_text_has_required_sections, build_hanall_news_brief
 from server.application.prompting import run_prompt_by_key_raw
 from server.application.weather import get_room_weather_snapshot
 from server.application.youtube import collect_youtube_summary_messages, split_long_message, summarize_youtube_url
@@ -47,14 +59,18 @@ from server.application.use_cases.runtime_health import RuntimeHealthUseCase
 from server.config import _warn_room_delivery_targets, get_prompt, resolve_room_policy
 from server.core.hanall_news_models import (
     CheckedSourceLogEntry,
+    CompetitorMapEntry,
     CoverageGap,
     HanallStage1OverlayOutput,
     CoverageSummary,
+    FieldProvenance,
     HanallStage1StructuredOutput,
     OmissionAuditEntry,
     OfficialCollectionResult,
     RSSCollectionResult,
     RawFinding,
+    SearchGapTarget,
+    StageFinding,
 )
 from server.infra.hanall_news_collectors import MfdsCollector, _dedupe_findings, collect_hanall_official_findings
 from server.infra.llm_clients import call_gemini_text, call_openai_text
@@ -62,9 +78,15 @@ from server.infra.sqlite_store import (
     ack_outbox_messages,
     count_outbox_messages,
     init_db,
+    list_stage2_finding_provenance,
+    list_stage2_search_evidence,
+    list_stage2_verification_runs,
+    persist_hanall_run_snapshot,
     list_scheduler_events,
     pull_pending_outbox_messages,
+    finalize_stage2_verification_run,
     record_scheduler_event,
+    record_stage2_verification_run_start,
     register_admin_alert_attempt,
     register_delivery_dedupe,
 )
@@ -263,8 +285,9 @@ class HanallResearchPacketTest(unittest.TestCase):
 
 
 class HanallPromptLoadingTest(unittest.TestCase):
-    def test_hanall_prompts_are_split_between_collect_and_finalize(self) -> None:
+    def test_hanall_prompts_are_split_between_collect_search_verify_and_finalize(self) -> None:
         collect_prompt = get_prompt("hanall_news_collect_prompt")
+        search_verify_prompt = get_prompt("hanall_news_search_verify_prompt")
         finalize_prompt = get_prompt("hanall_news_finalize_prompt")
         legacy_prompt = get_prompt("hanall_news_prompt")
 
@@ -272,8 +295,12 @@ class HanallPromptLoadingTest(unittest.TestCase):
         self.assertFalse(collect_prompt.get("tools"))
         self.assertIn("__STAGE1_CANDIDATE_PAYLOAD_JSON__", collect_prompt["template"])
         self.assertIn("company_direct_confirmed_ids", collect_prompt["template"])
+        self.assertIn("search_gap_targets", collect_prompt["template"])
         self.assertNotIn("today_scheduled_events\": [StageFinding]", collect_prompt["template"])
-        self.assertEqual(finalize_prompt["tools"], [{"google_search": {}}])
+        self.assertEqual(search_verify_prompt["tools"], [{"google_search": {}}])
+        self.assertIn("__SEARCH_GAP_TARGETS_JSON__", search_verify_prompt["template"])
+        self.assertFalse(finalize_prompt.get("tools"))
+        self.assertIn("__STAGE2_VERIFICATION_JSON__", finalize_prompt["template"])
         self.assertNotIn("tools", legacy_prompt)
 
     def test_base_prompt_replacements_include_shared_rule_blocks(self) -> None:
@@ -627,6 +654,139 @@ Omission Audit
 - 확인 소스 로그: 4건
 - 확인 소스 예시: Immunovant PR:new, SEC Form 8-K:no_new"""
 
+    @staticmethod
+    def _build_public_pipeline_result() -> HanallNewsPipelineResult:
+        current_now = datetime(2026, 3, 26, 9, 0, tzinfo=now_kst().tzinfo)
+        stage1_output = HanallStage1StructuredOutput(
+            coverage=CoverageSummary(level="High", rationale="회사 공식 자료와 규제 자료를 점검함"),
+            today_scheduled_events=[
+                StageFinding(
+                    candidate_id="sched-1",
+                    entity="HanAll Biopharma",
+                    category="scheduled_event",
+                    title="IR 행사 예정",
+                    published_at_kst="2026-03-26 09:00 KST",
+                    source_group="company_official",
+                    source_name="company_official",
+                    primary_source_url="https://www.hanall.com/ir",
+                    summary="오늘 IR 행사 일정이 예정되어 있습니다.",
+                )
+            ],
+            company_direct_confirmed=[
+                StageFinding(
+                    candidate_id="cand-1",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 임상 등록 정보 업데이트",
+                    published_at_kst="2026-03-26 08:30 KST",
+                    source_group="trial_registry",
+                    source_name="clinicaltrials",
+                    primary_source_url="https://clinicaltrials.gov/study/NCT12345678",
+                    summary="공식 임상 등록 페이지에서 모집 단계와 환자 수가 업데이트되었습니다.",
+                    trial_id="NCT12345678",
+                    asset="IMVT-1401",
+                    indication="gMG",
+                    phase="Phase 3",
+                    enrollment="240",
+                    primary_completion_date="2026-12-01",
+                    site_countries=["US", "JP"],
+                    field_provenance={
+                        "phase": [
+                            FieldProvenance(
+                                field_name="phase",
+                                field_value="Phase 3",
+                                action_type="filled_blank",
+                                source_type="registry",
+                                source_name="clinicaltrials",
+                                provenance_strength="official_registry",
+                            )
+                        ]
+                    },
+                )
+            ],
+            competitor_relevant_confirmed=[
+                StageFinding(
+                    candidate_id="cand-2",
+                    entity="argenx",
+                    category="competitor_relevant",
+                    title="경쟁사 발표자료 업데이트",
+                    published_at_kst="2026-03-26 07:00 KST",
+                    source_group="competitor_official",
+                    source_name="competitor_official",
+                    primary_source_url="https://www.argenx.com/presentation",
+                    summary="경쟁사 발표자료에 gMG 관련 개발 현황이 반영되었습니다.",
+                    asset="efgartigimod",
+                    indication="gMG",
+                    stage_status="출시",
+                )
+            ],
+            competitor_map_snapshot=[
+                CompetitorMapEntry(
+                    competitor="argenx",
+                    asset="efgartigimod",
+                    indication="gMG",
+                    stage_status="출시",
+                    layer="Direct class",
+                    region="US",
+                )
+            ],
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    status="checked",
+                    checked_at_kst="2026-03-26 09:00 KST",
+                    note="items=1",
+                )
+            ],
+            unverified_leads=[
+                StageFinding(
+                    candidate_id="lead-1",
+                    entity="Immunovant",
+                    category="unverified_lead",
+                    title="LinkedIn hiring signal",
+                    source_group="discovery_only",
+                    source_name="linkedin",
+                    primary_source_url="https://www.linkedin.com/company/immunovant",
+                    reason_unverified="공식 채용 페이지가 아니라 참고 자료만 먼저 확인되었습니다.",
+                    missing_verification_target="회사 공식 careers 페이지 확인",
+                    suggested_official_followup_queries=["Immunovant careers", "Immunovant jobs"],
+                )
+            ],
+            coverage_gaps=[
+                CoverageGap(
+                    source_family="sec",
+                    source_name="sec_api",
+                    source_group="regulator_disclosure",
+                    gap_type="http_429",
+                    detail="외부 서비스 응답 제한으로 잠시 후 재확인이 필요합니다.",
+                )
+            ],
+            omission_audit=[
+                OmissionAuditEntry(
+                    topic="official_api_collection",
+                    detail="규제·공시 축에서 재확인이 필요한 항목이 남아 있습니다.",
+                    axis="source_group",
+                    status="open",
+                    source_group="regulator_disclosure",
+                )
+            ],
+        )
+        raw_text = render_stage1_fallback_text(
+            stage1_output=stage1_output,
+            official_collection=OfficialCollectionResult(),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+        return HanallNewsPipelineResult(
+            final_text=raw_text,
+            raw_output_text=raw_text,
+            stage1_output=stage1_output,
+            official_collection=OfficialCollectionResult(),
+            rss_collection=RSSCollectionResult(),
+        )
+
     @patch(
         "server.application.news.run_hanall_news_pipeline",
         side_effect=TimeoutError("background 응답 polling timeout status=in_progress"),
@@ -649,14 +809,84 @@ Omission Audit
         result = build_hanall_news_brief()
 
         self.assertIn("[한올/Immunovant 24시간 브리핑]", result)
-        self.assertIn("회사 직접 업데이트", result)
-        self.assertIn("경쟁사 관련 업데이트", result)
+        self.assertIn("Confirmed Updates — Company Direct", result)
+        self.assertIn("Confirmed Updates — Competitor Relevant", result)
         self.assertIn("오늘 예정 이벤트", result)
         self.assertIn("정기주주총회", result)
         self.assertIn("Immunovant", result)
         self.assertIn("argenx", result)
         self.assertNotIn("```", result)
         self.assertTrue(_final_text_has_required_sections(result))
+
+    @patch("server.application.news.run_hanall_news_pipeline")
+    def test_returns_reader_friendly_public_brief_for_non_admin_room(self, mocked_pipeline) -> None:
+        mocked_pipeline.return_value = self._build_public_pipeline_result()
+
+        result = build_hanall_news_brief(room_key="stock_openchat_news")
+
+        self.assertTrue(_public_text_has_required_sections(result))
+        self.assertIn("📌 요약", result)
+        self.assertIn("📅 오늘 예정 이벤트", result)
+        self.assertIn("🏢 회사 직접 업데이트", result)
+        self.assertIn("🧭 경쟁사 관련 업데이트", result)
+        self.assertIn("🗺 경쟁 구도 한눈에 보기", result)
+        self.assertIn("🔎 확인한 자료", result)
+        self.assertIn("⚠ 추가 확인이 필요한 단서", result)
+        self.assertIn("1. 기준:", result)
+        self.assertIn("2. 범위:", result)
+        self.assertIn("3. 커버리지:", result)
+        self.assertIn("4. 공식 자료로 확인된 새 소식: 총 2건 (회사 1건, 경쟁사 1건)", result)
+        self.assertIn("회사 직접 업데이트 1건: Immunovant 'IMVT-1401 임상 등록 정보 업데이트'", result)
+        self.assertIn("경쟁사 관련 업데이트 1건: argenx '경쟁사 발표자료 업데이트'", result)
+        self.assertIn("🗺 경쟁 구도 한눈에 보기", result)
+        self.assertIn("- argenx", result)
+        self.assertIn("약물: efgartigimod | 질환: gMG", result)
+        self.assertIn("단계: 출시", result)
+        self.assertIn("임상 단계: Phase 3", result)
+        self.assertIn("참여 규모: 240", result)
+        self.assertIn("핵심 내용:", result)
+        self.assertIn("원문 링크:", result)
+        self.assertIn("확인 근거: 공식 자료 재확인", result)
+        self.assertIn("아직 확정하지 못한 이유:", result)
+        self.assertNotIn("Coverage Gaps", result)
+        self.assertNotIn("Omission Audit", result)
+        self.assertNotIn("검증 메모", result)
+        self.assertNotIn("Confirmed Updates — Company Direct", result)
+        self.assertNotIn("Confirmed Updates — Competitor Relevant", result)
+        self.assertNotIn("외부 서비스 응답 제한으로 잠시 후 재확인이 필요합니다.", result)
+        self.assertNotIn("Primary source:", result)
+        self.assertNotIn("Trial ID:", result)
+
+    @patch("server.application.news.run_hanall_news_pipeline")
+    def test_keeps_detailed_brief_for_admin_room(self, mocked_pipeline) -> None:
+        mocked_pipeline.return_value = self._build_public_pipeline_result()
+
+        result = build_hanall_news_brief(room_key="admin_test_room")
+
+        self.assertIn("Primary source:", result)
+        self.assertIn("Trial ID:", result)
+
+    @patch("server.application.news.deliver_room_messages")
+    @patch("server.application.news.run_hanall_news_pipeline")
+    def test_can_enqueue_detailed_copy_to_admin_for_public_room(self, mocked_pipeline, mocked_deliver) -> None:
+        mocked_pipeline.return_value = self._build_public_pipeline_result()
+
+        result = build_hanall_news_brief(
+            room_key="stock_openchat_news",
+            send_detailed_to_admin=True,
+        )
+
+        self.assertIn("1. 기준:", result)
+        mocked_deliver.assert_called_once()
+        self.assertEqual(mocked_deliver.call_args.kwargs["room_key"], "admin_test_room")
+        self.assertEqual(mocked_deliver.call_args.kwargs["source_type"], "admin:hanall_news_detailed_copy")
+        detailed_message = mocked_deliver.call_args.kwargs["message"]
+        self.assertIn("[한올 브리핑 상세본]", detailed_message)
+        self.assertIn("Confirmed Updates — Company Direct", detailed_message)
+        self.assertIn("Primary source:", detailed_message)
+        self.assertIn("Coverage Gaps", detailed_message)
+        self.assertIn("Omission Audit", detailed_message)
+        self.assertIn("검증 메모", detailed_message)
 
     @patch("server.application.news.run_hanall_news_pipeline")
     def test_strips_code_fence_wrapper(self, mocked_pipeline) -> None:
@@ -774,6 +1004,21 @@ class HanallNewsPipelineTest(unittest.TestCase):
         return json.dumps(payload)
 
     @staticmethod
+    def _stage2_verification_json(*, summary_lines: list[str] | None = None, **overrides) -> str:
+        payload = {
+            "evidence_catalog": [],
+            "backfills": [],
+            "discovered_confirmed_findings": [],
+            "discovered_unverified_leads": [],
+            "updated_source_logs": [],
+            "updated_coverage_gaps": [],
+            "updated_omission_audit": [],
+            "summary_lines": summary_lines or ["- 지난 24시간 내 Confirmed 업데이트 총수: 1"],
+        }
+        payload.update(overrides)
+        return json.dumps(payload)
+
+    @staticmethod
     def _http_429_error() -> requests.HTTPError:
         response = requests.Response()
         response.status_code = 429
@@ -794,7 +1039,7 @@ class HanallNewsPipelineTest(unittest.TestCase):
     @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results")
     @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
     @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
-    def test_pipeline_runs_collect_then_finalize(
+    def test_pipeline_runs_collect_then_search_verify(
         self,
         mocked_run_prompt,
         mocked_collect,
@@ -802,46 +1047,9 @@ class HanallNewsPipelineTest(unittest.TestCase):
     ) -> None:
         mocked_collect.return_value = self._official_collection()
         mocked_rss.return_value = self._rss_collection()
-        valid_final_text = """[한올/Immunovant 24시간 브리핑]
-기준: 2026-03-27 09:00 KST
-범위: 2026-03-26 09:00 KST ~ 2026-03-27 09:00 KST
-커버리지: Medium (official APIs returned some findings but coverage gaps remain)
-확인 이벤트: 총 1건, 회사 1건, 경쟁사 0건
-오늘 예정 이벤트: 0건
-
-요약
-- 지난 24시간 내 Confirmed 업데이트 총수: 1
-
-오늘 예정 이벤트
-- 없음
-
-Confirmed Updates — Company Direct
-- Immunovant | company_direct | 2026-03-26 20:00 KST
-사실: IMVT-1401 study updated
-
-Confirmed Updates — Competitor Relevant
-- 없음
-
-Competitor Map Snapshot
-- 없음
-
-Checked Source Log
-- 없음
-
-Unverified Leads
-- 없음
-
-Coverage Gaps
-- 없음
-
-Omission Audit
-- 없음
-
-검증 메모
-- 확인 소스 로그: 1건"""
         mocked_run_prompt.side_effect = [
             self._stage1_overlay_json(),
-            valid_final_text,
+            self._stage2_verification_json(),
         ]
 
         result = run_hanall_news_pipeline(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
@@ -853,15 +1061,17 @@ Omission Audit
         self.assertEqual(result.stage1_invalid_item_count, 0)
         self.assertEqual(result.stage1_invalid_ref_count, 0)
         self.assertEqual(mocked_run_prompt.call_args_list[0].args[0], "hanall_news_collect_prompt")
-        self.assertEqual(mocked_run_prompt.call_args_list[1].args[0], "hanall_news_finalize_prompt")
+        self.assertEqual(mocked_run_prompt.call_args_list[1].args[0], "hanall_news_search_verify_prompt")
         self.assertIn('"candidate_count"', mocked_run_prompt.call_args_list[0].kwargs["replacements"]["__STAGE1_CANDIDATE_PAYLOAD_JSON__"])
         self.assertIn("IMVT-1401", mocked_run_prompt.call_args_list[1].kwargs["replacements"]["__STAGE1_JSON__"])
+        self.assertIn("missing_structured_field", mocked_run_prompt.call_args_list[1].kwargs["replacements"]["__SEARCH_GAP_TARGETS_JSON__"])
+        self.assertEqual(result.render_mode, "stage2_search_verify_plus_deterministic")
         self.assertIn("[한올/Immunovant 24시간 브리핑]", result.final_text)
 
     @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results")
     @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
     @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
-    def test_pipeline_uses_stage2_fallback_text_when_finalize_fails(
+    def test_pipeline_uses_stage2_fallback_text_when_search_verify_fails(
         self,
         mocked_run_prompt,
         mocked_collect,
@@ -877,8 +1087,8 @@ Omission Audit
         result = run_hanall_news_pipeline(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
 
         self.assertTrue(result.used_stage2_fallback)
-        self.assertIn("회사 직접 업데이트", result.final_text)
-        self.assertIn("참고 메모", result.final_text)
+        self.assertIn("Confirmed Updates — Company Direct", result.final_text)
+        self.assertIn("검증 메모", result.final_text)
 
     @patch("server.application.hanall_news_pipeline._stage1_retry_sleep")
     @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results")
@@ -973,7 +1183,7 @@ Omission Audit
         self.assertEqual(result.render_mode, "deterministic_due_to_rate_limit")
         self.assertEqual(result.stage2_attempts, 2)
         self.assertEqual(result.stage2_skipped_reason, "rate_limit_after_retry")
-        self.assertIn("회사 직접 업데이트", result.final_text)
+        self.assertIn("Confirmed Updates — Company Direct", result.final_text)
         mocked_sleep.assert_called_once()
         self.assertEqual(mocked_run_prompt.call_count, 3)
         _reset_stage2_rate_limit_state()
@@ -982,7 +1192,7 @@ Omission Audit
     @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results")
     @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
     @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
-    def test_sparse_no_news_path_skips_stage2_and_renders_known_event_naturally(
+    def test_no_news_day_stage2_can_improve_source_coverage_sections(
         self,
         mocked_run_prompt,
         mocked_collect,
@@ -1013,19 +1223,60 @@ Omission Audit
                 "primary_source": "fixture source",
                 "status_note": "예정일 경과, 후속 공시 확인 필요",
                 "scheduled_for_kst": "2026-03-26 09:00 KST",
+                "aging_status": "past_due_without_followup",
             }
+        ]
+        mocked_run_prompt.side_effect = [
+            self._stage2_verification_json(
+                summary_lines=["- 지난 24시간 내 확인된 핵심 업데이트는 없지만 search verification으로 coverage를 보강함"],
+                updated_source_logs=[
+                    {
+                        "source_family": "company_official",
+                        "source_name": "immunovant_ir",
+                        "source_group": "company_official",
+                        "status": "checked",
+                        "checked_at_kst": "2026-03-27 09:00 KST",
+                        "note": "items=0 | search verified no new official item",
+                        "endpoint": "https://www.immunovant.com",
+                        "latest_item_title": "IR Calendar",
+                        "latest_item_url": "https://www.immunovant.com/news-events/events-presentations/default.aspx",
+                    }
+                ],
+                updated_coverage_gaps=[
+                    {
+                        "source_family": "trial_registry",
+                        "source_name": "ctis",
+                        "source_group": "trial_registry",
+                        "gap_type": "search_verified_no_new_item",
+                        "detail": "official registry checked via search_verify but no new 24h item found",
+                        "severity": "low",
+                    }
+                ],
+                updated_omission_audit=[
+                    {
+                        "topic": "source-group:company_official",
+                        "axis": "source_group",
+                        "source_group": "company_official",
+                        "status": "completed",
+                        "detail": "stage2 search verification checked Immunovant IR and found no new 24h item",
+                    }
+                ],
+            )
         ]
         result = run_hanall_news_pipeline(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
 
-        self.assertTrue(result.used_stage2_fallback)
-        self.assertEqual(result.render_mode, "deterministic_due_to_sparse_stage1")
-        self.assertEqual(result.stage2_attempts, 0)
-        self.assertEqual(result.stage2_skipped_reason, "sparse_stage1_no_updates")
-        self.assertIn("지난 24시간 내 확인된 핵심 업데이트 없음", result.final_text)
+        self.assertFalse(result.used_stage2_fallback)
+        self.assertEqual(result.render_mode, "stage2_search_verify_plus_deterministic")
+        self.assertEqual(result.stage2_attempts, 1)
+        self.assertIn("search verification으로 coverage를 보강함", result.final_text)
+        self.assertIn("오늘 예정 이벤트\n- 예정 또는 후속 확인 필요 일정 없음", result.final_text)
         self.assertIn("예정일 경과, 후속 공시 확인 필요", result.final_text)
+        self.assertIn("IR Calendar", result.final_text)
+        self.assertIn("search verification checked Immunovant IR", result.final_text)
+        self.assertIn("official registry checked via search_verify", result.final_text)
         self.assertEqual(result.stage1_mode, "deterministic_base_only_sparse")
         self.assertEqual(result.stage1_attempts, 0)
-        self.assertEqual(mocked_run_prompt.call_count, 0)
+        self.assertEqual(mocked_run_prompt.call_count, 1)
         _reset_stage2_rate_limit_state()
 
     @patch("server.application.hanall_news_pipeline._stage2_retry_sleep")
@@ -1059,6 +1310,1358 @@ Omission Audit
         self.assertEqual(mocked_run_prompt.call_count, 4)
         mocked_sleep.assert_called_once()
         _reset_stage2_rate_limit_state()
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_backfills_missing_clinical_fields(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 MG registry update",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT11111111",
+                    trial_id="NCT11111111",
+                    asset="IMVT-1401",
+                    indication="MG",
+                    sponsor="Immunovant",
+                    recruitment_status="Recruiting",
+                    confidence=0.95,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            self._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {
+                            "phase": "Phase 3",
+                            "enrollment": "240",
+                            "primary_completion_date": "2026-12-01",
+                            "site_countries": ["US", "JP"],
+                        },
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "NCT11111111 clinical registry detail",
+                        "source_type": "registry",
+                        "source_name": "clinicaltrials",
+                        "source_url": "https://clinicaltrials.gov/study/NCT11111111",
+                        "title": "Study Record Detail",
+                        "updated_at_kst": "2026-03-29 08:00 KST",
+                        "confidence": 0.95,
+                        "excerpt": "Phase 3, Enrollment 240",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["phase", "enrollment", "primary_completion_date", "site_countries"],
+                    }
+                ],
+                summary_lines=["- stage2 search verification으로 임상 필드 누락을 보강함"],
+            ),
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        self.assertFalse(result.used_stage2_fallback)
+        self.assertIn("Phase: Phase 3", result.final_text)
+        self.assertIn("Enrollment: 240", result.final_text)
+        self.assertIn("Primary completion date: 2026-12-01", result.final_text)
+        self.assertIn("Site countries: US, JP", result.final_text)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_backfills_missing_regulatory_fields(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="sec",
+                    source_name="sec_api",
+                    source_group="regulator_disclosure",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="Form 8-K filed",
+                    published_at=current_now - timedelta(hours=1),
+                    primary_source_url="https://www.sec.gov/ixviewer/0001111111",
+                    document_id="0001111111-26-000001",
+                    filing_type="8-K",
+                    regulator="SEC",
+                    exchange="NASDAQ",
+                    confidence=0.95,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            self._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {
+                            "accepted_at": "2026-03-29 08:02 KST",
+                            "regulatory_phrase": "accepted for filing",
+                            "key_numbers": ["gross_proceeds=$75000000"],
+                        },
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "SEC 8-K accepted",
+                        "source_type": "regulator",
+                        "source_name": "sec",
+                        "source_url": "https://www.sec.gov/ixviewer/0001111111",
+                        "title": "8-K Accepted",
+                        "published_at_kst": "2026-03-29 08:02 KST",
+                        "confidence": 0.9,
+                        "excerpt": "accepted for filing",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["accepted_at", "regulatory_phrase", "key_numbers"],
+                    }
+                ],
+            ),
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        self.assertIn("accepted_at: 2026-03-29 08:02 KST", result.final_text)
+        self.assertIn("Regulatory phrase: accepted for filing", result.final_text)
+        self.assertIn("key numbers: gross_proceeds=$75000000", result.final_text)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_adds_discovered_confirmed_official_item(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = OfficialCollectionResult(
+            findings=[],
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="company_official",
+                    source_name="immunovant_ir",
+                    source_group="company_official",
+                    status="checked",
+                    checked_at_kst="2026-03-29 09:00 KST",
+                    note="items=0",
+                    endpoint="https://www.immunovant.com",
+                )
+            ],
+        )
+        mocked_run_prompt.side_effect = [
+            self._stage2_verification_json(
+                discovered_confirmed_findings=[
+                    {
+                        "category": "company_direct",
+                        "entity": "Immunovant",
+                        "title": "Investor presentation posted",
+                        "source_type": "official",
+                        "source_name": "immunovant_ir",
+                        "source_url": "https://www.immunovant.com/presentation.pdf",
+                        "published_at_kst": "2026-03-29 08:20 KST",
+                        "structured_fields": {
+                            "asset": "IMVT-1402",
+                            "indication": "TED",
+                            "document_type": "presentation",
+                        },
+                        "why_discovered": "stage1 source log suggested official IR page re-check",
+                    }
+                ],
+                summary_lines=["- stage2 search verification으로 신규 official item 1건을 발견함"],
+            )
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        self.assertFalse(result.used_stage2_fallback)
+        self.assertIn("Investor presentation posted", result.final_text)
+        self.assertIn("Asset: IMVT-1402", result.final_text)
+        self.assertIn("Indication: TED", result.final_text)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_discovery_only_hit_is_not_promoted_to_confirmed(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = OfficialCollectionResult(
+            findings=[],
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="company_official",
+                    source_name="immunovant_ir",
+                    source_group="company_official",
+                    status="checked",
+                    checked_at_kst="2026-03-29 09:00 KST",
+                    note="items=0",
+                    endpoint="https://www.immunovant.com",
+                )
+            ],
+        )
+        mocked_run_prompt.side_effect = [
+            self._stage2_verification_json(
+                discovered_confirmed_findings=[
+                    {
+                        "category": "company_direct",
+                        "entity": "Immunovant",
+                        "title": "Blog rumor",
+                        "source_type": "discovery_only",
+                        "source_name": "linkedin",
+                        "source_url": "https://linkedin.example/blog-rumor",
+                        "published_at_kst": "2026-03-29 08:20 KST",
+                        "structured_fields": {"asset": "IMVT-1401"},
+                        "why_discovered": "discovery-only hit",
+                    }
+                ]
+            )
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        confirmed_block = result.final_text.split("Confirmed Updates — Company Direct", 1)[1].split("Confirmed Updates — Competitor Relevant", 1)[0]
+        self.assertNotIn("Blog rumor", confirmed_block)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_old_news_outside_window_is_not_added(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = OfficialCollectionResult(
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="company_official",
+                    source_name="hanall_official",
+                    source_group="company_official",
+                    status="checked",
+                    checked_at_kst="2026-03-29 09:00 KST",
+                    note="items=0",
+                    endpoint="https://www.hanall.com",
+                )
+            ]
+        )
+        mocked_run_prompt.side_effect = [
+            self._stage2_verification_json(
+                discovered_confirmed_findings=[
+                    {
+                        "category": "company_direct",
+                        "entity": "HanAll Biopharma",
+                        "title": "Old newsroom item",
+                        "source_type": "official",
+                        "source_name": "hanall_official",
+                        "source_url": "https://www.hanall.com/news/old",
+                        "published_at_kst": "2026-03-27 07:00 KST",
+                        "structured_fields": {},
+                        "why_discovered": "old news resurfaced in search",
+                    }
+                ]
+            )
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        self.assertNotIn("Old newsroom item", result.final_text)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage1_value_wins_when_stage2_conflicts(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 CIDP registry update",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT22222222",
+                    trial_id="NCT22222222",
+                    asset="IMVT-1401",
+                    indication="CIDP",
+                    phase="Phase 3",
+                    confidence=0.95,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            self._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {"phase": "Phase 2"},
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "conflicting registry mirror",
+                        "source_type": "registry",
+                        "source_name": "clinicaltrials",
+                        "source_url": "https://clinicaltrials.gov/study/NCT22222222",
+                        "updated_at_kst": "2026-03-29 08:00 KST",
+                        "title": "Study detail",
+                        "confidence": 0.8,
+                        "excerpt": "Phase 2",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["phase"],
+                    }
+                ],
+            ),
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        self.assertIn("Phase: Phase 3", result.final_text)
+        self.assertNotIn("Phase: Phase 2", result.final_text)
+        self.assertIn("stage2_field_conflict", json.dumps(result.stage1_output.coverage_gaps, default=lambda o: o.model_dump(mode='json')))
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_invalid_json_keeps_deterministic_fallback(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        mocked_collect.return_value = self._official_collection()
+        mocked_run_prompt.side_effect = [
+            self._stage1_overlay_json(),
+            "{invalid json",
+        ]
+
+        result = run_hanall_news_pipeline(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
+
+        self.assertTrue(result.used_stage2_fallback)
+        self.assertIn("Confirmed Updates — Company Direct", result.final_text)
+
+
+class HanallStage2PersistenceAndProvenanceTest(unittest.TestCase):
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_success_persists_evidence_run_and_provenance(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    source_tier="official_api",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 MG registry update",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT11111111",
+                    trial_id="NCT11111111",
+                    asset="IMVT-1401",
+                    indication="MG",
+                    sponsor="Immunovant",
+                    confidence=0.95,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            HanallNewsPipelineTest._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {
+                            "phase": "Phase 3",
+                            "enrollment": "240",
+                        },
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "NCT11111111 clinical registry detail",
+                        "source_type": "registry",
+                        "source_name": "clinicaltrials",
+                        "source_url": "https://clinicaltrials.gov/study/NCT11111111",
+                        "title": "Study Record Detail",
+                        "updated_at_kst": "2026-03-29 08:00 KST",
+                        "confidence": 0.95,
+                        "excerpt": "Phase 3, Enrollment 240",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["phase", "enrollment"],
+                        "entity": "Immunovant",
+                        "asset": "IMVT-1401",
+                        "indication": "MG",
+                        "region": "US",
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-persistence.db"))
+            result = run_hanall_news_pipeline(current_now=current_now, room_key="stock_openchat_news")
+
+            self.assertIsNotNone(result.stage2_trace_id)
+            evidence_rows = list_stage2_search_evidence(result.stage2_trace_id)
+            run_rows = list_stage2_verification_runs(result.stage2_trace_id)
+            provenance_rows = list_stage2_finding_provenance(result.stage2_trace_id)
+
+        self.assertEqual(len(evidence_rows), 1)
+        self.assertEqual(evidence_rows[0]["evidence_id"], "ev1")
+        self.assertEqual(evidence_rows[0]["asset"], "IMVT-1401")
+        self.assertEqual(run_rows[0]["room_key"], "stock_openchat_news")
+        self.assertEqual(run_rows[0]["stage2_status"], "success")
+        self.assertEqual(run_rows[0]["evidence_count"], 1)
+        self.assertEqual(run_rows[0]["backfill_count"], 1)
+        self.assertTrue(any(row["field_name"] == "phase" and row["action_type"] == "filled_blank" for row in provenance_rows))
+        self.assertIn("보강근거:", result.final_text)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_metadata_only_stage1_value_can_be_replaced_by_stronger_official_detail(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="company_official",
+                    source_name="immunovant_ir",
+                    source_group="company_official",
+                    source_tier="page_check_promoted",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="Program page updated",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://www.immunovant.com/programs",
+                    asset="IMVT-1401",
+                    indication="MG",
+                    confidence=0.9,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            HanallNewsPipelineTest._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {"indication": "gMG"},
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "Immunovant IMVT-1401 gMG program detail",
+                        "source_type": "official",
+                        "source_name": "immunovant_ir",
+                        "source_url": "https://www.immunovant.com/programs",
+                        "title": "Program Page",
+                        "updated_at_kst": "2026-03-29 08:10 KST",
+                        "confidence": 0.9,
+                        "excerpt": "gMG program",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["indication"],
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-replace.db"))
+            result = run_hanall_news_pipeline(current_now=current_now)
+            provenance_rows = list_stage2_finding_provenance(result.stage2_trace_id)
+
+        self.assertIn("Indication: gMG", result.final_text)
+        self.assertTrue(any(row["action_type"] == "replaced_metadata_only" and row["field_name"] == "indication" for row in provenance_rows))
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_official_structured_stage1_value_is_retained_and_conflict_logged(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    source_tier="official_api",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 CIDP registry update",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT22222222",
+                    trial_id="NCT22222222",
+                    asset="IMVT-1401",
+                    indication="CIDP",
+                    phase="Phase 3",
+                    confidence=0.95,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            HanallNewsPipelineTest._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {"phase": "Phase 2"},
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "conflicting registry mirror",
+                        "source_type": "registry",
+                        "source_name": "clinicaltrials",
+                        "source_url": "https://clinicaltrials.gov/study/NCT22222222",
+                        "updated_at_kst": "2026-03-29 08:00 KST",
+                        "title": "Study detail",
+                        "confidence": 0.8,
+                        "excerpt": "Phase 2",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["phase"],
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-retain.db"))
+            result = run_hanall_news_pipeline(current_now=current_now)
+            provenance_rows = list_stage2_finding_provenance(result.stage2_trace_id)
+
+        self.assertIn("Phase: Phase 3", result.final_text)
+        self.assertNotIn("Phase: Phase 2", result.final_text)
+        self.assertTrue(any(row["action_type"] == "retained_stage1" and row["field_name"] == "phase" for row in provenance_rows))
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_metadata_only_conflict_keeps_stage1_and_records_conflict_kept_stage1(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="company_official",
+                    source_name="immunovant_ir",
+                    source_group="company_official",
+                    source_tier="page_check_promoted",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="Program page updated",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://www.immunovant.com/programs",
+                    asset="IMVT-1401",
+                    indication="MG",
+                    confidence=0.9,
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            HanallNewsPipelineTest._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {"indication": "TED"},
+                        "evidence_ids": ["ev1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev1",
+                        "topic": "different source identity",
+                        "source_type": "official",
+                        "source_name": "hanall_official",
+                        "source_url": "https://www.hanall.com/other-program",
+                        "updated_at_kst": "2026-03-29 08:05 KST",
+                        "title": "Other program page",
+                        "confidence": 0.9,
+                        "excerpt": "TED",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["indication"],
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-conflict.db"))
+            result = run_hanall_news_pipeline(current_now=current_now)
+            provenance_rows = list_stage2_finding_provenance(result.stage2_trace_id)
+
+        self.assertIn("Indication: MG", result.final_text)
+        self.assertNotIn("Indication: TED", result.final_text)
+        self.assertTrue(any(row["action_type"] == "conflict_kept_stage1" and row["field_name"] == "indication" for row in provenance_rows))
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_discovery_only_hit_becomes_richer_unverified_lead(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = OfficialCollectionResult(
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="company_official",
+                    source_name="immunovant_ir",
+                    source_group="company_official",
+                    status="checked",
+                    checked_at_kst="2026-03-29 09:00 KST",
+                    note="items=0",
+                    endpoint="https://www.immunovant.com",
+                )
+            ]
+        )
+        mocked_run_prompt.side_effect = [
+            HanallNewsPipelineTest._stage2_verification_json(
+                discovered_confirmed_findings=[
+                    {
+                        "category": "company_direct",
+                        "entity": "Immunovant",
+                        "title": "LinkedIn hiring signal",
+                        "source_type": "discovery_only",
+                        "source_name": "linkedin",
+                        "source_url": "https://linkedin.example/jobs",
+                        "discovered_at_kst": "2026-03-29 08:20 KST",
+                        "why_discovered": "hiring pattern may imply program activity",
+                        "reason_unverified": "discovery_only source cannot promote confirmed finding",
+                        "missing_verification_target": "official careers page or press release",
+                        "suggested_official_followup_queries": ["Immunovant careers FcRn", "Immunovant official press release FcRn"],
+                        "likely_category": "careers_signal",
+                        "related_asset": "IMVT-1401",
+                        "related_indication": "MG",
+                    }
+                ]
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-unverified.db"))
+            result = run_hanall_news_pipeline(current_now=current_now)
+            run_rows = list_stage2_verification_runs(result.stage2_trace_id)
+
+        self.assertIn("LinkedIn hiring signal", result.final_text)
+        self.assertIn("Unverified reason:", result.final_text)
+        self.assertIn("Follow-up queries:", result.final_text)
+        self.assertEqual(run_rows[0]["discovered_unverified_count"], 1)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_invalid_json_records_failed_run_and_keeps_deterministic_fallback(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        mocked_collect.return_value = HanallNewsPipelineTest._official_collection()
+        mocked_run_prompt.side_effect = [
+            HanallNewsPipelineTest._stage1_overlay_json(),
+            "{invalid json",
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-invalid.db"))
+            result = run_hanall_news_pipeline(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
+            run_rows = list_stage2_verification_runs(result.stage2_trace_id)
+            evidence_rows = list_stage2_search_evidence(result.stage2_trace_id)
+
+        self.assertTrue(result.used_stage2_fallback)
+        self.assertEqual(run_rows[0]["stage2_status"], "invalid_json")
+        self.assertEqual(len(evidence_rows), 0)
+        self.assertIn("Confirmed Updates — Company Direct", result.final_text)
+
+    @patch("server.application.hanall_news_pipeline.get_hanall_known_events")
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results")
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_no_news_day_stage2_coverage_improvement_persists_run_counts(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+        mocked_known_events,
+    ) -> None:
+        current_now = datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = OfficialCollectionResult(
+            findings=[],
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="sec",
+                    source_name="sec_api",
+                    status="checked",
+                    checked_at_kst="2026-03-27 09:00 KST",
+                    note="items=0",
+                    endpoint="https://api.sec-api.io",
+                )
+            ],
+        )
+        mocked_rss.return_value = RSSCollectionResult()
+        mocked_known_events.return_value = []
+        mocked_run_prompt.side_effect = [
+            HanallNewsPipelineTest._stage2_verification_json(
+                updated_source_logs=[
+                    {
+                        "source_family": "company_official",
+                        "source_name": "immunovant_ir",
+                        "source_group": "company_official",
+                        "status": "checked",
+                        "checked_at_kst": "2026-03-27 09:00 KST",
+                        "note": "items=0",
+                        "endpoint": "https://www.immunovant.com",
+                    }
+                ],
+                updated_coverage_gaps=[
+                    {
+                        "source_family": "trial_registry",
+                        "source_name": "ctis",
+                        "source_group": "trial_registry",
+                        "gap_type": "search_verified_no_new_item",
+                        "detail": "no new item found",
+                    }
+                ],
+                updated_omission_audit=[
+                    {
+                        "topic": "source-group:company_official",
+                        "axis": "source_group",
+                        "source_group": "company_official",
+                        "status": "completed",
+                        "detail": "stage2 search verification checked company official page",
+                    }
+                ],
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage2-no-news.db"))
+            result = run_hanall_news_pipeline(current_now=current_now)
+            run_rows = list_stage2_verification_runs(result.stage2_trace_id)
+
+        self.assertFalse(result.used_stage2_fallback)
+        self.assertEqual(run_rows[0]["coverage_upgrade_count"], 3)
+        self.assertIn("stage2 search verification으로 재확인 완료", result.final_text)
+
+
+class HanallStage3ReportingAndRankingTest(unittest.TestCase):
+    def _persist_snapshot_run(
+        self,
+        *,
+        trace_id: str,
+        room_key: str,
+        current_now: datetime,
+        stage_output: HanallStage1StructuredOutput,
+        stage2_status: str = "success",
+        evidence_count: int = 0,
+        backfill_count: int = 0,
+        discovered_confirmed_count: int = 0,
+        discovered_unverified_count: int = 0,
+        coverage_upgrade_count: int = 0,
+        reused_evidence_count: int = 0,
+        stage2_output: dict[str, object] | None = None,
+    ) -> None:
+        record_stage2_verification_run_start(
+            trace_id=trace_id,
+            room_key=room_key,
+            run_started_at_kst=current_now.strftime("%Y-%m-%d %H:%M KST"),
+            used_search_verify=True,
+            gap_target_count=len(stage_output.search_gap_targets),
+        )
+        finalize_stage2_verification_run(
+            trace_id=trace_id,
+            run_finished_at_kst=current_now.strftime("%Y-%m-%d %H:%M KST"),
+            stage2_status=stage2_status,
+            evidence_count=evidence_count,
+            backfill_count=backfill_count,
+            discovered_confirmed_count=discovered_confirmed_count,
+            discovered_unverified_count=discovered_unverified_count,
+            coverage_upgrade_count=coverage_upgrade_count,
+            reused_evidence_count=reused_evidence_count,
+        )
+        final_text = render_stage1_fallback_text(
+            stage1_output=stage_output,
+            official_collection=OfficialCollectionResult(),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+        persist_hanall_run_snapshot(
+            trace_id=trace_id,
+            room_key=room_key,
+            created_at_kst=current_now.strftime("%Y-%m-%d %H:%M KST"),
+            stage1_candidate_summary={"candidate_count": len(stage_output.company_direct_confirmed) + len(stage_output.competitor_relevant_confirmed)},
+            stage1_output=stage_output.model_dump(mode="json"),
+            merged_stage1_output=stage_output.model_dump(mode="json"),
+            stage2_output=stage2_output,
+            search_memory={"memory": {}, "plan": {"reused_evidence_count": reused_evidence_count}},
+            ranked_issues=build_ranked_issue_list(stage1_output=stage_output, current_now=current_now, limit=10),
+            summary_lines=["- snapshot summary"],
+            final_text=final_text,
+            debug_meta={"render_mode": "deterministic_fallback"},
+        )
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_debug_bundle_reconstructs_run_artifacts(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    source_tier="official_api",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 MG registry update",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT99999999",
+                    trial_id="NCT99999999",
+                    asset="IMVT-1401",
+                    indication="MG",
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            HanallNewsPipelineTest._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {"phase": "Phase 3"},
+                        "evidence_ids": ["ev-debug-1"],
+                    }
+                ],
+                discovered_confirmed_findings=[
+                    {
+                        "category": "competitor_relevant",
+                        "entity": "argenx",
+                        "title": "argenx official regulatory update",
+                        "source_type": "official",
+                        "source_name": "argenx_official",
+                        "source_url": "https://argenx.com/news/update",
+                        "published_at_kst": "2026-03-30 08:10 KST",
+                        "discovered_at_kst": "2026-03-30 08:15 KST",
+                        "structured_fields": {"event_action": "presentation", "asset": "efgartigimod", "indication": "MG"},
+                        "why_discovered": "official IR page surfaced an additional relevant update",
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev-debug-1",
+                        "topic": "NCT99999999 registry detail",
+                        "source_type": "registry",
+                        "source_name": "clinicaltrials",
+                        "source_url": "https://clinicaltrials.gov/study/NCT99999999",
+                        "title": "Study detail",
+                        "updated_at_kst": "2026-03-30 08:00 KST",
+                        "confidence": 0.95,
+                        "excerpt": "Phase 3",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["phase"],
+                        "entity": "Immunovant",
+                        "asset": "IMVT-1401",
+                        "indication": "MG",
+                        "region": "US",
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage3-debug.db"))
+            result = run_hanall_news_pipeline(current_now=current_now, room_key="hanall_room")
+            bundle = get_hanall_run_debug_bundle(result.stage2_trace_id)
+
+        self.assertEqual(bundle["run_status"], "success")
+        self.assertEqual(bundle["run_metadata"]["room_key"], "hanall_room")
+        self.assertGreaterEqual(bundle["stage1_candidate_summary"]["candidate_count"], 1)
+        self.assertEqual(len(bundle["stage2_evidence_catalog"]), 1)
+        self.assertEqual(len(bundle["backfills"]), 1)
+        self.assertEqual(len(bundle["discovered_confirmed_findings"]), 1)
+        self.assertTrue(bundle["final_ranking_inputs"])
+        self.assertTrue(bundle["final_summary_lines"])
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_recent_runs_metrics_and_recent_summary_use_db_data(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = HanallNewsPipelineTest._official_collection()
+        mocked_run_prompt.side_effect = [
+            HanallNewsPipelineTest._stage1_overlay_json(),
+            HanallNewsPipelineTest._stage2_verification_json(
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev-metrics-1",
+                        "topic": "official follow-up",
+                        "source_type": "official",
+                        "source_name": "immunovant_ir",
+                        "source_url": "https://www.immunovant.com",
+                        "title": "IR detail",
+                        "updated_at_kst": "2026-03-30 08:00 KST",
+                        "confidence": 0.8,
+                        "excerpt": "detail",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["accepted_at"],
+                    }
+                ],
+            ),
+            HanallNewsPipelineTest._stage1_overlay_json(),
+            "{invalid json",
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage3-metrics.db"))
+            first = run_hanall_news_pipeline(current_now=current_now, room_key="hanall_room")
+            second = run_hanall_news_pipeline(current_now=current_now + timedelta(hours=1), room_key="hanall_room")
+            recent_runs = get_latest_hanall_runs(limit=5, room_key="hanall_room")
+            recent_summary = get_hanall_recent_run_summary(limit=5, room_key="hanall_room")
+            metrics = get_hanall_ops_metrics(limit=5, room_key="hanall_room")
+
+        self.assertTrue(first.stage2_trace_id)
+        self.assertTrue(second.stage2_trace_id)
+        self.assertEqual(len(recent_runs), 2)
+        self.assertEqual(len(recent_summary), 2)
+        self.assertIn("success", metrics["status_counts"])
+        self.assertIn("invalid_json", metrics["status_counts"])
+        self.assertGreater(metrics["average_evidence_count"], 0)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_search_memory_reuses_matching_recent_evidence(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    source_tier="official_api",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="IMVT-1401 MG registry update",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT12345678",
+                    trial_id="NCT12345678",
+                    asset="IMVT-1401",
+                    indication="MG",
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(official_collection=official_collection, current_now=current_now)
+        candidate_id = base.candidate_order[0]
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps({"company_direct_confirmed_ids": [candidate_id]}),
+            HanallNewsPipelineTest._stage2_verification_json(
+                backfills=[
+                    {
+                        "candidate_id": candidate_id,
+                        "filled_fields": {"phase": "Phase 3"},
+                        "evidence_ids": ["ev-memory-1"],
+                    }
+                ],
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev-memory-1",
+                        "topic": "NCT12345678 registry detail",
+                        "source_type": "registry",
+                        "source_name": "clinicaltrials",
+                        "source_url": "https://clinicaltrials.gov/study/NCT12345678",
+                        "title": "Study Record Detail",
+                        "updated_at_kst": "2026-03-30 08:30 KST",
+                        "confidence": 0.95,
+                        "excerpt": "Phase 3",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["phase"],
+                        "entity": "Immunovant",
+                        "asset": "IMVT-1401",
+                        "indication": "MG",
+                        "region": "US",
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stage3-memory.db"
+            init_db(str(db_path))
+            run_hanall_news_pipeline(current_now=current_now, room_key="hanall_room")
+            stage1_output = HanallStage1StructuredOutput(
+                search_gap_targets=[
+                    SearchGapTarget(
+                        priority="P0",
+                        candidate_id="cand-memory",
+                        finding_identity="clinicaltrials|NCT12345678",
+                        gap_type="missing_structured_field",
+                        field_targets=["phase"],
+                        preferred_source_types=["registry"],
+                        entity="Immunovant",
+                        asset="IMVT-1401",
+                        indication="MG",
+                        region="US",
+                    )
+                ]
+            )
+            memory = build_stage2_search_memory(stage1_output=stage1_output, current_now=current_now + timedelta(hours=1), room_key="hanall_room")
+            plan = build_search_plan_from_memory(stage1_output=stage1_output, search_memory=memory, current_now=current_now + timedelta(hours=1))
+
+        self.assertEqual(plan["reused_evidence_count"], 1)
+        self.assertTrue(plan["targets"][0]["preverified"])
+        self.assertEqual(plan["targets"][0]["reused_evidence"][0]["evidence_id"], "ev-memory-1")
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stale_evidence_is_not_reused(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_collect.return_value = HanallNewsPipelineTest._official_collection()
+        mocked_run_prompt.side_effect = [
+            HanallNewsPipelineTest._stage1_overlay_json(),
+            HanallNewsPipelineTest._stage2_verification_json(
+                evidence_catalog=[
+                    {
+                        "evidence_id": "ev-stale-1",
+                        "topic": "old official evidence",
+                        "source_type": "official",
+                        "source_name": "immunovant_ir",
+                        "source_url": "https://www.immunovant.com/programs",
+                        "title": "Program Detail",
+                        "updated_at_kst": "2026-03-30 08:10 KST",
+                        "confidence": 0.8,
+                        "excerpt": "gMG",
+                        "evidence_kind": "field_confirmation",
+                        "confirms_fields": ["indication"],
+                        "entity": "Immunovant",
+                        "asset": "IMVT-1401",
+                        "indication": "gMG",
+                    }
+                ],
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "stage3-stale-memory.db"
+            init_db(str(db_path))
+            run_hanall_news_pipeline(current_now=current_now, room_key="hanall_room")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE stage2_search_evidence
+                    SET inserted_at_kst = ?, updated_at_kst = ?
+                    WHERE evidence_id = ?
+                    """,
+                    ("2026-03-20 09:00 KST", "2026-03-20 09:00 KST", "ev-stale-1"),
+                )
+            stage1_output = HanallStage1StructuredOutput(
+                search_gap_targets=[
+                    SearchGapTarget(
+                        priority="P0",
+                        gap_type="missing_structured_field",
+                        field_targets=["indication"],
+                        preferred_source_types=["official"],
+                        entity="Immunovant",
+                        asset="IMVT-1401",
+                    )
+                ]
+            )
+            memory = build_stage2_search_memory(stage1_output=stage1_output, current_now=current_now + timedelta(hours=1), room_key="hanall_room")
+            plan = build_search_plan_from_memory(stage1_output=stage1_output, search_memory=memory, current_now=current_now + timedelta(hours=1))
+
+        self.assertEqual(plan["reused_evidence_count"], 0)
+        self.assertFalse(plan["targets"][0]["preverified"])
+
+    def test_drift_report_detects_added_removed_changed_and_competitor_snapshot_change(self) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        first_output = HanallStage1StructuredOutput(
+            coverage=CoverageSummary(level="Medium", rationale="baseline"),
+            company_direct_confirmed=[
+                StageFinding(
+                    candidate_id="cand-1",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="Registry update",
+                    source_group="trial_registry",
+                    source_name="clinicaltrials",
+                    primary_source_url="https://clinicaltrials.gov/study/NCT0001",
+                    trial_id="NCT0001",
+                    phase="Phase 2",
+                )
+            ],
+            competitor_map_snapshot=[
+                {"competitor": "argenx", "asset": "efgartigimod", "indication": "MG", "stage_status": "approved"}
+            ],
+        )
+        second_output = HanallStage1StructuredOutput(
+            coverage=CoverageSummary(level="High", rationale="improved"),
+            company_direct_confirmed=[
+                StageFinding(
+                    candidate_id="cand-1",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="Registry update",
+                    source_group="trial_registry",
+                    source_name="clinicaltrials",
+                    primary_source_url="https://clinicaltrials.gov/study/NCT0001",
+                    trial_id="NCT0001",
+                    phase="Phase 3",
+                )
+            ],
+            competitor_relevant_confirmed=[
+                StageFinding(
+                    candidate_id="cand-2",
+                    entity="argenx",
+                    category="competitor_relevant",
+                    title="Approval update",
+                    source_group="regulator_disclosure",
+                    source_name="ema",
+                    primary_source_url="https://ema.europa.eu/doc/1",
+                    document_id="EMA-1",
+                    event_action="approved",
+                )
+            ],
+            competitor_map_snapshot=[
+                {"competitor": "argenx", "asset": "efgartigimod", "indication": "MG", "stage_status": "approved"},
+                {"competitor": "UCB", "asset": "rozanolixizumab", "indication": "MG", "stage_status": "approved"},
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage3-drift.db"))
+            self._persist_snapshot_run(
+                trace_id="trace-prev",
+                room_key="hanall_room",
+                current_now=current_now - timedelta(hours=1),
+                stage_output=first_output,
+            )
+            self._persist_snapshot_run(
+                trace_id="trace-current",
+                room_key="hanall_room",
+                current_now=current_now,
+                stage_output=second_output,
+            )
+            drift = build_hanall_run_drift_report("trace-current", "trace-prev")
+
+        self.assertEqual(len(drift["added_confirmed_findings"]), 1)
+        self.assertTrue(any("phase" in item["changed_fields"] for item in drift["changed_findings"]))
+        self.assertEqual(drift["coverage_level_change"]["before"], "Medium")
+        self.assertEqual(drift["coverage_level_change"]["after"], "High")
+        self.assertEqual(drift["competitor_snapshot_change"]["after"], 2)
+
+    def test_provenance_aware_ranking_orders_regulatory_update_above_career_noise(self) -> None:
+        stage1_output = HanallStage1StructuredOutput(
+            company_direct_confirmed=[
+                StageFinding(
+                    candidate_id="cand-reg",
+                    entity="Immunovant",
+                    category="company_direct",
+                    title="EMA accepted filing",
+                    source_group="regulator_disclosure",
+                    source_name="ema",
+                    primary_source_url="https://ema.europa.eu/doc/1",
+                    filing_type="acceptance",
+                    accepted_at="2026-03-30 08:00 KST",
+                    event_action="accepted",
+                    regulatory_phrase="validated marketing authorization application",
+                )
+            ],
+            competitor_relevant_confirmed=[
+                StageFinding(
+                    candidate_id="cand-career",
+                    entity="argenx",
+                    category="competitor_relevant",
+                    title="argenx careers page updated",
+                    source_group="competitor_official",
+                    source_name="argenx_official",
+                    primary_source_url="https://argenx.com/careers",
+                    event_action="career_posting",
+                    summary="career hiring update",
+                )
+            ],
+        )
+
+        ranked = build_ranked_issue_list(stage1_output=stage1_output, current_now=datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo), limit=5)
+
+        self.assertEqual(ranked[0]["candidate_id"], "cand-reg")
+        self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+
+    def test_noisy_day_top_issue_ordering_is_deterministic(self) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        stage1_output = HanallStage1StructuredOutput(
+            company_direct_confirmed=[
+                StageFinding(candidate_id="a", entity="Immunovant", category="company_direct", title="Phase 3 registry update", source_group="trial_registry", source_name="clinicaltrials", phase="Phase 3", enrollment="240"),
+                StageFinding(candidate_id="b", entity="Immunovant", category="company_direct", title="Investor presentation posted", source_group="company_official", source_name="immunovant_ir", event_action="presentation"),
+            ],
+            competitor_relevant_confirmed=[
+                StageFinding(candidate_id="c", entity="argenx", category="competitor_relevant", title="Approval update", source_group="regulator_disclosure", source_name="ema", event_action="approved"),
+                StageFinding(candidate_id="d", entity="UCB", category="competitor_relevant", title="Careers posting", source_group="competitor_official", source_name="ucb_official", event_action="career_posting"),
+            ],
+        )
+
+        first = [entry["candidate_id"] for entry in build_ranked_issue_list(stage1_output=stage1_output, current_now=current_now, limit=10)]
+        second = [entry["candidate_id"] for entry in build_ranked_issue_list(stage1_output=stage1_output, current_now=current_now, limit=10)]
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], "a")
+        self.assertEqual(first[-1], "d")
+
+    def test_no_news_day_metrics_and_source_health_report_generate(self) -> None:
+        current_now = datetime(2026, 3, 30, 9, 0, tzinfo=now_kst().tzinfo)
+        no_news_output = HanallStage1StructuredOutput(
+            coverage=CoverageSummary(level="Low", rationale="no updates"),
+            checked_source_log=[
+                CheckedSourceLogEntry(
+                    source_family="company_official",
+                    source_name="immunovant_ir",
+                    source_group="company_official",
+                    status="checked",
+                    checked_at_kst="2026-03-30 09:00 KST",
+                    note="items=0",
+                )
+            ],
+            coverage_gaps=[
+                CoverageGap(
+                    source_family="trial_registry",
+                    source_name="ctis",
+                    source_group="trial_registry",
+                    gap_type="search_verified_no_new_item",
+                    detail="no new item found",
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "stage3-no-news-report.db"))
+            self._persist_snapshot_run(
+                trace_id="trace-no-news",
+                room_key="hanall_room",
+                current_now=current_now,
+                stage_output=no_news_output,
+                stage2_status="no_result",
+            )
+            metrics = get_hanall_ops_metrics(limit=5, room_key="hanall_room")
+            source_health = get_hanall_source_health_report(limit=5, room_key="hanall_room")
+
+        self.assertEqual(metrics["recent_run_count"], 1)
+        self.assertTrue(source_health)
+        self.assertEqual(source_health[0]["source_name"], "ctis")
 
 
 class HanallFinalRenderAndCollectorSafetyTest(unittest.TestCase):
@@ -1145,6 +2748,9 @@ class HanallFinalRenderAndCollectorSafetyTest(unittest.TestCase):
                 "sec_api": MixedCollector,
                 "crossref": CrossrefNoiseCollector,
             },
+        ), patch(
+            "server.infra.hanall_news_collectors.get_hanall_sources_config",
+            return_value={"collectors": {}, "page_checks": {"enabled": False, "sources": []}},
         ):
             result = collect_hanall_official_findings(current_now=current_now)
 
@@ -1168,7 +2774,10 @@ class HanallFinalRenderAndCollectorSafetyTest(unittest.TestCase):
                     "GET https://example.com?api_key=secret123&serviceKey=svc123&crtfc_key=dart123&token=tok123"
                 )
 
-        with patch("server.infra.hanall_news_collectors.COLLECTOR_CLASSES", {"exploding": ExplodingCollector}):
+        with patch("server.infra.hanall_news_collectors.COLLECTOR_CLASSES", {"exploding": ExplodingCollector}), patch(
+            "server.infra.hanall_news_collectors.get_hanall_sources_config",
+            return_value={"collectors": {}, "page_checks": {"enabled": False, "sources": []}},
+        ):
             result = collect_hanall_official_findings(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
 
         note = result.checked_source_log[0].note
@@ -1236,9 +2845,9 @@ class HanallFinalRenderAndCollectorSafetyTest(unittest.TestCase):
 
         normalized = normalize_hanall_final_text(raw_text)
 
-        self.assertIn("회사 직접 업데이트", normalized)
-        self.assertIn("경쟁사 관련 업데이트", normalized)
-        self.assertIn("추가 확인 필요", normalized)
+        self.assertIn("Confirmed Updates — Company Direct", normalized)
+        self.assertIn("Confirmed Updates — Competitor Relevant", normalized)
+        self.assertIn("Unverified Leads", normalized)
         self.assertTrue(_final_text_has_required_sections(normalized))
 
     def test_fallback_renderer_emits_required_sections_in_order(self) -> None:
@@ -1293,9 +2902,284 @@ class HanallFinalRenderAndCollectorSafetyTest(unittest.TestCase):
         )
 
         self.assertTrue(_final_text_has_required_sections(text))
-        self.assertIn("회사 직접 업데이트", text)
-        self.assertIn("아직 확인이 필요한 부분", text)
-        self.assertIn("누락 점검", text)
+        self.assertIn("Confirmed Updates — Company Direct", text)
+        self.assertIn("Coverage Gaps", text)
+        self.assertIn("Omission Audit", text)
+
+    def test_no_news_day_still_renders_competitor_universe_snapshot(self) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        stage1_output = build_stage1_fallback_output(
+            official_collection=OfficialCollectionResult(),
+            current_now=current_now,
+        )
+
+        text = render_stage1_fallback_text(
+            stage1_output=stage1_output,
+            official_collection=OfficialCollectionResult(),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+
+        self.assertGreater(len(stage1_output.competitor_map_snapshot), 0)
+        self.assertIn("Competitor Map Snapshot", text)
+        self.assertIn("Immunovant", text)
+        self.assertNotIn("Competitor Map Snapshot\n- 없음", text)
+
+    def test_clinical_trial_fields_render_deterministically(self) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        finding = RawFinding(
+            source_family="clinicaltrials",
+            source_name="clinicaltrials",
+            source_group="trial_registry",
+            entity="Immunovant",
+            entity_type="company",
+            category="company_direct",
+            title="IMVT-1401 gMG study update",
+            summary="Phase 3 trial update posted",
+            published_at=current_now - timedelta(hours=2),
+            primary_source_url="https://clinicaltrials.gov/study/NCT12345678",
+            trial_id="NCT12345678",
+            asset="IMVT-1401",
+            indication="MG",
+            sponsor="Immunovant",
+            target_moa="FcRn antagonist",
+            phase="Phase 3",
+            recruitment_status="Recruiting",
+            enrollment="240",
+            primary_completion_date="2026-12-01",
+            last_update_posted="2026-03-29",
+            site_countries=["US", "JP"],
+        )
+        stage1_output = build_stage1_fallback_output(
+            official_collection=OfficialCollectionResult(findings=[finding]),
+            current_now=current_now,
+        )
+
+        text = render_stage1_fallback_text(
+            stage1_output=stage1_output,
+            official_collection=OfficialCollectionResult(findings=[finding]),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+
+        self.assertIn("Trial ID: NCT12345678", text)
+        self.assertIn("Asset: IMVT-1401", text)
+        self.assertIn("Indication: MG", text)
+        self.assertIn("Phase: Phase 3", text)
+        self.assertIn("Recruitment status: Recruiting", text)
+        self.assertIn("Enrollment: 240", text)
+        self.assertIn("Primary completion date: 2026-12-01", text)
+        self.assertIn("Site countries: US, JP", text)
+
+    def test_disclosure_fields_render_deterministically(self) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        finding = RawFinding(
+            source_family="sec",
+            source_name="sec_api",
+            source_group="regulator_disclosure",
+            entity="Immunovant",
+            entity_type="company",
+            category="company_direct",
+            title="Form 8-K accepted",
+            summary="SEC filing accepted with financing detail",
+            published_at=current_now - timedelta(hours=1),
+            primary_source_url="https://www.sec.gov/ixviewer/0001234567",
+            document_id="0001234567-26-000001",
+            filing_type="8-K",
+            asset="IMVT-1401",
+            indication="MG",
+            regulator="SEC",
+            exchange="NASDAQ",
+            filed_at="2026-03-29 08:00 KST",
+            accepted_at="2026-03-29 08:02 KST",
+            event_action="accepted",
+            key_numbers=["gross_proceeds=$75000000", "shares=1200000"],
+        )
+        stage1_output = build_stage1_fallback_output(
+            official_collection=OfficialCollectionResult(findings=[finding]),
+            current_now=current_now,
+        )
+
+        text = render_stage1_fallback_text(
+            stage1_output=stage1_output,
+            official_collection=OfficialCollectionResult(findings=[finding]),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+
+        self.assertIn("Document ID: 0001234567-26-000001", text)
+        self.assertIn("filing type: 8-K", text)
+        self.assertIn("regulator: SEC", text)
+        self.assertIn("exchange: NASDAQ", text)
+        self.assertIn("filed_at: 2026-03-29 08:00 KST", text)
+        self.assertIn("accepted_at: 2026-03-29 08:02 KST", text)
+        self.assertIn("event_action: accepted", text)
+        self.assertIn("key numbers: gross_proceeds=$75000000, shares=1200000", text)
+
+    def test_changed_fields_render_deterministically(self) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        finding = RawFinding(
+            source_family="trial_registry",
+            source_name="ctis",
+            source_group="trial_registry",
+            entity="Immunovant",
+            entity_type="company",
+            category="company_direct",
+            title="CTIS batoclimab CIDP trial update",
+            summary="Detail follow-up captured changed trial fields",
+            published_at=current_now - timedelta(hours=1),
+            updated_at=current_now - timedelta(minutes=20),
+            primary_source_url="https://euclinicaltrials.eu/trial/CTIS-2026-000123-45",
+            trial_id="CTIS-2026-000123-45",
+            sponsor="Immunovant Sciences GmbH",
+            asset="batoclimab",
+            indication="CIDP",
+            phase="Phase 2",
+            recruitment_status="Active, not recruiting",
+            enrollment="180",
+            primary_completion_date="2027-03-01",
+            last_update_posted="2026-03-29",
+            changed_fields=["recruitment_status", "enrollment", "primary_completion_date"],
+        )
+
+        text = render_stage1_fallback_text(
+            stage1_output=build_stage1_fallback_output(
+                official_collection=OfficialCollectionResult(findings=[finding]),
+                current_now=current_now,
+            ),
+            official_collection=OfficialCollectionResult(findings=[finding]),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+
+        self.assertIn("Changed fields: recruitment_status, enrollment, primary_completion_date", text)
+
+    def test_omission_audit_is_segmented_by_source_group_indication_and_region(self) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        finding = RawFinding(
+            source_family="clinicaltrials",
+            source_name="clinicaltrials",
+            source_group="trial_registry",
+            entity="Immunovant",
+            entity_type="company",
+            category="company_direct",
+            title="IMVT-1401 gMG US study update",
+            summary="US trial registry update",
+            published_at=current_now - timedelta(hours=2),
+            primary_source_url="https://clinicaltrials.gov/study/NCT12345678",
+            trial_id="NCT12345678",
+            asset="IMVT-1401",
+            indication="MG",
+            region="US",
+        )
+        stage1_output = build_stage1_fallback_output(
+            official_collection=OfficialCollectionResult(findings=[finding]),
+            current_now=current_now,
+        )
+
+        axes = {entry.axis for entry in stage1_output.omission_audit}
+        self.assertIn("source_group", axes)
+        self.assertIn("indication", axes)
+        self.assertIn("region", axes)
+        self.assertTrue(any(entry.source_group == "trial_registry" for entry in stage1_output.omission_audit))
+        self.assertTrue(any(entry.indication == "MG" for entry in stage1_output.omission_audit))
+        self.assertTrue(any(entry.region == "US" for entry in stage1_output.omission_audit))
+
+    @patch("server.application.hanall_news_pipeline.get_hanall_known_events")
+    def test_stale_known_event_is_not_rendered_as_today_event(self, mocked_known_events) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        mocked_known_events.return_value = [
+            {
+                "entity": "HanAll Biopharma",
+                "category": "investor_event",
+                "fact": "오늘 예정 이벤트로 남아 있으면 안 되는 오래된 일정",
+                "basis": "fixture basis",
+                "primary_source": "https://example.com/ir-calendar",
+                "status_note": "예정일 경과, 후속 공시 확인 필요",
+                "scheduled_for_kst": "2026-03-28 09:00 KST",
+                "aging_status": "past_due_without_followup",
+            }
+        ]
+
+        stage1_output = build_stage1_fallback_output(
+            official_collection=OfficialCollectionResult(),
+            current_now=current_now,
+        )
+        text = render_stage1_fallback_text(
+            stage1_output=stage1_output,
+            official_collection=OfficialCollectionResult(),
+            rss_collection=RSSCollectionResult(),
+            current_now=current_now,
+        )
+
+        self.assertEqual(stage1_output.today_scheduled_events, [])
+        self.assertIn("오늘 예정 이벤트\n- 예정 또는 후속 확인 필요 일정 없음", text)
+        self.assertIn("기등록 일정 stale 점검", text)
+        self.assertNotIn("오늘 예정 이벤트로 남아 있으면 안 되는 오래된 일정", text)
+
+    @patch("server.application.hanall_news_pipeline.fetch_hanall_rss_results", return_value=RSSCollectionResult())
+    @patch("server.application.hanall_news_pipeline.collect_hanall_official_findings")
+    @patch("server.application.hanall_news_pipeline.run_prompt_by_key_raw")
+    def test_stage2_fallback_preserves_deterministic_clinical_fields(
+        self,
+        mocked_run_prompt,
+        mocked_collect,
+        mocked_rss,
+    ) -> None:
+        current_now = datetime(2026, 3, 29, 9, 0, tzinfo=now_kst().tzinfo)
+        official_collection = OfficialCollectionResult(
+            findings=[
+                RawFinding(
+                    source_family="clinicaltrials",
+                    source_name="clinicaltrials",
+                    source_group="trial_registry",
+                    entity="Immunovant",
+                    entity_type="company",
+                    category="company_direct",
+                    title="IMVT-1401 CIDP study update",
+                    summary="Stage2 fallback should keep deterministic clinical fields",
+                    published_at=current_now - timedelta(hours=2),
+                    primary_source_url="https://clinicaltrials.gov/study/NCT87654321",
+                    trial_id="NCT87654321",
+                    asset="IMVT-1401",
+                    indication="CIDP",
+                    sponsor="Immunovant",
+                    target_moa="FcRn antagonist",
+                    phase="Phase 2b",
+                    recruitment_status="Recruiting",
+                    enrollment="180",
+                    primary_completion_date="2026-11-15",
+                    last_update_posted="2026-03-29",
+                    site_countries=["US", "EU"],
+                )
+            ]
+        )
+        base = build_stage1_deterministic_base(
+            official_collection=official_collection,
+            current_now=current_now,
+        )
+        mocked_collect.return_value = official_collection
+        mocked_run_prompt.side_effect = [
+            json.dumps(
+                {
+                    "company_direct_confirmed_ids": [base.candidate_order[0]],
+                    "coverage": {
+                        "level": "Medium",
+                        "rationale": "fixture rationale",
+                    },
+                }
+            ),
+            ValueError("stage2 failed"),
+        ]
+
+        result = run_hanall_news_pipeline(current_now=current_now)
+
+        self.assertTrue(result.used_stage2_fallback)
+        self.assertIn("Trial ID: NCT87654321", result.final_text)
+        self.assertIn("Phase: Phase 2b", result.final_text)
+        self.assertIn("Recruitment status: Recruiting", result.final_text)
+        self.assertIn("Enrollment: 180", result.final_text)
+        self.assertIn("Primary completion date: 2026-11-15", result.final_text)
 
     def test_collector_failure_is_captured_as_gap_in_orchestration(self) -> None:
         class ExplodingCollector:
@@ -1309,7 +3193,10 @@ class HanallFinalRenderAndCollectorSafetyTest(unittest.TestCase):
             def collect(self, session, *, current_now=None):
                 raise RuntimeError("boom")
 
-        with patch("server.infra.hanall_news_collectors.COLLECTOR_CLASSES", {"exploding": ExplodingCollector}):
+        with patch("server.infra.hanall_news_collectors.COLLECTOR_CLASSES", {"exploding": ExplodingCollector}), patch(
+            "server.infra.hanall_news_collectors.get_hanall_sources_config",
+            return_value={"collectors": {}, "page_checks": {"enabled": False, "sources": []}},
+        ):
             result = collect_hanall_official_findings(current_now=datetime(2026, 3, 27, 9, 0, tzinfo=now_kst().tzinfo))
 
         self.assertEqual(len(result.findings), 0)
@@ -1364,15 +3251,20 @@ class PromptExecutionRoutingTest(unittest.TestCase):
                 "feature_key": "hanall_news_brief",
                 "preserve_newlines": True,
             },
-            "hanall_news_finalize_prompt": {
-                "title": "finalize",
+            "hanall_news_search_verify_prompt": {
+                "title": "search verify",
                 "feature_key": "hanall_news_brief",
                 "preserve_newlines": True,
                 "tools": [{"google_search": {}}],
             },
+            "hanall_news_finalize_prompt": {
+                "title": "finalize",
+                "feature_key": "hanall_news_brief",
+                "preserve_newlines": True,
+            },
         }[prompt_key],
     )
-    def test_run_prompt_routes_finalize_prompt_to_gemini_with_google_search(
+    def test_run_prompt_routes_search_verify_prompt_to_gemini_with_google_search(
         self,
         mocked_prompt,
         mocked_settings,
@@ -1382,7 +3274,7 @@ class PromptExecutionRoutingTest(unittest.TestCase):
         mocked_gemini,
         mocked_openai,
     ) -> None:
-        result = run_prompt_by_key_raw("hanall_news_finalize_prompt", replacements={"__NOW_KST__": "x"})
+        result = run_prompt_by_key_raw("hanall_news_search_verify_prompt", replacements={"__NOW_KST__": "x"})
 
         self.assertEqual(result, "gemini result")
         mocked_gemini.assert_called_once()
@@ -1831,6 +3723,179 @@ class SchedulerEventStoreTest(unittest.TestCase):
         self.assertIn("room_key=family_room_home", joined)
         self.assertIn("room_key=stock_openchat_news", joined)
         self.assertIn("display_name_fallback_only", joined)
+
+
+class HanallSqliteMigrationGuardTest(unittest.TestCase):
+    def test_old_schema_read_write_paths_are_migrated_on_demand(self) -> None:
+        from server.infra import sqlite_store
+
+        original_db_path = sqlite_store._DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "old-schema.db"
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        """
+                        CREATE TABLE stage2_verification_runs (
+                            trace_id TEXT PRIMARY KEY,
+                            room_key TEXT,
+                            run_started_at_kst TEXT NOT NULL,
+                            run_finished_at_kst TEXT,
+                            stage2_status TEXT NOT NULL,
+                            used_search_verify INTEGER NOT NULL DEFAULT 0,
+                            gap_target_count INTEGER NOT NULL DEFAULT 0,
+                            evidence_count INTEGER NOT NULL DEFAULT 0,
+                            backfill_count INTEGER NOT NULL DEFAULT 0,
+                            discovered_confirmed_count INTEGER NOT NULL DEFAULT 0,
+                            discovered_unverified_count INTEGER NOT NULL DEFAULT 0,
+                            coverage_upgrade_count INTEGER NOT NULL DEFAULT 0,
+                            error_detail TEXT
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        CREATE TABLE stage2_search_evidence (
+                            trace_id TEXT NOT NULL,
+                            evidence_id TEXT NOT NULL,
+                            topic TEXT NOT NULL,
+                            source_type TEXT NOT NULL,
+                            source_name TEXT NOT NULL,
+                            source_url TEXT NOT NULL,
+                            title TEXT NOT NULL,
+                            published_at_kst TEXT,
+                            updated_at_kst TEXT,
+                            confidence REAL,
+                            excerpt TEXT,
+                            evidence_kind TEXT,
+                            confirms_fields_json TEXT,
+                            inserted_at_kst TEXT NOT NULL,
+                            PRIMARY KEY (trace_id, evidence_id)
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        CREATE TABLE page_observations (
+                            source_name TEXT NOT NULL,
+                            page_name TEXT NOT NULL,
+                            item_url TEXT NOT NULL,
+                            item_title TEXT NOT NULL,
+                            content_fingerprint TEXT NOT NULL,
+                            first_seen_at_kst TEXT NOT NULL,
+                            last_seen_at_kst TEXT NOT NULL,
+                            last_published_at_kst TEXT,
+                            last_updated_at_kst TEXT,
+                            PRIMARY KEY (source_name, page_name, item_url)
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        CREATE TABLE competitor_universe_observations (
+                            competitor TEXT NOT NULL,
+                            asset TEXT NOT NULL,
+                            indication TEXT NOT NULL,
+                            stage_status TEXT,
+                            region TEXT,
+                            primary_source_url TEXT NOT NULL,
+                            source_label TEXT,
+                            source_type TEXT,
+                            content_fingerprint TEXT NOT NULL,
+                            first_seen_at_kst TEXT NOT NULL,
+                            last_seen_at_kst TEXT NOT NULL,
+                            PRIMARY KEY (competitor, asset, indication, primary_source_url)
+                        )
+                        """
+                    )
+                sqlite_store._DB_PATH = str(db_path)
+
+                sqlite_store.record_stage2_verification_run_start(
+                    trace_id="trace-old-schema",
+                    room_key="stock_openchat_news",
+                    run_started_at_kst="2026-03-30 09:00 KST",
+                    used_search_verify=True,
+                    gap_target_count=2,
+                )
+                sqlite_store.persist_stage2_verification_success(
+                    trace_id="trace-old-schema",
+                    run_finished_at_kst="2026-03-30 09:05 KST",
+                    stage2_status="success",
+                    evidence_catalog=[
+                        {
+                            "evidence_id": "ev-old",
+                            "topic": "registry detail",
+                            "source_type": "registry",
+                            "source_name": "ctis",
+                            "source_url": "https://euclinicaltrials.eu/ctis/trial/123",
+                            "title": "CTIS record detail",
+                            "published_at_kst": "2026-03-30 08:00 KST",
+                            "updated_at_kst": "2026-03-30 08:30 KST",
+                            "confidence": 0.95,
+                            "excerpt": "Phase 3 enrollment 240",
+                            "evidence_kind": "field_confirmation",
+                            "confirms_fields": ["phase", "enrollment"],
+                            "entity": "Immunovant",
+                            "asset": "IMVT-1401",
+                            "indication": "MG",
+                            "region": "EU",
+                        }
+                    ],
+                    provenance_rows=[],
+                    backfill_count=1,
+                    discovered_confirmed_count=0,
+                    discovered_unverified_count=0,
+                    coverage_upgrade_count=1,
+                    reused_evidence_count=1,
+                )
+                page_decision = sqlite_store.record_page_observation(
+                    source_name="immunovant_ir",
+                    page_name="presentations",
+                    item_url="https://www.immunovant.com/presentations/deck",
+                    item_identity_key="presentation:deck-20260330",
+                    item_title="Investor deck updated",
+                    content_fingerprint="fp-new",
+                    observed_at_kst="2026-03-30 09:10 KST",
+                    updated_at_kst="2026-03-30 08:45 KST",
+                    structured_payload={"item_type": "presentation"},
+                    source_specific_identity={"kind": "presentation"},
+                )
+                page_row = sqlite_store.get_page_observation(
+                    source_name="immunovant_ir",
+                    page_name="presentations",
+                    item_url="https://www.immunovant.com/presentations/deck",
+                    item_identity_key="presentation:deck-20260330",
+                )
+                sqlite_store.record_competitor_universe_observation(
+                    competitor="argenx",
+                    asset="efgartigimod",
+                    indication="MG",
+                    stage_status="approved",
+                    region="US",
+                    primary_source_url="https://www.argenx.com/pipeline",
+                    source_label="argenx pipeline",
+                    source_type="official",
+                    aliases=["Vyvgart"],
+                    target_moa="FcRn",
+                    layer="direct_class",
+                    provenance_score=0.95,
+                    content_fingerprint="argenx-fp",
+                    observed_at_kst="2026-03-30 09:12 KST",
+                )
+                evidence_rows = sqlite_store.list_stage2_search_evidence("trace-old-schema")
+                run_rows = sqlite_store.list_stage2_verification_runs("trace-old-schema")
+                competitor_rows = sqlite_store.load_competitor_universe_observations()
+        finally:
+            sqlite_store._DB_PATH = original_db_path
+
+        self.assertTrue(page_decision.is_new_item)
+        self.assertEqual(evidence_rows[0]["entity"], "Immunovant")
+        self.assertEqual(evidence_rows[0]["region"], "EU")
+        self.assertEqual(run_rows[0]["reused_evidence_count"], 1)
+        self.assertEqual(page_row["item_identity_key"], "presentation:deck-20260330")
+        self.assertEqual(page_row["structured_payload"]["item_type"], "presentation")
+        self.assertEqual(competitor_rows[0]["aliases"], ["Vyvgart"])
+        self.assertEqual(competitor_rows[0]["layer"], "direct_class")
 
 
 class YouTubeSummaryTest(unittest.TestCase):

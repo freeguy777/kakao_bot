@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 SERVER_DIR = Path(__file__).resolve().parent
 ENV_PATH = SERVER_DIR / ".env"
 HANALL_SOURCES_PATH = SERVER_DIR / "hanall_sources.yaml"
+HANALL_COMPETITORS_PATH = SERVER_DIR / "hanall_competitors.yaml"
 ROOMS_PATH = SERVER_DIR / "rooms.yaml"
 PROMPTS_PATH = SERVER_DIR / "prompts.yaml"
 

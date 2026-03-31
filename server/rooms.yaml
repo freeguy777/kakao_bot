@@ -162,29 +162,6 @@ rooms:
       birth_date: "2024-09-26"
       include_days: true
 
-  # 방 4: 주식 오픈 카톡방
-  stock_openchat_news:
-    display_name: "주식 오픈 카톡방"
-    channel_id: ""
-    features:
-      youtube_summary: true
-      news_brief: true
-      morning_brief: false
-    schedules:
-      enabled: false
-      jobs:
-        - name: hanall_news_brief
-          triggers:
-            - id_suffix: morning
-              day_of_week: "mon-fri"
-              hour: 8
-              minute: 15
-    delivery:
-      admin_room_key: admin_test_room
-    news:
-      enabled: true
-      prompt_key: "hanall_news_prompt"
-      max_items: 5
 
   # 방 5: 테스트방
   openchat_test:
@@ -196,7 +173,7 @@ rooms:
       morning_brief: true
       weather_brief: true
     schedules:
-      enabled: true
+      enabled: false
       jobs:
         - name: family_morning_brief
           triggers:
@@ -206,8 +183,8 @@ rooms:
           triggers:
             - id_suffix: morning
               day_of_week: "mon-fri"
-              hour: 8
-              minute: 15
+              hour: 16
+              minute: 37
     delivery:
       admin_room_key: admin_test_room
       notify_admin_on_error: true
