@@ -1065,6 +1065,59 @@ function isAdminRoom(msg) {
 }
 
 // ===== 8. Room Cache =====
+function buildRoomCacheKey(channelId, roomName) {
+  var normalizedChannelId = trimString(channelId);
+  var normalizedRoomName = trimString(roomName);
+
+  if (normalizedChannelId) {
+    return normalizedChannelId;
+  }
+
+  if (!normalizedRoomName) {
+    return "";
+  }
+
+  return "name:" + normalizedRoomName;
+}
+
+function isTemporaryRoomCacheKey(cacheKey) {
+  return safeString(cacheKey).indexOf("name:") === 0;
+}
+
+function removeRoomOrder(cacheKey) {
+  var i;
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    if (STATE.roomOrder[i] === cacheKey) {
+      STATE.roomOrder.splice(i, 1);
+      return;
+    }
+  }
+}
+
+function findTemporaryRoomCacheKeyByName(roomName) {
+  var normalizedRoomName = trimString(roomName);
+  var i;
+  var cacheKey;
+  var item;
+
+  if (!normalizedRoomName) {
+    return "";
+  }
+
+  for (i = 0; i < STATE.roomOrder.length; i++) {
+    cacheKey = STATE.roomOrder[i];
+    if (!isTemporaryRoomCacheKey(cacheKey)) {
+      continue;
+    }
+    item = STATE.roomsByChannelId[cacheKey];
+    if (item && trimString(item.room) === normalizedRoomName) {
+      return cacheKey;
+    }
+  }
+
+  return "";
+}
+
 function addRoomOrder(channelId) {
   var i;
   var evictedChannelId;
@@ -1106,7 +1159,7 @@ function roomCount() {
 function buildRoomLine(item, index) {
   return (
     (index + 1) + ". " + item.room +
-    " | channelId=" + item.channelId +
+    " | channelId=" + (trimString(item.channelId) || "-") +
     " | group=" + String(item.isGroupChat) +
     " | lastSeen=" + item.lastSeenAt
   );
@@ -1115,20 +1168,36 @@ function buildRoomLine(item, index) {
 function cacheRoom(msg) {
   var channelId = getChannelId(msg);
   var roomName = getRoomName(msg);
+  var cacheKey = "";
+  var temporaryKey = "";
   var item;
   var isNew = false;
 
-  if (!channelId || !roomName) {
+  if (!roomName) {
     return null;
   }
 
-  item = STATE.roomsByChannelId[channelId];
+  cacheKey = buildRoomCacheKey(channelId, roomName);
+  if (!cacheKey) {
+    return null;
+  }
+
+  item = STATE.roomsByChannelId[cacheKey];
+  if (!item && channelId) {
+    temporaryKey = findTemporaryRoomCacheKeyByName(roomName);
+    if (temporaryKey && STATE.roomsByChannelId[temporaryKey]) {
+      item = STATE.roomsByChannelId[temporaryKey];
+      delete STATE.roomsByChannelId[temporaryKey];
+      removeRoomOrder(temporaryKey);
+    }
+  }
+
   if (!item) {
     item = {};
     isNew = true;
   }
 
-  item.channelId = channelId;
+  item.channelId = trimString(channelId) || trimString(item.channelId);
   item.room = roomName;
   item.isGroupChat = getIsGroupChat(msg);
   item.packageName = getPackageName(msg) || getKakaoPackageName();
@@ -1136,8 +1205,8 @@ function cacheRoom(msg) {
   item.lastLogId = getLogId(msg);
   item.lastSeenAt = nowIsoString();
 
-  STATE.roomsByChannelId[channelId] = item;
-  addRoomOrder(channelId);
+  STATE.roomsByChannelId[cacheKey] = item;
+  addRoomOrder(cacheKey);
 
   if (isNew && CONFIG.NOTIFY_ADMIN_ON_NEW_ROOM && item.room !== CONFIG.ADMIN_ROOM_NAME) {
     notifyAdminAsync(
@@ -1284,7 +1353,7 @@ function botSendRoom(roomName, text, packageName) {
 function sendMessagesToRoom(roomName, messages, packageName, traceId) {
   var normalized = normalizeMessages(messages);
   var i;
-  var ok = true;
+  var sendSucceeded = true;
   var sentCount = 0;
   var lastError = "";
   var startedAtMs = nowMillis();
@@ -1292,7 +1361,7 @@ function sendMessagesToRoom(roomName, messages, packageName, traceId) {
   for (i = 0; i < normalized.length; i++) {
     STATE.sendAttemptCount += 1;
     if (!botSendRoom(roomName, normalized[i], packageName)) {
-      ok = false;
+      sendSucceeded = false;
       STATE.sendFailureCount += 1;
       lastError =
         "bot.send failed at index=" + String(i + 1) +
@@ -1308,15 +1377,15 @@ function sendMessagesToRoom(roomName, messages, packageName, traceId) {
   }
 
   STATE.sendLastDurationMs = nowMillis() - startedAtMs;
-  if (ok) {
+  if (sendSucceeded) {
     STATE.sendLastSuccessAt = nowIsoString();
     recordLastSuccess("send");
   }
 
   return {
-    ok: ok,
+    ok: sendSucceeded,
     sentCount: sentCount,
-    error: ok ? "" : lastError
+    error: sendSucceeded ? "" : lastError
   };
 }
 

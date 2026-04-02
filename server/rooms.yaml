@@ -63,12 +63,6 @@ rooms:
           triggers:
             - hour: 8
               minute: 10
-        - name: hanall_news_brief
-          triggers:
-            - id_suffix: morning
-              day_of_week: "mon-fri"
-              hour: 8
-              minute: 15
     delivery:
       admin_room_key: admin_test_room
       notify_admin_on_error: true
@@ -107,7 +101,7 @@ rooms:
 
   # 방 2: 친구 카톡방
   friends_room_main:
-    display_name: "친구 카톡방(김현기)"
+    display_name: "현기휘태"
     channel_id: "464481170193970"
     features:
       youtube_summary: true
@@ -165,7 +159,7 @@ rooms:
 
   # 방 5: 테스트방
   openchat_test:
-    display_name: "테스트방"
+    display_name: "테스트방하는방방방"
     channel_id: "18478614215033563"
     features:
       youtube_summary: true
@@ -173,7 +167,7 @@ rooms:
       morning_brief: true
       weather_brief: true
     schedules:
-      enabled: false
+      enabled: true
       jobs:
         - name: family_morning_brief
           triggers:
@@ -182,9 +176,9 @@ rooms:
         - name: hanall_news_brief
           triggers:
             - id_suffix: morning
-              day_of_week: "mon-fri"
-              hour: 16
-              minute: 37
+              #day_of_week: "mon-fri"
+              hour: 8
+              minute: 15
     delivery:
       admin_room_key: admin_test_room
       notify_admin_on_error: true
