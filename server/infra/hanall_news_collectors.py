@@ -8,9 +8,9 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree
 
 import requests
@@ -50,6 +50,7 @@ PRIMARY_QUERY = '"Immunovant" OR "HanAll Biopharma" OR batoclimab OR IMVT-1401 O
 COMPETITOR_QUERY = 'FcRn OR argenx OR efgartigimod OR rozanolixizumab OR nipocalimab OR TED OR CIDP OR Sjogren'
 REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_RESULT_LIMIT = 5
+SEC_REQUEST_INTERVAL_SECONDS = 0.25
 MFDS_DEFAULT_NUM_ROWS = 100
 DART_COMPANY_ALIASES = ("한올바이오파마", "HanAll Biopharma", "HANALL BIOPHARMA")
 IMMUNOVANT_ALIASES = ("Immunovant", "IMVT")
@@ -68,6 +69,7 @@ SECRET_FIELD_PATTERNS = (
     re.compile(r'((?:api-key|api_key|serviceKey|token|Authorization|crtfc_key)=)([^&\s]+)', re.IGNORECASE),
 )
 LOW_PRECISION_SOURCE_NAMES = {"crossref", "biorxiv"}
+FMP_BROAD_8K_ENDPOINTS = {"latest_8k", "filings_by_form_type"}
 STRICT_RELEVANCE_TERMS = (
     "immunovant",
     "hanall biopharma",
@@ -87,6 +89,15 @@ TARGET_MOA_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("efgartigimod", "vyvgart", "rozanolixizumab", "rystiggo", "nipocalimab"), "FcRn antagonist"),
     (("teprotumumab", "tepezza"), "IGF-1R inhibitor"),
 )
+SEC_FAIR_ACCESS_NOTE = (
+    "SEC fair access may reject requests without a declared User-Agent or with excessive request rates; "
+    "this collector stays below 5 requests/second."
+)
+BEST_EFFORT_FULL_TEXT_LIMITATION = (
+    "SEC public docs do not expose a 1:1 public full-text API equivalent to sec-api. "
+    "This is a best-effort local text scan over recent SEC filing documents."
+)
+_SEC_REQUEST_STATE: dict[str, float] = {"last_started": 0.0}
 
 
 def _apply_page_item_detail_fields(page_item: OfficialPageItem, detail_fields: dict[str, Any]) -> None:
@@ -303,6 +314,19 @@ def _is_auth_invalid_response(response: requests.Response | None, *, source_name
         return True
     if source_name == "sec_api":
         return "api token invalid" in combined or "invalid token" in combined
+    if source_name == "fmp":
+        return any(
+            phrase in combined
+            for phrase in (
+                "invalid api key",
+                "apikey invalid",
+                "missing api key",
+                "missing apikey",
+                "apikey is required",
+                "invalid apikey",
+                "unauthorized",
+            )
+        )
     if source_name == "openfda":
         return "api_key_invalid" in combined or "invalid api_key" in combined
     if source_name == "ncbi":
@@ -339,6 +363,7 @@ def _parse_datetime(value: Any) -> datetime | None:
     if not text:
         return None
 
+    text = re.sub(r"\b([A-Za-z]{3})\.\s", r"\1 ", text)
     candidate_formats = (
         "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%S.%f%z",
@@ -504,6 +529,263 @@ def _is_low_precision_relevant(finding: RawFinding) -> bool:
         if part
     ).lower()
     return any(term in combined for term in STRICT_RELEVANCE_TERMS)
+
+
+def _infer_watch_asset(*values: Any) -> str | None:
+    lowered = " ".join(_stringify_values(values)).lower()
+    if not lowered:
+        return None
+    for aliases, canonical in (
+        (("batoclimab", "hl161", "imvt-1401", "rvt-1401", "hbm9161"), "batoclimab"),
+        (("imvt-1402", "hl161ans"), "IMVT-1402"),
+        (("tanfanercept", "hl036"), "tanfanercept"),
+    ):
+        if any(alias in lowered for alias in aliases):
+            return canonical
+    return None
+
+
+def _normalize_url_text(url: str | None) -> str:
+    normalized = _safe_text(url).strip()
+    if not normalized:
+        return ""
+    return normalized.rstrip("/")
+
+
+def _append_unique_text(base: str | None, extra: str | None, *, separator: str = " | ") -> str | None:
+    base_text = _safe_text(base)
+    extra_text = _safe_text(extra)
+    if not base_text:
+        return extra_text or None
+    if not extra_text or extra_text in base_text:
+        return base_text
+    return f"{base_text}{separator}{extra_text}"
+
+
+def _merge_unique_strings(*values: Any) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for value in values:
+        for text in _stringify_values(value):
+            if text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+    return merged
+
+
+def _normalize_document_key(document_id: str | None) -> str:
+    text = _safe_text(document_id).lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def _finding_timestamp_key(finding: RawFinding) -> str:
+    return _safe_text(finding.accepted_at or finding.filed_at or finding.updated_at_kst or finding.published_at_kst)
+
+
+def _finding_primary_keys(finding: RawFinding) -> list[str]:
+    page_item_payload = finding.raw_payload.get("page_item", {}) if isinstance(finding.raw_payload, dict) else {}
+    keys: list[str] = []
+    document_key = _normalize_document_key(finding.document_id)
+    if document_key:
+        keys.append(f"document:{document_key}")
+    normalized_url = _normalize_url_text(finding.primary_source_url)
+    if normalized_url:
+        keys.append(f"url:{normalized_url.lower()}")
+    title_key = _safe_text(finding.title).lower()
+    timestamp_key = _finding_timestamp_key(finding)
+    if title_key and timestamp_key:
+        keys.append(f"title_time:{title_key}|{timestamp_key}")
+    page_identity = _safe_text(page_item_payload.get("item_identity_key"))
+    if page_identity:
+        keys.append(f"page_item:{page_identity}")
+    trial_key = _safe_text(finding.trial_id)
+    if trial_key:
+        keys.append(f"trial:{trial_key.lower()}")
+    return keys
+
+
+def _finding_structured_score(finding: RawFinding) -> int:
+    score_fields = (
+        finding.document_id,
+        finding.filing_type,
+        finding.primary_source_url,
+        finding.secondary_source_url,
+        finding.source_note,
+        finding.summary,
+        finding.asset,
+        finding.indication,
+        finding.regulator,
+        finding.exchange,
+        finding.filed_at,
+        finding.accepted_at,
+        finding.event_action,
+        finding.insider_person,
+        finding.insider_role,
+        finding.insider_quantity,
+        finding.insider_price,
+        finding.trade_date,
+    )
+    score = sum(1 for field in score_fields if field not in (None, "", [], {}))
+    score += len(finding.aliases) + len(finding.key_numbers) + len(finding.site_countries) + len(finding.changed_fields)
+    if finding.source_name == "sec_official" and finding.document_type == "sec_litigation_release":
+        score += 10
+    if isinstance(finding.raw_payload, dict) and finding.raw_payload:
+        score += 1
+    return score
+
+
+def _merge_raw_payload(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    if not primary:
+        return dict(secondary)
+    merged = dict(primary)
+    for key, value in secondary.items():
+        if key not in merged or merged[key] in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def _merge_findings(preferred: RawFinding, other: RawFinding) -> RawFinding:
+    merged = preferred.model_copy(deep=True)
+    scalar_fields = (
+        "entity",
+        "entity_type",
+        "category",
+        "title",
+        "summary",
+        "document_type",
+        "document_id",
+        "filing_type",
+        "trial_id",
+        "asset",
+        "sponsor",
+        "target_moa",
+        "indication",
+        "region",
+        "stage_status",
+        "phase",
+        "recruitment_status",
+        "enrollment",
+        "primary_completion_date",
+        "last_update_posted",
+        "regulator",
+        "exchange",
+        "filed_at",
+        "accepted_at",
+        "event_action",
+        "regulatory_phrase",
+        "insider_person",
+        "insider_role",
+        "insider_quantity",
+        "insider_price",
+        "trade_date",
+        "primary_source_url",
+        "secondary_source_url",
+    )
+    for field_name in scalar_fields:
+        current_value = getattr(merged, field_name)
+        if current_value in (None, "", [], {}):
+            setattr(merged, field_name, getattr(other, field_name))
+
+    if merged.published_at is None and other.published_at is not None:
+        merged.published_at = other.published_at
+    if merged.updated_at is None and other.updated_at is not None:
+        merged.updated_at = other.updated_at
+    if not merged.published_at_kst and other.published_at_kst:
+        merged.published_at_kst = other.published_at_kst
+    if not merged.updated_at_kst and other.updated_at_kst:
+        merged.updated_at_kst = other.updated_at_kst
+
+    merged.aliases = _merge_unique_strings(merged.aliases, other.aliases)
+    merged.site_countries = _merge_unique_strings(merged.site_countries, other.site_countries)
+    merged.changed_fields = _merge_unique_strings(merged.changed_fields, other.changed_fields)
+    merged.key_numbers = _merge_unique_strings(merged.key_numbers, other.key_numbers)
+    merged.source_note = _append_unique_text(merged.source_note, other.source_note)
+    merged.summary = _append_unique_text(merged.summary, other.summary)
+    merged.confidence = max(merged.confidence, other.confidence)
+    merged.raw_payload = _merge_raw_payload(
+        merged.raw_payload if isinstance(merged.raw_payload, dict) else {},
+        other.raw_payload if isinstance(other.raw_payload, dict) else {},
+    )
+    return merged
+
+
+def _choose_preferred_finding(left: RawFinding, right: RawFinding) -> tuple[RawFinding, RawFinding]:
+    if right.source_name == "sec_official" and right.document_type == "sec_litigation_release":
+        return right, left
+    if left.source_name == "sec_official" and left.document_type == "sec_litigation_release":
+        return left, right
+    if _finding_structured_score(right) > _finding_structured_score(left):
+        return right, left
+    return left, right
+
+
+def _throttle_sec_request() -> None:
+    elapsed = perf_counter() - _SEC_REQUEST_STATE["last_started"]
+    remaining = SEC_REQUEST_INTERVAL_SECONDS - elapsed
+    if remaining > 0:
+        sleep(remaining)
+    _SEC_REQUEST_STATE["last_started"] = perf_counter()
+
+
+class SecRequestMixin:
+    def _sec_declared_user_agent(self) -> str:
+        # SEC recommends a declared identity such as "Company Name Contact@company.com".
+        configured = _safe_text(getattr(self.settings, "sec_edgar_user_agent", ""))
+        return configured or USER_AGENT
+
+    def _request_sec_text(
+        self,
+        session: requests.Session,
+        *,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> str:
+        _throttle_sec_request()
+        return self._request_text(
+            session,
+            endpoint=endpoint,
+            params=params,
+            headers={
+                "User-Agent": self._sec_declared_user_agent(),
+                "Accept": "text/html, text/plain, application/json, application/xml",
+                **(headers or {}),
+            },
+            timeout=timeout,
+        )
+
+    def _request_sec_json(
+        self,
+        session: requests.Session,
+        *,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> Any:
+        _throttle_sec_request()
+        return self._request_json(
+            session,
+            endpoint=endpoint,
+            params=params,
+            headers={
+                "User-Agent": self._sec_declared_user_agent(),
+                "Accept": "application/json, text/plain",
+                **(headers or {}),
+            },
+            timeout=timeout,
+        )
+
+    def _sec_error_detail(self, exc: requests.HTTPError) -> str:
+        detail = self._http_error_detail(exc)
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code in {403, 429}:
+            return _append_unique_text(detail, SEC_FAIR_ACCESS_NOTE) or detail
+        return detail
 
 
 class BaseHanallCollector(ABC):
@@ -966,202 +1248,391 @@ class BaseHanallCollector(ABC):
     def _collect(self, session: requests.Session, *, checked_at: datetime) -> OfficialCollectionResult:
         raise NotImplementedError
 
-class SecApiCollector(BaseHanallCollector):
-    source_name = "sec_api"
-    source_family = "sec"
+class FmpCollector(SecRequestMixin, BaseHanallCollector):
+    source_name = "fmp"
+    source_family = "fmp"
     source_group = "regulator_disclosure"
 
+    def __init__(self, settings: AppSettings, collector_config: dict[str, Any]) -> None:
+        super().__init__(settings, collector_config)
+        all_config = get_hanall_sources_config()
+        collectors = all_config.get("collectors", {}) if isinstance(all_config.get("collectors"), dict) else {}
+        sec_official = collectors.get("sec_official", {}) if isinstance(collectors.get("sec_official"), dict) else {}
+        sec_endpoints = sec_official.get("endpoints", {}) if isinstance(sec_official.get("endpoints"), dict) else {}
+        self.sec_endpoints = sec_endpoints if isinstance(sec_endpoints, dict) else {}
+
     def _api_key(self) -> str | None:
-        value = self.settings.sec_api_key.strip()
+        value = _safe_text(getattr(self.settings, "fmp_api_key", ""))
         return value if value and value != "replace_me" else None
 
-    def _sec_api_auth_attempts(self) -> list[tuple[str, dict[str, str] | None, dict[str, Any] | None]]:
-        api_key = self._api_key()
-        if not api_key:
-            return []
-        return [
-            ("authorization_header", {"Authorization": api_key}, None),
-            ("token_query_param", None, {"token": api_key}),
-        ]
+    def _fmp_params(self, **params: Any) -> dict[str, Any]:
+        normalized = {key: value for key, value in params.items() if value not in (None, "", [], {})}
+        normalized["apikey"] = self._api_key()
+        return normalized
 
-    def _request_sec_api_json(
+    def _request_fmp_endpoint(
         self,
         session: requests.Session,
         *,
-        endpoint: str,
-        json_body: dict[str, Any],
-    ) -> tuple[Any, str]:
-        last_auth_exc: requests.HTTPError | None = None
-        for auth_mode, headers, params in self._sec_api_auth_attempts():
-            try:
-                payload = self._request_json(
-                    session,
-                    method="POST",
+        endpoint_key: str,
+        checked_at: datetime,
+        source_logs: list[CheckedSourceLogEntry],
+        coverage_gaps: list[CoverageGap],
+        params: dict[str, Any] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        endpoint = _safe_text(self.endpoints.get(endpoint_key))
+        if not endpoint:
+            return "", []
+        try:
+            payload = self._request_json(
+                session,
+                endpoint=endpoint,
+                params=self._fmp_params(**(params or {})),
+            )
+            items = _extract_items(payload)
+            source_logs.append(
+                self._source_log(
+                    status="checked",
+                    note=f"endpoint={endpoint_key} items={len(items)} auth_mode=apikey_query_param",
                     endpoint=endpoint,
-                    params=params,
-                    headers=headers,
-                    json_body=json_body,
+                    checked_at=checked_at,
                 )
-                return payload, auth_mode
-            except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                if status_code in {401, 403} and _is_auth_invalid_response(exc.response, source_name=self.source_name):
-                    last_auth_exc = exc
-                    continue
-                raise
-        if last_auth_exc is not None:
-            raise last_auth_exc
-        raise requests.HTTPError("sec-api request failed before auth attempt")
+            )
+            return endpoint, items
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            detail = self._http_error_detail(exc)
+            if _is_auth_invalid_response(exc.response, source_name=self.source_name):
+                status = "auth_invalid"
+                gap_type = "auth_invalid"
+            else:
+                status = f"http_{status_code}" if status_code else "http_error"
+                gap_type = self._http_gap_type(status_code)
+            logger.warning("fmp collector http error endpoint=%s status=%s error=%s", endpoint_key, status_code, detail)
+            source_logs.append(
+                self._source_log(
+                    status=status,
+                    note=f"endpoint={endpoint_key} error={detail}",
+                    endpoint=endpoint,
+                    checked_at=checked_at,
+                    http_status=status_code,
+                )
+            )
+            coverage_gaps.append(
+                self._gap(
+                    gap_type=gap_type,
+                    detail=detail,
+                    endpoint=endpoint,
+                    severity="high" if gap_type == "auth_invalid" else "medium",
+                    http_status=status_code,
+                )
+            )
+        except requests.RequestException as exc:
+            detail = _masked_exception_text(exc)
+            logger.warning("fmp collector request failed endpoint=%s error=%s", endpoint_key, detail)
+            source_logs.append(
+                self._source_log(
+                    status="request_error",
+                    note=f"endpoint={endpoint_key} error={detail}",
+                    endpoint=endpoint,
+                    checked_at=checked_at,
+                )
+            )
+            coverage_gaps.append(
+                self._gap(
+                    gap_type="request_error",
+                    detail=detail,
+                    endpoint=endpoint,
+                )
+            )
+        return endpoint, []
 
-    def _parse_sec_items(self, items: list[dict[str, Any]], endpoint_key: str, endpoint: str) -> list[RawFinding]:
+    def _merge_company_metadata(self, metadata: dict[str, str], item: dict[str, Any]) -> dict[str, str]:
+        merged = dict(metadata)
+        for field_name, value in (
+            ("entity", _first_text(item, "companyName", "name", "entity", "companyNameLong")),
+            ("symbol", _first_text(item, "symbol", "ticker", "tradingSymbol", "issuerTradingSymbol")),
+            ("cik", _first_text(item, "cik", "cikNumber", "companyCik", "issuerCik")),
+        ):
+            if not merged.get(field_name) and value:
+                merged[field_name] = value
+        return merged
+
+    def _normalize_cik(self, value: Any) -> str:
+        digits = re.sub(r"\D", "", _safe_text(value))
+        if not digits:
+            return ""
+        return str(int(digits))
+
+    def _accession_with_dashes(self, value: Any) -> str:
+        text = _safe_text(value)
+        if not text:
+            return ""
+        if re.fullmatch(r"\d{10}-\d{2}-\d{6}", text):
+            return text
+        compact = re.sub(r"\D", "", text)
+        if len(compact) == 18:
+            return f"{compact[:10]}-{compact[10:12]}-{compact[12:]}"
+        return text
+
+    def _accession_without_dashes(self, value: Any) -> str:
+        return re.sub(r"\D", "", self._accession_with_dashes(value))
+
+    def _primary_document_name(self, item: dict[str, Any]) -> str:
+        explicit = _first_text(item, "primaryDocument", "primaryDocDescription", "documentName", "document", "filename")
+        if explicit:
+            return explicit
+        for candidate_url in (
+            _first_text(item, "finalLink", "linkToHtml", "documentUrl", "finalUrl", "link", "filingUrl", "url"),
+        ):
+            if not candidate_url:
+                continue
+            path = urlparse(candidate_url).path.rsplit("/", 1)[-1]
+            if path:
+                return path
+        return ""
+
+    def _normalize_sec_candidate_url(self, value: str) -> str:
+        url = _safe_text(value)
+        if not url:
+            return ""
+        if "sec.gov/ixviewer/ix.html" in url and "doc=" in url:
+            parsed = urlparse(url)
+            match = re.search(r"(?:^|&)doc=([^&]+)", parsed.query)
+            if match:
+                document_path = unquote(match.group(1))
+                if document_path.startswith("/"):
+                    return f"https://www.sec.gov{document_path}"
+        return url
+
+    def _build_sec_url(self, template_key: str, **kwargs: str) -> str:
+        template = _safe_text(self.sec_endpoints.get(template_key))
+        if not template:
+            return ""
+        try:
+            return template.format(**kwargs)
+        except KeyError:
+            return ""
+
+    def _resolve_sec_filing_urls(self, item: dict[str, Any], company_metadata: dict[str, str]) -> list[str]:
+        candidates: list[str] = []
+        for key in (
+            "finalLink",
+            "linkToHtml",
+            "linkToTxt",
+            "documentUrl",
+            "finalUrl",
+            "filingUrl",
+            "link",
+            "url",
+            "sourceUrl",
+            "linkToFilingDetails",
+        ):
+            candidate = self._normalize_sec_candidate_url(_first_text(item, key))
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        cik = self._normalize_cik(_first_text(item, "cik", "cikNumber", "companyCik", "issuerCik") or company_metadata.get("cik"))
+        accession = self._accession_with_dashes(
+            _first_text(item, "accessionNumber", "accessionNo", "accession", "accession_number", "id")
+        )
+        accession_no_dashes = self._accession_without_dashes(accession)
+        primary_document = self._primary_document_name(item)
+        if cik and accession and accession_no_dashes:
+            for template_key in ("filing_document", "filing_text", "filing_index"):
+                built = self._build_sec_url(
+                    template_key,
+                    cik_no_zero=cik,
+                    accession=accession,
+                    accession_no_dashes=accession_no_dashes,
+                    primary_document=primary_document,
+                )
+                if built and built not in candidates:
+                    candidates.append(built)
+        return candidates
+
+    def _is_watch_relevant(self, *values: Any) -> bool:
+        lowered = " ".join(_stringify_values(values)).lower()
+        return any(term in lowered for term in STRICT_RELEVANCE_TERMS) or any(alias.lower() in lowered for alias in IMMUNOVANT_ALIASES)
+
+    def _parse_fmp_filing_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        endpoint_key: str,
+        endpoint: str,
+        company_metadata: dict[str, str],
+        insider_mode: bool = False,
+    ) -> list[RawFinding]:
         findings: list[RawFinding] = []
         stats = _new_parser_stats()
-        for item in items[:DEFAULT_RESULT_LIMIT]:
+        for item in items:
+            allow_company_metadata_fallback = endpoint_key not in FMP_BROAD_8K_ENDPOINTS
+            item_entity = _first_text(item, "companyName", "entity", "issuerName", "name")
+            item_symbol = _first_text(item, "symbol", "ticker", "tradingSymbol", "issuerTradingSymbol")
+            item_cik = _first_text(item, "cik", "cikNumber", "companyCik", "issuerCik")
+            combined_entity = item_entity or (company_metadata.get("entity", "") if allow_company_metadata_fallback else "")
+            symbol = item_symbol or (company_metadata.get("symbol", "") if allow_company_metadata_fallback else "")
+            cik = item_cik or (company_metadata.get("cik", "") if allow_company_metadata_fallback else "")
+            form_type = self._pick_text(
+                item,
+                "formType",
+                "filingType",
+                "type",
+                "form",
+                "documentType",
+                field_name="filing_type",
+                stats=stats,
+            )
+            title = self._pick_text(
+                item,
+                "title",
+                "description",
+                "documentTitle",
+                "filingTitle",
+                "type",
+                "formType",
+                field_name="title",
+                default=f"{form_type or 'SEC filing'} {combined_entity or symbol}".strip(),
+                stats=stats,
+            )
+            description = _first_text(item, "description", "title", "documentDescription", "documentTitle")
+            relevance_values: list[Any] = [title, description, item_entity, item_symbol, item_cik, item]
+            if allow_company_metadata_fallback:
+                relevance_values.extend([combined_entity, symbol, cik])
+            if not self._is_watch_relevant(*relevance_values):
+                continue
+
+            accession = self._pick_text(
+                item,
+                "accessionNumber",
+                "accessionNo",
+                "accession",
+                "accession_number",
+                "id",
+                field_name="document_id",
+                stats=stats,
+            )
             filed_at_dt = self._pick_datetime(
                 item,
-                "filedAt",
-                "periodOfReport",
+                "acceptedDate",
+                "acceptedAt",
+                "acceptedDateTime",
                 "filingDate",
+                "filedAt",
+                "date",
                 field_name="filed_at",
                 stats=stats,
             )
             accepted_at_dt = self._pick_datetime(
                 item,
+                "acceptedDate",
                 "acceptedAt",
+                "acceptedDateTime",
                 "filedAt",
                 field_name="accepted_at",
                 stats=stats,
             )
-            title = self._pick_text(
-                item,
-                "description",
-                "title",
-                "documentFormatFiles.0.description",
-                "documentFormatFiles.description",
-                "documentType",
-                "formType",
-                field_name="title",
-                default=f"SEC API {endpoint_key}",
-                stats=stats,
+            primary_candidates = self._resolve_sec_filing_urls(item, company_metadata)
+            primary_source_url = next((candidate for candidate in primary_candidates if "sec.gov" in candidate.lower()), "") or (
+                primary_candidates[0] if primary_candidates else ""
             )
-            entity = self._pick_text(
+            entity = combined_entity or symbol or "Immunovant"
+            summary_parts = [
+                form_type,
+                symbol,
+                cik,
+                _first_text(item, "acceptedDate", "filingDate", "filedAt", "date"),
+                _first_text(item, "description", "title"),
+            ]
+            insider_person = self._pick_text(
                 item,
-                "companyName",
-                "issuerName",
-                "issuerTradingSymbol",
-                "ticker",
+                "reportingName",
                 "ownerName",
-                field_name="entity",
-                default="SEC API",
-                stats=stats,
-            )
-            filing_type = self._pick_text(
+                "person",
+                "reportingOwnerName",
+                field_name="insider_person",
+                stats=None,
+            ) if insider_mode else None
+            insider_role = self._pick_text(
                 item,
-                "formType",
-                "documentType",
-                "transactionCode",
-                field_name="filing_type",
-                stats=stats,
-            )
-            accession_no = self._pick_text(
+                "officerTitle",
+                "reportingRelationship",
+                "ownerRelationship",
+                "position",
+                field_name="insider_role",
+                stats=None,
+            ) if insider_mode else None
+            insider_quantity = self._pick_text(
                 item,
-                "accessionNo",
-                "accessionNumber",
-                "accessionNumberLong",
-                "id",
-                field_name="document_id",
-                stats=stats,
-            )
-            primary_url = self._pick_text(
+                "securitiesTransacted",
+                "transactionShares",
+                "amountOfShares",
+                "quantity",
+                field_name="insider_quantity",
+                stats=None,
+            ) if insider_mode else None
+            insider_price = self._pick_text(
                 item,
-                "linkToFilingDetails",
-                "linkToTxt",
-                "linkToHtml",
-                "link",
-                "sourceUrl",
-                field_name="primary_source_url",
-                default=endpoint,
-                stats=stats,
-            )
-            summary = smart_truncate(
-                " | ".join(
-                    filter(
-                        None,
-                        [
-                            filing_type,
-                            self._pick_text(item, "ticker", "issuerTradingSymbol", field_name="ticker", stats=None),
-                            self._pick_text(item, "periodOfReport", "filingDate", field_name="period_of_report", stats=None),
-                            self._pick_text(item, "filedAt", "acceptedAt", field_name="filed_at_raw", stats=None),
-                            self._pick_text(item, "ownerName", field_name="owner_name", stats=None),
-                        ],
-                    )
-                ),
-                420,
-            )
+                "price",
+                "transactionPrice",
+                "transactionPricePerShare",
+                "pricePerSecurity",
+                field_name="insider_price",
+                stats=None,
+            ) if insider_mode else None
+            trade_date = self._pick_text(
+                item,
+                "transactionDate",
+                "tradeDate",
+                "date",
+                field_name="trade_date",
+                stats=None,
+            ) if insider_mode else None
             findings.append(
                 self._build_finding(
                     title=title,
-                    summary=summary,
-                    published_at=accepted_at_dt or filed_at_dt or self._pick_datetime(
-                        item,
-                        "transactionDate",
-                        field_name="published_at",
-                        stats=None,
-                    ),
+                    summary=smart_truncate(" | ".join(part for part in summary_parts if part), 420),
+                    published_at=accepted_at_dt or filed_at_dt,
                     entity=entity,
                     document_type="sec_filing",
-                    document_id=accession_no,
-                    filing_type=filing_type,
+                    document_id=accession,
+                    filing_type=form_type,
+                    asset=_infer_watch_asset(title, description, entity),
+                    aliases=[alias for alias in (symbol,) if alias],
+                    target_moa=_infer_target_moa(title, description, entity),
                     regulator="SEC",
-                    exchange=self._pick_text(item, "exchange", "issuerExchange", field_name="exchange", stats=None),
-                    filed_at=_format_kst_text(filed_at_dt) or self._pick_text(item, "filingDate", field_name="filed_at_text", stats=None),
+                    exchange=self._pick_text(item, "exchange", field_name="exchange", stats=None),
+                    filed_at=_format_kst_text(filed_at_dt) or self._pick_text(item, "filingDate", "date", field_name="filed_at_text", stats=None),
                     accepted_at=_format_kst_text(accepted_at_dt),
                     event_action=self._pick_text(
                         item,
+                        "transactionType",
                         "transactionCode",
-                        "documentType",
                         "formType",
+                        "type",
                         field_name="event_action",
                         stats=None,
                     ),
                     key_numbers=[
                         value
-                        for value in [
-                            _numeric_field_text(_deep_get(item, "transactionShares")),
-                            _numeric_field_text(_deep_get(item, "transactionPricePerShare")),
-                            _numeric_field_text(_deep_get(item, "sharesOwnedFollowingTransaction")),
-                        ]
+                        for value in (insider_quantity, insider_price, _numeric_field_text(cik))
                         if value
                     ],
-                    insider_person=self._pick_text(item, "ownerName", field_name="insider_person", stats=None),
-                    insider_role=self._pick_text(
-                        item,
-                        "officerTitle",
-                        "ownerRelationship",
-                        field_name="insider_role",
-                        stats=None,
-                    ),
-                    insider_quantity=self._pick_text(
-                        item,
-                        "transactionShares",
-                        "amountOfShares",
-                        field_name="insider_quantity",
-                        stats=None,
-                    ),
-                    insider_price=self._pick_text(
-                        item,
-                        "transactionPricePerShare",
-                        "price",
-                        field_name="insider_price",
-                        stats=None,
-                    ),
-                    trade_date=self._pick_text(item, "transactionDate", field_name="trade_date", stats=None),
-                    primary_source_url=primary_url,
+                    insider_person=insider_person,
+                    insider_role=insider_role,
+                    insider_quantity=insider_quantity,
+                    insider_price=insider_price,
+                    trade_date=trade_date,
+                    primary_source_url=primary_source_url or endpoint,
                     secondary_source_url=endpoint,
                     source_note=f"endpoint={endpoint_key}",
-                    raw_payload=item,
+                    raw_payload={**item, "_fmp_endpoint": endpoint_key},
+                    confidence=0.75 if not insider_mode else 0.7,
                 )
             )
+            if len(findings) >= DEFAULT_RESULT_LIMIT:
+                break
         self._log_parser_summary(
             endpoint=endpoint,
             parsed_count=len(findings),
@@ -1170,129 +1641,466 @@ class SecApiCollector(BaseHanallCollector):
         )
         return findings
 
+    def _best_effort_full_text_scan(
+        self,
+        session: requests.Session,
+        *,
+        findings: list[RawFinding],
+        checked_at: datetime,
+        source_logs: list[CheckedSourceLogEntry],
+        coverage_gaps: list[CoverageGap],
+    ) -> None:
+        candidate_findings = [
+            finding
+            for finding in findings
+            if finding.document_type == "sec_filing"
+            and isinstance(finding.raw_payload, dict)
+            and not _safe_text(finding.raw_payload.get("_fmp_endpoint")).startswith("insider")
+        ]
+        scanned_count = 0
+        matched_count = 0
+        last_error_detail = ""
+        archives_root = _safe_text(self.sec_endpoints.get("archives_root")) or "-"
+        if not candidate_findings:
+            source_logs.append(
+                self._source_log(
+                    status="checked",
+                    note=f"endpoint=best_effort_full_text scanned=0 limitation={BEST_EFFORT_FULL_TEXT_LIMITATION}",
+                    endpoint=archives_root,
+                    checked_at=checked_at,
+                )
+            )
+            coverage_gaps.append(
+                self._gap(
+                    gap_type="limited_full_text_search",
+                    detail=f"{BEST_EFFORT_FULL_TEXT_LIMITATION} No recent SEC filing candidates were available from FMP discovery.",
+                    endpoint=archives_root,
+                    severity="medium",
+                )
+            )
+            return
+
+        for finding in candidate_findings[:DEFAULT_RESULT_LIMIT]:
+            payload = finding.raw_payload if isinstance(finding.raw_payload, dict) else {}
+            candidate_urls = self._resolve_sec_filing_urls(payload, {})
+            if finding.primary_source_url and finding.primary_source_url not in candidate_urls:
+                candidate_urls.insert(0, finding.primary_source_url)
+            response_text = ""
+            fetched_url = ""
+            for candidate_url in candidate_urls:
+                if "sec.gov" not in candidate_url.lower():
+                    continue
+                try:
+                    response_text = self._request_sec_text(session, endpoint=candidate_url)
+                    fetched_url = candidate_url
+                    break
+                except requests.HTTPError as exc:
+                    last_error_detail = self._sec_error_detail(exc)
+                except requests.RequestException as exc:
+                    last_error_detail = _masked_exception_text(exc)
+            if not response_text:
+                continue
+            scanned_count += 1
+            if "<html" in response_text.lower():
+                visible_text = "\n".join(_extract_visible_lines(response_text))
+            else:
+                visible_text = response_text
+            matched_terms = sorted(
+                {
+                    term
+                    for term in (
+                        "immunovant",
+                        "imvt",
+                        "hanall biopharma",
+                        "hanall",
+                        "batoclimab",
+                        "imvt-1401",
+                        "imvt-1402",
+                        "hl161",
+                        "hl036",
+                    )
+                    if term in visible_text.lower()
+                }
+            )
+            if not matched_terms:
+                continue
+            matched_count += 1
+            finding.source_note = _append_unique_text(
+                finding.source_note,
+                f"best_effort_full_text_match={','.join(matched_terms)}",
+            )
+            finding.summary = _append_unique_text(
+                finding.summary,
+                f"best-effort full-text match terms: {', '.join(matched_terms)}",
+            )
+            raw_payload = dict(payload)
+            raw_payload["_best_effort_full_text_match_terms"] = matched_terms
+            raw_payload["_best_effort_full_text_limitation"] = BEST_EFFORT_FULL_TEXT_LIMITATION
+            raw_payload["_best_effort_full_text_url"] = fetched_url
+            finding.raw_payload = raw_payload
+
+        note = (
+            f"endpoint=best_effort_full_text scanned={scanned_count} matched={matched_count} "
+            f"limitation={BEST_EFFORT_FULL_TEXT_LIMITATION}"
+        )
+        if last_error_detail and scanned_count == 0:
+            note = f"{note} error={last_error_detail}"
+        source_logs.append(
+            self._source_log(
+                status="checked",
+                note=note,
+                endpoint=archives_root,
+                checked_at=checked_at,
+            )
+        )
+        if scanned_count == 0:
+            coverage_gaps.append(
+                self._gap(
+                    gap_type="limited_full_text_search",
+                    detail=f"{BEST_EFFORT_FULL_TEXT_LIMITATION} {last_error_detail or 'SEC filing documents could not be fetched for local scan.'}",
+                    endpoint=archives_root,
+                    severity="medium",
+                )
+            )
+
     def _collect(self, session: requests.Session, *, checked_at: datetime) -> OfficialCollectionResult:
         source_logs: list[CheckedSourceLogEntry] = []
         coverage_gaps: list[CoverageGap] = []
         findings: list[RawFinding] = []
-        endpoint_specs = (
+        company_metadata: dict[str, str] = {}
+        default_page_params = {"page": 0, "limit": DEFAULT_RESULT_LIMIT * 2}
+
+        for endpoint_key, params in (
+            ("latest_sec_filings", default_page_params),
+            ("filings_by_symbol", {"symbol": "IMVT", **default_page_params}),
+        ):
+            endpoint, items = self._request_fmp_endpoint(
+                session,
+                endpoint_key=endpoint_key,
+                checked_at=checked_at,
+                source_logs=source_logs,
+                coverage_gaps=coverage_gaps,
+                params=params,
+            )
+            findings.extend(
+                self._parse_fmp_filing_items(
+                    items,
+                    endpoint_key=endpoint_key,
+                    endpoint=endpoint or _safe_text(self.endpoints.get(endpoint_key)),
+                    company_metadata=company_metadata,
+                )
+            )
+
+        for endpoint_key, params in (
+            ("company_search_by_symbol", {"symbol": "IMVT"}),
+            ("filings_by_name", {"name": "Immunovant"}),
+        ):
+            _, items = self._request_fmp_endpoint(
+                session,
+                endpoint_key=endpoint_key,
+                checked_at=checked_at,
+                source_logs=source_logs,
+                coverage_gaps=coverage_gaps,
+                params=params,
+            )
+            if items:
+                company_metadata = self._merge_company_metadata(company_metadata, items[0])
+
+        cik = self._normalize_cik(company_metadata.get("cik"))
+        if cik:
+            endpoint, items = self._request_fmp_endpoint(
+                session,
+                endpoint_key="filings_by_cik",
+                checked_at=checked_at,
+                source_logs=source_logs,
+                coverage_gaps=coverage_gaps,
+                params={"cik": cik, **default_page_params},
+            )
+            findings.extend(
+                self._parse_fmp_filing_items(
+                    items,
+                    endpoint_key="filings_by_cik",
+                    endpoint=endpoint or _safe_text(self.endpoints.get("filings_by_cik")),
+                    company_metadata=company_metadata,
+                )
+            )
+            self._request_fmp_endpoint(
+                session,
+                endpoint_key="company_search_by_cik",
+                checked_at=checked_at,
+                source_logs=source_logs,
+                coverage_gaps=coverage_gaps,
+                params={"cik": cik},
+            )
+
+        for endpoint_key, params in (
+            ("latest_8k", default_page_params),
             (
-                "api_root",
-                "POST",
+                "filings_by_form_type",
                 {
-                    "query": 'ticker:IMVT OR companyName:"Immunovant"',
-                    "from": "0",
-                    "size": str(DEFAULT_RESULT_LIMIT),
-                    "sort": [{"filedAt": {"order": "desc"}}],
-                },
-            ),
-            (
-                "full_text_search",
-                "POST",
-                {
-                    "query": PRIMARY_QUERY.replace('"', ""),
-                    "from": (checked_at - timedelta(days=1)).strftime("%Y-%m-%d"),
+                    "formType": "8-K",
+                    "from": (checked_at - timedelta(days=7)).strftime("%Y-%m-%d"),
                     "to": checked_at.strftime("%Y-%m-%d"),
-                    "page": "1",
+                    **default_page_params,
                 },
             ),
-            (
-                "form_8k",
-                "POST",
-                {
-                    "query": 'ticker:IMVT AND formType:"8-K"',
-                    "from": "0",
-                    "size": str(DEFAULT_RESULT_LIMIT),
-                    "sort": [{"filedAt": {"order": "desc"}}],
-                },
-            ),
-            (
-                "insider_trading",
-                "POST",
-                {
-                    "query": 'issuer.tradingSymbol:IMVT OR issuerName:"Immunovant"',
-                    "from": "0",
-                    "size": str(DEFAULT_RESULT_LIMIT),
-                    "sort": [{"filedAt": {"order": "desc"}}],
-                },
-            ),
-            (
-                "sec_litigation_releases",
-                "POST",
-                {
-                    "query": 'entities.tickers:IMVT OR entities.companyName:"Immunovant"',
-                    "from": "0",
-                    "size": str(DEFAULT_RESULT_LIMIT),
-                    "sort": [{"releasedAt": {"order": "desc"}}],
-                },
-            ),
+        ):
+            endpoint, items = self._request_fmp_endpoint(
+                session,
+                endpoint_key=endpoint_key,
+                checked_at=checked_at,
+                source_logs=source_logs,
+                coverage_gaps=coverage_gaps,
+                params=params,
+            )
+            findings.extend(
+                self._parse_fmp_filing_items(
+                    items,
+                    endpoint_key=endpoint_key,
+                    endpoint=endpoint or _safe_text(self.endpoints.get(endpoint_key)),
+                    company_metadata=company_metadata,
+                )
+            )
+
+        for endpoint_key, params in (
+            ("insider_latest", default_page_params),
+            ("insider_search", {"symbol": "IMVT", **default_page_params}),
+        ):
+            endpoint, items = self._request_fmp_endpoint(
+                session,
+                endpoint_key=endpoint_key,
+                checked_at=checked_at,
+                source_logs=source_logs,
+                coverage_gaps=coverage_gaps,
+                params=params,
+            )
+            findings.extend(
+                self._parse_fmp_filing_items(
+                    items,
+                    endpoint_key=endpoint_key,
+                    endpoint=endpoint or _safe_text(self.endpoints.get(endpoint_key)),
+                    company_metadata=company_metadata,
+                    insider_mode=True,
+                )
+            )
+
+        self._best_effort_full_text_scan(
+            session,
+            findings=findings,
+            checked_at=checked_at,
+            source_logs=source_logs,
+            coverage_gaps=coverage_gaps,
         )
-        for endpoint_key, method, payload in endpoint_specs:
-            endpoint = _safe_text(self.endpoints.get(endpoint_key))
-            if not endpoint:
-                continue
-            try:
-                response_payload, auth_mode = self._request_sec_api_json(
-                    session,
-                    endpoint=endpoint,
-                    json_body=payload,
-                )
-                endpoint_items = _extract_items(response_payload)
-                parsed_findings = self._parse_sec_items(endpoint_items, endpoint_key, endpoint)
-                findings.extend(parsed_findings)
-                source_logs.append(
-                    self._source_log(
-                        status="checked",
-                        note=f"endpoint={endpoint_key} items={len(endpoint_items)} auth={auth_mode}",
-                        endpoint=endpoint,
-                        checked_at=checked_at,
-                    )
-                )
-                self._log_fetch_result(
-                    endpoint=endpoint,
-                    status_code=200,
-                    elapsed_ms=0,
-                    item_count=len(endpoint_items),
-                    note=f"collector={self.source_name} endpoint={endpoint_key} auth={auth_mode}",
-                )
-            except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                detail = self._http_error_detail(exc)
-                logger.warning("sec-api collector http error endpoint=%s status=%s error=%s", endpoint_key, status_code, detail)
-                source_logs.append(
-                    self._source_log(
-                        status=f"http_{status_code}" if status_code else "http_error",
-                        note=f"endpoint={endpoint_key} error={detail}",
-                        endpoint=endpoint,
-                        checked_at=checked_at,
-                        http_status=status_code,
-                    )
-                )
-                coverage_gaps.append(
-                    self._gap(
-                        gap_type=self._http_gap_type(status_code),
-                        detail=detail,
-                        endpoint=endpoint,
-                        http_status=status_code,
-                    )
-                )
-            except requests.RequestException as exc:
-                logger.warning("sec-api collector request failed endpoint=%s error=%s", endpoint_key, _masked_exception_text(exc))
-                source_logs.append(
-                    self._source_log(
-                        status="request_error",
-                        note=f"endpoint={endpoint_key} error={exc}",
-                        endpoint=endpoint,
-                        checked_at=checked_at,
-                    )
-                )
-                coverage_gaps.append(
-                    self._gap(
-                        gap_type="request_error",
-                        detail=_masked_exception_text(exc),
-                        endpoint=endpoint,
-                    )
-                )
         return OfficialCollectionResult(findings=findings, checked_source_log=source_logs, coverage_gaps=coverage_gaps)
+
+
+class SecOfficialCollector(SecRequestMixin, BaseHanallCollector):
+    source_name = "sec_official"
+    source_family = "sec"
+    source_group = "regulator_disclosure"
+
+    def _is_watch_relevant(self, text: str) -> bool:
+        lowered = _safe_text(text).lower()
+        return any(term in lowered for term in STRICT_RELEVANCE_TERMS) or any(alias.lower() in lowered for alias in IMMUNOVANT_ALIASES)
+
+    def _match_anchor_url(self, anchors: list[tuple[str, str]], start_index: int, label: str) -> tuple[str, int]:
+        target = _safe_text(label)
+        if not target:
+            return "", start_index
+        for index in range(start_index, len(anchors)):
+            anchor_label, anchor_url = anchors[index]
+            if _normalize_url_text(anchor_label) == _normalize_url_text(target):
+                return anchor_url, index + 1
+        return "", start_index
+
+    def _collect_related_links(
+        self,
+        anchors: list[tuple[str, str]],
+        start_index: int,
+        *,
+        block_lines: list[str],
+        title: str,
+    ) -> tuple[list[dict[str, str]], int]:
+        related: list[dict[str, str]] = []
+        block_text = " ".join(block_lines).lower()
+        title_key = _safe_text(title).lower()
+        index = start_index
+        while index < len(anchors):
+            label, url = anchors[index]
+            normalized_label = _safe_text(label)
+            label_key = normalized_label.lower()
+            if not normalized_label:
+                index += 1
+                continue
+            if label_key == title_key:
+                index += 1
+                continue
+            if label_key in block_text:
+                related.append({"label": normalized_label, "url": url})
+                index += 1
+                continue
+            break
+        return related, index
+
+    def _parse_litigation_items(self, html_text: str, endpoint: str) -> list[dict[str, Any]]:
+        lines = [line for line in _extract_visible_lines(html_text) if line]
+        anchors = _extract_anchor_items(html_text, endpoint)
+        items: list[dict[str, Any]] = []
+        anchor_index = 0
+        index = 0
+        while index < len(lines):
+            published_at = _parse_datetime(lines[index])
+            if published_at is None:
+                index += 1
+                continue
+
+            block_lines: list[str] = []
+            title = ""
+            release_number = ""
+            next_index = index + 1
+            while next_index < len(lines):
+                if _parse_datetime(lines[next_index]) is not None:
+                    break
+                current_line = lines[next_index]
+                block_lines.append(current_line)
+                if not title and not current_line.startswith("Release No.") and not current_line.startswith("See Also:"):
+                    title = current_line
+                release_match = re.search(r"Release No\.?\s*(LR-\d+)", current_line, re.IGNORECASE)
+                if release_match:
+                    release_number = release_match.group(1)
+                next_index += 1
+
+            title_url, anchor_index = self._match_anchor_url(anchors, anchor_index, title)
+            related_links, anchor_index = self._collect_related_links(
+                anchors,
+                anchor_index,
+                block_lines=block_lines,
+                title=title,
+            )
+            items.append(
+                {
+                    "published_at": published_at,
+                    "title": title,
+                    "release_number": release_number,
+                    "primary_source_url": title_url,
+                    "related_links": related_links,
+                    "raw_lines": block_lines,
+                }
+            )
+            index = next_index
+        return items
+
+    def _collect(self, session: requests.Session, *, checked_at: datetime) -> OfficialCollectionResult:
+        endpoint = _safe_text(self.endpoints.get("litigation_releases"))
+        if not endpoint:
+            return self._disabled_result(checked_at=checked_at, reason="missing litigation_releases endpoint")
+
+        findings: list[RawFinding] = []
+        source_logs: list[CheckedSourceLogEntry] = []
+        coverage_gaps: list[CoverageGap] = []
+        try:
+            html_text = self._request_sec_text(session, endpoint=endpoint)
+            parsed_items = self._parse_litigation_items(html_text, endpoint)
+            for item in parsed_items:
+                title = _safe_text(item.get("title"))
+                release_number = _safe_text(item.get("release_number"))
+                related_links = item.get("related_links", []) if isinstance(item.get("related_links"), list) else []
+                if not self._is_watch_relevant(" ".join([title, release_number] + item.get("raw_lines", []))):
+                    continue
+                published_at = item.get("published_at") if isinstance(item.get("published_at"), datetime) else None
+                findings.append(
+                    self._build_finding(
+                        title=title,
+                        summary=smart_truncate(
+                            " | ".join(
+                                part
+                                for part in (
+                                    release_number,
+                                    ", ".join(link.get("label", "") for link in related_links if isinstance(link, dict)),
+                                )
+                                if part
+                            ),
+                            420,
+                        ),
+                        published_at=published_at,
+                        entity="Immunovant" if "immunovant" in title.lower() or "imvt" in title.lower() else (
+                            "HanAll Biopharma" if "hanall" in title.lower() else title
+                        ),
+                        document_type="sec_litigation_release",
+                        document_id=release_number,
+                        regulator="SEC",
+                        primary_source_url=_safe_text(item.get("primary_source_url")) or endpoint,
+                        secondary_source_url=(related_links[0].get("url") if related_links else endpoint),
+                        source_note="SEC official litigation releases",
+                        raw_payload={
+                            "title": title,
+                            "release_number": release_number,
+                            "related_links": related_links,
+                            "source": endpoint,
+                        },
+                        confidence=0.8,
+                    )
+                )
+                if len(findings) >= DEFAULT_RESULT_LIMIT:
+                    break
+
+            source_logs.append(
+                self._source_log(
+                    status="checked",
+                    note=f"endpoint=litigation_releases items={len(parsed_items)} relevant={len(findings)}",
+                    endpoint=endpoint,
+                    checked_at=checked_at,
+                )
+            )
+            if not findings:
+                coverage_gaps.append(
+                    self._gap(
+                        gap_type="no_relevant_match",
+                        detail="No SEC official litigation releases matched the HanAll/Immunovant watch terms.",
+                        endpoint=endpoint,
+                        severity="low",
+                    )
+                )
+            return OfficialCollectionResult(findings=findings, checked_source_log=source_logs, coverage_gaps=coverage_gaps)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            detail = self._sec_error_detail(exc)
+            source_logs.append(
+                self._source_log(
+                    status=f"http_{status_code}" if status_code else "http_error",
+                    note=f"endpoint=litigation_releases error={detail}",
+                    endpoint=endpoint,
+                    checked_at=checked_at,
+                    http_status=status_code,
+                )
+            )
+            coverage_gaps.append(
+                self._gap(
+                    gap_type=self._http_gap_type(status_code),
+                    detail=detail,
+                    endpoint=endpoint,
+                    http_status=status_code,
+                )
+            )
+            return OfficialCollectionResult(findings=findings, checked_source_log=source_logs, coverage_gaps=coverage_gaps)
+        except requests.RequestException as exc:
+            detail = _masked_exception_text(exc)
+            source_logs.append(
+                self._source_log(
+                    status="request_error",
+                    note=f"endpoint=litigation_releases error={detail}",
+                    endpoint=endpoint,
+                    checked_at=checked_at,
+                )
+            )
+            coverage_gaps.append(
+                self._gap(
+                    gap_type="request_error",
+                    detail=detail,
+                    endpoint=endpoint,
+                )
+            )
+            return OfficialCollectionResult(findings=findings, checked_source_log=source_logs, coverage_gaps=coverage_gaps)
 
 
 class OpenDartCollector(BaseHanallCollector):
@@ -3293,6 +4101,12 @@ def collect_hanall_page_checks(
                     item.changed_fields = observation.changed_fields or []
                     item.first_seen_at_kst = observation.first_seen_at_kst
                     item.last_seen_at_kst = observation.last_seen_at_kst
+                    if observation.previous_item_title and observation.title_change_observed_at_kst:
+                        item.raw_snapshot["title_change"] = {
+                            "before": observation.previous_item_title,
+                            "after": item.item_title,
+                            "observed_at_kst": observation.title_change_observed_at_kst,
+                        }
                     if item.changed_fields:
                         item.raw_snapshot["changed_fields"] = item.changed_fields
                     page_items.append(item)
@@ -3431,7 +4245,8 @@ def collect_hanall_page_checks(
 
 
 COLLECTOR_CLASSES = {
-    "sec_api": SecApiCollector,
+    "fmp": FmpCollector,
+    "sec_official": SecOfficialCollector,
     "opendart": OpenDartCollector,
     "openfda": OpenFdaCollector,
     "clinicaltrials": ClinicalTrialsCollector,
@@ -3446,25 +4261,37 @@ COLLECTOR_CLASSES = {
 
 def _dedupe_findings(findings: list[RawFinding]) -> list[RawFinding]:
     deduped: list[RawFinding] = []
-    seen: set[str] = set()
+    key_to_index: dict[str, int] = {}
     for finding in findings:
-        page_item_payload = finding.raw_payload.get("page_item", {}) if isinstance(finding.raw_payload, dict) else {}
-        key = "|".join(
-            [
-                finding.source_family,
-                finding.source_name,
-                str(page_item_payload.get("item_identity_key") or "-"),
-                finding.document_id or "-",
-                finding.trial_id or "-",
-                finding.primary_source_url or "-",
-                finding.title,
-                finding.accepted_at or finding.updated_at_kst or finding.published_at_kst or "-",
-            ]
-        )
-        if key in seen:
+        identity_keys = _finding_primary_keys(finding)
+        matched_key = next((key for key in identity_keys if key in key_to_index), None)
+        existing_index = key_to_index.get(matched_key) if matched_key else None
+        if existing_index is None:
+            deduped.append(finding)
+            for key in identity_keys:
+                key_to_index[key] = len(deduped) - 1
             continue
-        seen.add(key)
-        deduped.append(finding)
+
+        existing = deduped[existing_index]
+        existing_document_key = _normalize_document_key(existing.document_id)
+        current_document_key = _normalize_document_key(finding.document_id)
+        if (
+            matched_key
+            and not matched_key.startswith("document:")
+            and existing_document_key
+            and current_document_key
+            and existing_document_key != current_document_key
+        ):
+            deduped.append(finding)
+            for key in identity_keys:
+                key_to_index[key] = len(deduped) - 1
+            continue
+
+        preferred, other = _choose_preferred_finding(existing, finding)
+        merged = _merge_findings(preferred, other)
+        deduped[existing_index] = merged
+        for key in _finding_primary_keys(merged):
+            key_to_index[key] = existing_index
     return deduped
 
 

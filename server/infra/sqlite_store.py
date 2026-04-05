@@ -21,6 +21,7 @@ OUTBOX_STATUS_PENDING = "pending"
 OUTBOX_STATUS_INFLIGHT = "inflight"
 OUTBOX_STATUS_SENT = "sent"
 OUTBOX_STALE_INFLIGHT_MINUTES = 5
+POLLING_HEARTBEAT_RETENTION_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class PageObservationDecision:
     first_seen_at_kst: str | None = None
     last_seen_at_kst: str | None = None
     previous_fingerprint: str | None = None
+    previous_item_title: str | None = None
+    title_change_observed_at_kst: str | None = None
 
 
 def get_db_path() -> str:
@@ -139,6 +142,8 @@ def _ensure_page_observations_table(conn: sqlite3.Connection) -> None:
             item_url TEXT NOT NULL,
             item_identity_key TEXT,
             item_title TEXT NOT NULL,
+            previous_item_title TEXT,
+            title_change_observed_at_kst TEXT,
             content_fingerprint TEXT NOT NULL,
             structured_payload_json TEXT,
             source_specific_identity_json TEXT,
@@ -151,6 +156,8 @@ def _ensure_page_observations_table(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "page_observations", "item_identity_key", "TEXT")
+    _ensure_column(conn, "page_observations", "previous_item_title", "TEXT")
+    _ensure_column(conn, "page_observations", "title_change_observed_at_kst", "TEXT")
     _ensure_column(conn, "page_observations", "structured_payload_json", "TEXT NOT NULL DEFAULT '{}'")
     _ensure_column(conn, "page_observations", "source_specific_identity_json", "TEXT NOT NULL DEFAULT '{}'")
 
@@ -285,6 +292,22 @@ def _ensure_hanall_run_snapshots_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_hanall_brief_snapshots_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hanall_brief_snapshots (
+            cache_date_kst TEXT PRIMARY KEY,
+            source_room_key TEXT,
+            trace_id TEXT,
+            created_at_kst TEXT NOT NULL,
+            public_text TEXT NOT NULL,
+            detailed_text TEXT NOT NULL,
+            raw_output_text TEXT
+        )
+        """
+    )
+
+
 def _parse_kst_text(value: str | None) -> datetime | None:
     normalized = str(value or "").strip().removesuffix(" KST").strip()
     if not normalized:
@@ -357,6 +380,15 @@ def init_db(sqlite_path: str | None = None) -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS polling_heartbeats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                trace_id TEXT,
+                checked_at TEXT NOT NULL,
+                meta_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS room_targets (
                 room_key TEXT PRIMARY KEY,
                 channel_id TEXT,
@@ -388,6 +420,8 @@ def init_db(sqlite_path: str | None = None) -> None:
                 item_url TEXT NOT NULL,
                 item_identity_key TEXT,
                 item_title TEXT NOT NULL,
+                previous_item_title TEXT,
+                title_change_observed_at_kst TEXT,
                 content_fingerprint TEXT NOT NULL,
                 structured_payload_json TEXT,
                 source_specific_identity_json TEXT,
@@ -487,6 +521,16 @@ def init_db(sqlite_path: str | None = None) -> None:
                 final_text TEXT NOT NULL,
                 debug_meta_json TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS hanall_brief_snapshots (
+                cache_date_kst TEXT PRIMARY KEY,
+                source_room_key TEXT,
+                trace_id TEXT,
+                created_at_kst TEXT NOT NULL,
+                public_text TEXT NOT NULL,
+                detailed_text TEXT NOT NULL,
+                raw_output_text TEXT
+            );
             """
         )
         _ensure_column(conn, "outbox_messages", "last_attempt_at", "TEXT")
@@ -494,7 +538,11 @@ def init_db(sqlite_path: str | None = None) -> None:
         _ensure_column(conn, "scheduler_events", "detail", "TEXT")
         _ensure_column(conn, "scheduler_events", "trace_id", "TEXT")
         _ensure_column(conn, "scheduler_events", "meta_json", "TEXT")
+        _ensure_column(conn, "polling_heartbeats", "trace_id", "TEXT")
+        _ensure_column(conn, "polling_heartbeats", "meta_json", "TEXT")
         _ensure_column(conn, "page_observations", "item_identity_key", "TEXT")
+        _ensure_column(conn, "page_observations", "previous_item_title", "TEXT")
+        _ensure_column(conn, "page_observations", "title_change_observed_at_kst", "TEXT")
         _ensure_column(conn, "page_observations", "structured_payload_json", "TEXT")
         _ensure_column(conn, "page_observations", "source_specific_identity_json", "TEXT")
         _ensure_column(conn, "stage2_search_evidence", "entity", "TEXT")
@@ -503,6 +551,7 @@ def init_db(sqlite_path: str | None = None) -> None:
         _ensure_column(conn, "stage2_search_evidence", "region", "TEXT")
         _ensure_column(conn, "stage2_verification_runs", "coverage_upgrade_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "stage2_verification_runs", "reused_evidence_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_hanall_brief_snapshots_table(conn)
         logger.info("database initialized path=%s", get_db_path())
 
 
@@ -523,9 +572,10 @@ def get_page_observation(
         _ensure_page_observations_table(conn)
         row = conn.execute(
             """
-            SELECT source_name, page_name, item_url, item_identity_key, item_title, content_fingerprint, structured_payload_json,
-                   source_specific_identity_json,
-                   first_seen_at_kst, last_seen_at_kst, last_published_at_kst, last_updated_at_kst
+            SELECT source_name, page_name, item_url, item_identity_key, item_title, previous_item_title,
+                   title_change_observed_at_kst, content_fingerprint, structured_payload_json,
+                   source_specific_identity_json, first_seen_at_kst, last_seen_at_kst,
+                   last_published_at_kst, last_updated_at_kst
             FROM page_observations
             WHERE source_name = ? AND page_name = ? AND item_url = ?
             """,
@@ -539,6 +589,10 @@ def get_page_observation(
         "item_url": str(row["item_url"]).strip(),
         "item_identity_key": str(row["item_identity_key"]).strip() if row["item_identity_key"] else None,
         "item_title": str(row["item_title"]).strip(),
+        "previous_item_title": str(row["previous_item_title"]).strip() if row["previous_item_title"] else None,
+        "title_change_observed_at_kst": (
+            str(row["title_change_observed_at_kst"]).strip() if row["title_change_observed_at_kst"] else None
+        ),
         "content_fingerprint": str(row["content_fingerprint"]).strip(),
         "structured_payload": json.loads(row["structured_payload_json"] or "{}"),
         "source_specific_identity_json": json.loads(row["source_specific_identity_json"] or "{}"),
@@ -591,9 +645,9 @@ def record_page_observation(
         _ensure_page_observations_table(conn)
         row = conn.execute(
             """
-            SELECT item_title, content_fingerprint, structured_payload_json, source_specific_identity_json,
-                   first_seen_at_kst, last_seen_at_kst,
-                   last_published_at_kst, last_updated_at_kst
+            SELECT item_title, previous_item_title, title_change_observed_at_kst,
+                   content_fingerprint, structured_payload_json, source_specific_identity_json,
+                   first_seen_at_kst, last_seen_at_kst, last_published_at_kst, last_updated_at_kst
             FROM page_observations
             WHERE source_name = ? AND page_name = ? AND item_url = ?
             """,
@@ -604,10 +658,11 @@ def record_page_observation(
             conn.execute(
                 """
                 INSERT INTO page_observations (
-                    source_name, page_name, item_url, item_identity_key, item_title, content_fingerprint, structured_payload_json,
-                    source_specific_identity_json,
-                    first_seen_at_kst, last_seen_at_kst, last_published_at_kst, last_updated_at_kst
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_name, page_name, item_url, item_identity_key, item_title, previous_item_title,
+                    title_change_observed_at_kst, content_fingerprint, structured_payload_json,
+                    source_specific_identity_json, first_seen_at_kst, last_seen_at_kst,
+                    last_published_at_kst, last_updated_at_kst
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized_source_name,
@@ -615,6 +670,8 @@ def record_page_observation(
                     storage_item_url,
                     normalized_item_identity_key,
                     normalized_item_title,
+                    None,
+                    None,
                     normalized_fingerprint,
                     structured_payload_json,
                     source_specific_identity_json,
@@ -635,16 +692,22 @@ def record_page_observation(
             )
 
         previous_fingerprint = str(row["content_fingerprint"]).strip()
+        previous_item_title = str(row["item_title"]).strip()
+        stored_previous_item_title = str(row["previous_item_title"]).strip() if row["previous_item_title"] else None
+        stored_title_change_observed_at_kst = (
+            str(row["title_change_observed_at_kst"]).strip() if row["title_change_observed_at_kst"] else None
+        )
         previous_structured_payload = json.loads(row["structured_payload_json"] or "{}")
         first_seen_at_kst = str(row["first_seen_at_kst"]).strip()
         last_seen_at_kst = str(row["last_seen_at_kst"]).strip()
         previous_published_at_kst = str(row["last_published_at_kst"]).strip() if row["last_published_at_kst"] else None
         previous_updated_at_kst = str(row["last_updated_at_kst"]).strip() if row["last_updated_at_kst"] else None
+        title_changed = bool(normalized_item_title and normalized_item_title != previous_item_title)
 
         changed = previous_fingerprint != normalized_fingerprint
         if not changed and normalized_updated_at_kst and previous_updated_at_kst and normalized_updated_at_kst != previous_updated_at_kst:
             changed = True
-        if not changed and normalized_item_title and normalized_item_title != str(row["item_title"]).strip():
+        if not changed and title_changed:
             changed = True
 
         candidate_reference = (
@@ -656,11 +719,15 @@ def record_page_observation(
         is_resurfaced_old_news = not changed and candidate_reference is not None and candidate_reference < observed_at - timedelta(hours=24)
         freshness_state = "substantive_update" if changed else "resurfaced_old_news" if is_resurfaced_old_news else "unchanged"
         changed_fields = compute_changed_fields(normalized_structured_payload, previous_structured_payload) if changed else []
+        current_previous_item_title = previous_item_title if title_changed else stored_previous_item_title
+        current_title_change_observed_at_kst = normalized_observed_at_kst if title_changed else stored_title_change_observed_at_kst
 
         conn.execute(
             """
             UPDATE page_observations
             SET item_title = ?,
+                previous_item_title = ?,
+                title_change_observed_at_kst = ?,
                 content_fingerprint = ?,
                 structured_payload_json = ?,
                 source_specific_identity_json = ?,
@@ -671,6 +738,8 @@ def record_page_observation(
             """,
             (
                 normalized_item_title,
+                current_previous_item_title,
+                current_title_change_observed_at_kst,
                 normalized_fingerprint,
                 structured_payload_json,
                 source_specific_identity_json,
@@ -691,6 +760,8 @@ def record_page_observation(
             first_seen_at_kst=first_seen_at_kst,
             last_seen_at_kst=normalized_observed_at_kst,
             previous_fingerprint=previous_fingerprint,
+            previous_item_title=previous_item_title if title_changed else None,
+            title_change_observed_at_kst=current_title_change_observed_at_kst if title_changed else None,
         )
 
 
@@ -1234,6 +1305,64 @@ def list_hanall_run_snapshots(limit: int = 20, *, room_key: str | None = None) -
     return items
 
 
+def persist_hanall_brief_snapshot(
+    *,
+    cache_date_kst: str,
+    source_room_key: str | None,
+    trace_id: str | None,
+    created_at_kst: str,
+    public_text: str,
+    detailed_text: str,
+    raw_output_text: str | None = None,
+) -> None:
+    normalized_cache_date = str(cache_date_kst or "").strip() or now_kst().strftime("%Y-%m-%d")
+    with _get_connection() as conn:
+        _ensure_hanall_brief_snapshots_table(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO hanall_brief_snapshots (
+                cache_date_kst, source_room_key, trace_id, created_at_kst, public_text, detailed_text, raw_output_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_cache_date,
+                str(source_room_key or "").strip() or None,
+                str(trace_id or "").strip() or None,
+                str(created_at_kst or "").strip() or now_kst().strftime("%Y-%m-%d %H:%M KST"),
+                str(public_text or "").strip(),
+                str(detailed_text or "").strip(),
+                str(raw_output_text or "").strip() or None,
+            ),
+        )
+
+
+def get_hanall_brief_snapshot(*, cache_date_kst: str) -> dict[str, Any] | None:
+    normalized_cache_date = str(cache_date_kst or "").strip()
+    if not normalized_cache_date:
+        return None
+    with _get_connection() as conn:
+        _ensure_hanall_brief_snapshots_table(conn)
+        row = conn.execute(
+            """
+            SELECT cache_date_kst, source_room_key, trace_id, created_at_kst, public_text, detailed_text, raw_output_text
+            FROM hanall_brief_snapshots
+            WHERE cache_date_kst = ?
+            """,
+            (normalized_cache_date,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "cache_date_kst": str(row["cache_date_kst"]).strip(),
+        "source_room_key": str(row["source_room_key"]).strip() if row["source_room_key"] else None,
+        "trace_id": str(row["trace_id"]).strip() if row["trace_id"] else None,
+        "created_at_kst": str(row["created_at_kst"]).strip(),
+        "public_text": str(row["public_text"]).strip(),
+        "detailed_text": str(row["detailed_text"]).strip(),
+        "raw_output_text": str(row["raw_output_text"]).strip() if row["raw_output_text"] else None,
+    }
+
+
 def reset_inflight_outbox_messages() -> int:
     with _get_connection() as conn:
         cursor = conn.execute(
@@ -1490,6 +1619,66 @@ def list_scheduler_events(limit: int = 10) -> list[dict[str, Any]]:
             "event_type": str(row["event_type"]).strip(),
             "detail": str(row["detail"] or "").strip(),
             "trace_id": str(row["trace_id"]).strip() if row["trace_id"] else None,
+            "meta": json.loads(row["meta_json"] or "{}"),
+            "created_at": str(row["created_at"]).strip(),
+        }
+        for row in rows
+    ]
+
+
+def record_polling_heartbeat(
+    event_type: str,
+    *,
+    trace_id: str | None = None,
+    checked_at: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    normalized_event_type = str(event_type or "").strip() or "unknown"
+    normalized_checked_at = str(checked_at or "").strip() or now_kst().isoformat()
+    retention_before = (now_kst() - timedelta(days=POLLING_HEARTBEAT_RETENTION_DAYS)).isoformat()
+    with _get_connection() as conn:
+        conn.execute(
+            "DELETE FROM polling_heartbeats WHERE checked_at < ?",
+            (retention_before,),
+        )
+        conn.execute(
+            """
+            INSERT INTO polling_heartbeats (event_type, trace_id, checked_at, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_event_type,
+                str(trace_id).strip() if trace_id else None,
+                normalized_checked_at,
+                json.dumps(meta or {}, ensure_ascii=False),
+                now_kst().isoformat(),
+            ),
+        )
+
+
+def list_polling_heartbeats(limit: int = 10, event_type: str | None = None) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 100))
+    normalized_event_type = str(event_type or "").strip() or None
+    query = """
+        SELECT id, event_type, trace_id, checked_at, meta_json, created_at
+        FROM polling_heartbeats
+    """
+    params: list[Any] = []
+    if normalized_event_type:
+        query += " WHERE event_type = ?"
+        params.append(normalized_event_type)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(normalized_limit)
+
+    with _get_connection() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "id": int(row["id"]),
+            "event_type": str(row["event_type"]).strip(),
+            "trace_id": str(row["trace_id"]).strip() if row["trace_id"] else None,
+            "checked_at": str(row["checked_at"]).strip(),
             "meta": json.loads(row["meta_json"] or "{}"),
             "created_at": str(row["created_at"]).strip(),
         }

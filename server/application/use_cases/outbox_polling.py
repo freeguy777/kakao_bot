@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from server.core.contracts import OutboxAckRequest, OutboxPullRequest, build_standard_response
-from server.infra.sqlite_store import ack_outbox_messages, count_outbox_messages, pull_pending_outbox_messages
+from server.infra.sqlite_store import (
+    ack_outbox_messages,
+    count_outbox_messages,
+    pull_pending_outbox_messages,
+    record_polling_heartbeat,
+)
 from server.utils import make_trace_id, now_kst
 
 ACTIVE_TRANSPORT = "polling_outbox"
@@ -55,6 +60,8 @@ class OutboxPollingUseCase:
     puller: Callable[[str | None, str | None, int], list[dict[str, Any]]] = pull_pending_outbox_messages
     acker: Callable[[list[Any], bool, bool], int] = ack_outbox_messages
     trace_id_factory: Callable[[], str] = make_trace_id
+    heartbeat_recorder: Callable[..., None] = record_polling_heartbeat
+    now_factory: Callable[[], Any] = now_kst
 
     def pull(
         self,
@@ -64,24 +71,43 @@ class OutboxPollingUseCase:
     ) -> dict[str, Any]:
         request = payload if isinstance(payload, OutboxPullRequest) else OutboxPullRequest.model_validate(payload)
         trace_id = self.trace_id_factory()
-        checked_at = now_kst().isoformat()
+        checked_at = self.now_factory().isoformat()
+        heartbeat_meta: dict[str, Any] = {
+            "ok": False,
+            "room_key": request.room_key,
+            "channel_id": request.channel_id,
+            "limit": request.limit,
+        }
         _POLLING_STATUS["last_pull_at"] = checked_at
-        items = self.puller(request.room_key, request.channel_id, request.limit)
-        _POLLING_STATUS["last_success_at"] = checked_at
-        status = get_polling_status_snapshot()
-        return build_standard_response(
-            ok=True,
-            trace_id=trace_id,
-            action=action,
-            messages=[],
-            error=None,
-            meta={
-                "active_transport": ACTIVE_TRANSPORT,
-                "count": len(items),
-                "items": items,
-                **status,
-            },
-        )
+        try:
+            items = self.puller(request.room_key, request.channel_id, request.limit)
+            _POLLING_STATUS["last_success_at"] = checked_at
+            heartbeat_meta["ok"] = True
+            heartbeat_meta["count"] = len(items)
+            status = get_polling_status_snapshot()
+            return build_standard_response(
+                ok=True,
+                trace_id=trace_id,
+                action=action,
+                messages=[],
+                error=None,
+                meta={
+                    "active_transport": ACTIVE_TRANSPORT,
+                    "count": len(items),
+                    "items": items,
+                    **status,
+                },
+            )
+        except Exception as exc:
+            heartbeat_meta["error"] = str(exc)
+            raise
+        finally:
+            self.heartbeat_recorder(
+                "pull",
+                trace_id=trace_id,
+                checked_at=checked_at,
+                meta=heartbeat_meta,
+            )
 
     def ack(
         self,
@@ -92,24 +118,43 @@ class OutboxPollingUseCase:
         request = payload if isinstance(payload, OutboxAckRequest) else OutboxAckRequest.model_validate(payload)
         trace_id = self.trace_id_factory()
         increment_retry = request.increment_retry if request.increment_retry is not None else (not request.success)
-        updated = self.acker(request.message_ids, request.success, increment_retry)
-        checked_at = now_kst().isoformat()
-        if request.success:
-            _POLLING_STATUS["last_ack_success_count"] = updated
-        else:
-            _POLLING_STATUS["last_ack_fail_count"] = updated
-        _POLLING_STATUS["last_success_at"] = checked_at
-        status = get_polling_status_snapshot()
-        return build_standard_response(
-            ok=True,
-            trace_id=trace_id,
-            action=action,
-            messages=["처리 완료"],
-            error=None,
-            meta={
-                "active_transport": ACTIVE_TRANSPORT,
-                "updated_count": updated,
-                "success": request.success,
-                **status,
-            },
-        )
+        checked_at = self.now_factory().isoformat()
+        heartbeat_meta: dict[str, Any] = {
+            "ok": False,
+            "success": request.success,
+            "increment_retry": increment_retry,
+            "message_id_count": len(request.message_ids),
+        }
+        try:
+            updated = self.acker(request.message_ids, request.success, increment_retry)
+            if request.success:
+                _POLLING_STATUS["last_ack_success_count"] = updated
+            else:
+                _POLLING_STATUS["last_ack_fail_count"] = updated
+            _POLLING_STATUS["last_success_at"] = checked_at
+            heartbeat_meta["ok"] = True
+            heartbeat_meta["updated_count"] = updated
+            status = get_polling_status_snapshot()
+            return build_standard_response(
+                ok=True,
+                trace_id=trace_id,
+                action=action,
+                messages=["처리 완료"],
+                error=None,
+                meta={
+                    "active_transport": ACTIVE_TRANSPORT,
+                    "updated_count": updated,
+                    "success": request.success,
+                    **status,
+                },
+            )
+        except Exception as exc:
+            heartbeat_meta["error"] = str(exc)
+            raise
+        finally:
+            self.heartbeat_recorder(
+                "ack",
+                trace_id=trace_id,
+                checked_at=checked_at,
+                meta=heartbeat_meta,
+            )

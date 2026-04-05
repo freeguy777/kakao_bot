@@ -15,6 +15,7 @@ from server.application.hanall_news_pipeline import (
     normalize_hanall_final_text,
     run_hanall_news_pipeline,
 )
+from server.db import get_hanall_brief_snapshot, persist_hanall_brief_snapshot
 from server.config import get_admin_room_key, get_room_policy
 from server.utils import make_trace_id, now_kst, smart_truncate
 
@@ -26,7 +27,6 @@ PUBLIC_REQUIRED_SECTION_HEADINGS = (
     "🧭 경쟁사 관련 업데이트",
     "🗺 경쟁 구도 한눈에 보기",
     "🔎 확인한 자료",
-    "⚠ 추가 확인이 필요한 단서",
 )
 
 
@@ -96,7 +96,9 @@ def _public_source_label(source_group: str | None, source_name: str | None) -> s
     name_map = {
         "clinicaltrials": "ClinicalTrials.gov",
         "sec_api": "SEC 공시",
+        "sec_official": "SEC 공시",
         "sec": "SEC 공시",
+        "fmp": "FMP SEC 공시",
         "opendart": "전자공시(OpenDART)",
         "company_official": "회사 공식 자료",
         "competitor_official": "경쟁사 공식 자료",
@@ -343,12 +345,13 @@ def _render_public_competitor_map(entries: list, *, max_items: int) -> list[str]
 
 def _render_public_source_logs(entries: list, *, max_items: int) -> list[str]:
     lines = ["🔎 확인한 자료"]
-    if not entries:
+    checked_entries = [entry for entry in entries if str(getattr(entry, "status", "") or "").strip().lower() == "checked"]
+    if not checked_entries:
         lines.append("- 이번 점검에서 확인한 자료가 없습니다.")
         return lines
-    group_counter = Counter(_public_group_label(getattr(entry, "source_group", None)) for entry in entries)
-    status_counter = Counter(_public_source_status(getattr(entry, "status", "")) for entry in entries)
-    lines.append(f"- 점검한 자료는 총 {len(entries)}곳입니다.")
+    group_counter = Counter(_public_group_label(getattr(entry, "source_group", None)) for entry in checked_entries)
+    status_counter = Counter(_public_source_status(getattr(entry, "status", "")) for entry in checked_entries)
+    lines.append(f"- 점검한 자료는 총 {len(checked_entries)}곳입니다.")
     lines.append(
         "- 자료 구분: "
         + ", ".join(f"{group} {count}곳" for group, count in group_counter.most_common(4))
@@ -357,7 +360,7 @@ def _render_public_source_logs(entries: list, *, max_items: int) -> list[str]:
         "- 점검 결과: "
         + ", ".join(f"{status} {count}건" for status, count in status_counter.most_common(4))
     )
-    for entry in entries[:max_items]:
+    for entry in checked_entries[:max_items]:
         note_bits = [
             _public_source_label(getattr(entry, "source_group", None), getattr(entry, "source_name", None)),
             _public_source_status(getattr(entry, "status", None)),
@@ -464,15 +467,6 @@ def _build_public_hanall_news_text(*, room_key: str, pipeline_result) -> str:
     lines.extend(_render_public_competitor_map(stage1_output.competitor_map_snapshot, max_items=max_items))
     lines.append("")
     lines.extend(_render_public_source_logs(merged_source_logs, max_items=min(max_items, 4)))
-    lines.append("")
-    lines.extend(
-        _render_public_stage_block(
-            "⚠ 추가 확인이 필요한 단서",
-            stage1_output.unverified_leads,
-            empty_text="- 현재 추가 확인이 필요한 단서는 많지 않습니다.",
-            max_items=max_items,
-        )
-    )
     public_text = _normalize_public_hanall_text("\n".join(lines).strip())
     if not _public_text_has_required_sections(public_text):
         return _normalize_hanall_news_text(pipeline_result.final_text)
@@ -547,6 +541,16 @@ def _send_hanall_news_detailed_to_admin(*, room_key: str | None, detailed_text: 
         )
 
 
+def _current_hanall_brief_cache_date() -> str:
+    return now_kst().strftime("%Y-%m-%d")
+
+
+def _select_hanall_brief_variant(*, room_key: str | None, detailed_text: str, public_text: str) -> str:
+    if _should_render_public_hanall_text(room_key):
+        return public_text
+    return detailed_text
+
+
 def build_hanall_news_brief(
     room_key: str | None = None,
     *,
@@ -555,21 +559,54 @@ def build_hanall_news_brief(
     send_detailed_to_admin: bool = False,
 ) -> str:
     try:
+        cache_date_kst = _current_hanall_brief_cache_date()
+        try:
+            cached_snapshot = get_hanall_brief_snapshot(cache_date_kst=cache_date_kst)
+        except Exception as cache_exc:
+            logger.warning("failed to load hanall brief snapshot cache_date_kst=%s error=%s", cache_date_kst, cache_exc)
+            cached_snapshot = None
+        if cached_snapshot is not None:
+            raw_response = str(cached_snapshot.get("raw_output_text") or "").strip()
+            detailed_text = str(cached_snapshot.get("detailed_text") or "").strip()
+            public_text = str(cached_snapshot.get("public_text") or "").strip() or detailed_text
+            if send_raw_to_admin and raw_response:
+                _send_hanall_news_raw_to_admin(room_key=room_key, raw_text=raw_response)
+            if send_detailed_to_admin and detailed_text:
+                _send_hanall_news_detailed_to_admin(room_key=room_key, detailed_text=detailed_text)
+            return _select_hanall_brief_variant(
+                room_key=room_key,
+                detailed_text=detailed_text,
+                public_text=public_text,
+            )
+
         pipeline_result = run_hanall_news_pipeline(room_key=room_key)
         raw_response = pipeline_result.raw_output_text
         detailed_text = _normalize_hanall_news_text(pipeline_result.final_text)
+        public_text = _build_public_hanall_news_text(
+            room_key=str(room_key or ""),
+            pipeline_result=pipeline_result,
+        )
+        try:
+            persist_hanall_brief_snapshot(
+                cache_date_kst=cache_date_kst,
+                source_room_key=room_key,
+                trace_id=pipeline_result.stage2_trace_id,
+                created_at_kst=now_kst().strftime("%Y-%m-%d %H:%M KST"),
+                public_text=public_text,
+                detailed_text=detailed_text,
+                raw_output_text=raw_response,
+            )
+        except Exception as cache_exc:
+            logger.warning("failed to persist hanall brief snapshot cache_date_kst=%s error=%s", cache_date_kst, cache_exc)
         if send_raw_to_admin:
             _send_hanall_news_raw_to_admin(room_key=room_key, raw_text=raw_response)
         if send_detailed_to_admin:
             _send_hanall_news_detailed_to_admin(room_key=room_key, detailed_text=detailed_text)
-        if _should_render_public_hanall_text(room_key):
-            normalized = _build_public_hanall_news_text(
-                room_key=str(room_key),
-                pipeline_result=pipeline_result,
-            )
-        else:
-            normalized = detailed_text
-        return normalized
+        return _select_hanall_brief_variant(
+            room_key=room_key,
+            detailed_text=detailed_text,
+            public_text=public_text,
+        )
     except TimeoutError as exc:
         logger.warning("hanall news brief timed out error=%s", exc)
         if raise_on_error:

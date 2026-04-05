@@ -5,19 +5,36 @@
 #   datasets disabled even when the collector itself is enabled.
 # - Edit only the listed endpoints below. Do not invent additional paths in runtime code.
 collectors:
-  sec_api:
-    # MVP: Query API / form-8k / insider-trading / litigation endpoints are POST JSON only.
-    # Prefer Authorization header first and probe token query param once only on auth failures.
+  sec_official:
+    # SEC public data APIs require a declared User-Agent and conservative fair-access pacing.
+    enabled: true
+    implementation_status: partial
+    requires_api_key: false
+    endpoints:
+      data_api_root: "https://data.sec.gov"
+      submissions: "https://data.sec.gov/submissions/CIK{cik}.json"
+      archives_root: "https://www.sec.gov/Archives"
+      filing_index: "https://www.sec.gov/Archives/edgar/data/{cik_no_zero}/{accession_no_dashes}/{accession}-index.html"
+      filing_text: "https://www.sec.gov/Archives/edgar/data/{cik_no_zero}/{accession_no_dashes}/{accession}.txt"
+      filing_document: "https://www.sec.gov/Archives/edgar/data/{cik_no_zero}/{accession_no_dashes}/{primary_document}"
+      litigation_releases: "https://www.sec.gov/enforcement-litigation/litigation-releases"
+  fmp:
+    # SEC replacement strategy: FMP for filings/8-K/insider plus SEC official document fetches for best-effort local text scan.
     enabled: true
     implementation_status: partial
     requires_api_key: true
     endpoints:
-      api_root: "https://api.sec-api.io"
-      full_text_search: "https://api.sec-api.io/full-text-search"
-      xbrl_to_json: "https://api.sec-api.io/xbrl-to-json"
-      insider_trading: "https://api.sec-api.io/insider-trading"
-      form_8k: "https://api.sec-api.io/form-8k"
-      sec_litigation_releases: "https://api.sec-api.io/sec-litigation-releases"
+      latest_sec_filings: "https://financialmodelingprep.com/stable/sec-filings-financials"
+      latest_8k: "https://financialmodelingprep.com/stable/sec-filings-8k"
+      filings_by_form_type: "https://financialmodelingprep.com/stable/sec-filings-search/form-type"
+      filings_by_symbol: "https://financialmodelingprep.com/stable/sec-filings-search/symbol"
+      filings_by_cik: "https://financialmodelingprep.com/stable/sec-filings-search/cik"
+      filings_by_name: "https://financialmodelingprep.com/stable/sec-filings-company-search/name"
+      company_search_by_symbol: "https://financialmodelingprep.com/stable/sec-filings-company-search/symbol"
+      company_search_by_cik: "https://financialmodelingprep.com/stable/sec-filings-company-search/cik"
+      insider_latest: "https://financialmodelingprep.com/stable/insider-trading/latest"
+      insider_search: "https://financialmodelingprep.com/stable/insider-trading/search"
+      insider_reporting_name: "https://financialmodelingprep.com/stable/insider-trading/reporting-name"
   opendart:
     # corpCode.xml may return either a zip payload or a raw XML error body.
     # Treat non-000 XML status/message auth failures as auth_invalid/api_error, not request_error.

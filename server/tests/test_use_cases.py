@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -278,6 +279,7 @@ class MessageEventUseCaseTest(unittest.TestCase):
 class OutboxPollingUseCaseTest(unittest.TestCase):
     def setUp(self) -> None:
         reset_polling_status()
+        self.checked_at = datetime(2026, 3, 29, 9, 0, tzinfo=timezone(timedelta(hours=9)))
 
     def test_pull_builds_standard_response(self) -> None:
         puller = Mock(
@@ -289,9 +291,12 @@ class OutboxPollingUseCaseTest(unittest.TestCase):
                 }
             ]
         )
+        heartbeat_recorder = Mock()
         use_case = OutboxPollingUseCase(
             puller=puller,
             trace_id_factory=lambda: "trace-pull",
+            heartbeat_recorder=heartbeat_recorder,
+            now_factory=lambda: self.checked_at,
         )
 
         result = use_case.pull({"room_key": "room-alpha", "limit": 3}, action="fallback.outbox.pull")
@@ -300,13 +305,29 @@ class OutboxPollingUseCaseTest(unittest.TestCase):
         self.assertEqual(result["action"], "fallback.outbox.pull")
         self.assertEqual(result["meta"]["count"], 1)
         self.assertEqual(result["meta"]["active_transport"], "polling_outbox")
+        self.assertEqual(result["meta"]["last_pull_at"], self.checked_at.isoformat())
         puller.assert_called_once_with("room-alpha", None, 3)
+        heartbeat_recorder.assert_called_once_with(
+            "pull",
+            trace_id="trace-pull",
+            checked_at=self.checked_at.isoformat(),
+            meta={
+                "ok": True,
+                "room_key": "room-alpha",
+                "channel_id": None,
+                "limit": 3,
+                "count": 1,
+            },
+        )
 
     def test_ack_enables_retry_increment_on_failure_by_default(self) -> None:
         acker = Mock(return_value=2)
+        heartbeat_recorder = Mock()
         use_case = OutboxPollingUseCase(
             acker=acker,
             trace_id_factory=lambda: "trace-ack",
+            heartbeat_recorder=heartbeat_recorder,
+            now_factory=lambda: self.checked_at,
         )
 
         result = use_case.ack({"message_ids": [10, 20], "success": False}, action="polling.outbox.ack")
@@ -316,6 +337,18 @@ class OutboxPollingUseCaseTest(unittest.TestCase):
         self.assertEqual(result["meta"]["updated_count"], 2)
         self.assertEqual(result["meta"]["active_transport"], "polling_outbox")
         acker.assert_called_once_with([10, 20], False, True)
+        heartbeat_recorder.assert_called_once_with(
+            "ack",
+            trace_id="trace-ack",
+            checked_at=self.checked_at.isoformat(),
+            meta={
+                "ok": True,
+                "success": False,
+                "increment_retry": True,
+                "message_id_count": 2,
+                "updated_count": 2,
+            },
+        )
 
 
 class DeliveryDispatchUseCaseTest(unittest.TestCase):

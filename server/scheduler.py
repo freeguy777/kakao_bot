@@ -110,8 +110,45 @@ def _classify_scheduler_delivery_result(result: dict[str, Any]) -> tuple[str, st
 
 
 def _deliver_job_message(job_name: str, room_key: str, builder: JobBuilder) -> None:
+    _deliver_job_message_for_slot(job_name, room_key, builder)
+
+
+def _format_schedule_slot_key(scheduled_for: datetime | None = None) -> str:
+    slot_time = scheduled_for.astimezone(now_kst().tzinfo) if scheduled_for is not None else now_kst()
+    return slot_time.strftime("%Y%m%d%H%M")
+
+
+def _resolve_recent_schedule_slot(
+    trigger: dict[str, Any],
+    timezone: str,
+    *,
+    current_now: datetime | None = None,
+    lookback_seconds: int = DEFAULT_RECENT_MISFIRE_GRACE_SECONDS,
+) -> datetime | None:
+    now = current_now or datetime.now(ZoneInfo(timezone))
+    window_seconds = max(60, int(lookback_seconds))
+    cron_trigger = _build_cron_trigger(trigger, timezone)
+    candidate = cron_trigger.get_next_fire_time(None, now - timedelta(seconds=window_seconds))
+    latest_due: datetime | None = None
+    while candidate is not None and candidate <= now:
+        latest_due = candidate
+        next_candidate = cron_trigger.get_next_fire_time(candidate, candidate)
+        if next_candidate is None or next_candidate <= candidate:
+            break
+        candidate = next_candidate
+    return latest_due
+
+
+def _deliver_job_message_for_slot(
+    job_name: str,
+    room_key: str,
+    builder: JobBuilder,
+    *,
+    scheduled_for: datetime | None = None,
+    dedupe_ttl_seconds: int | None = None,
+) -> None:
     trace_id = make_trace_id()
-    dedupe_key = f"schedule:{room_key}:{job_name}:{now_kst().strftime('%Y%m%d%H%M')}"
+    dedupe_key = f"schedule:{room_key}:{job_name}:{_format_schedule_slot_key(scheduled_for)}"
     try:
         message = builder(room_key)
         result = deliver_room_messages(
@@ -119,8 +156,12 @@ def _deliver_job_message(job_name: str, room_key: str, builder: JobBuilder) -> N
             message=message,
             source_type=f"schedule:{job_name}",
             trace_id=trace_id,
-            meta={"job_name": job_name},
+            meta={
+                "job_name": job_name,
+                "scheduled_for": scheduled_for.isoformat() if scheduled_for is not None else None,
+            },
             dedupe_key=dedupe_key,
+            dedupe_ttl_seconds_override=(max(60, int(dedupe_ttl_seconds)) + 60) if dedupe_ttl_seconds is not None else None,
         )
         status, detail = _classify_scheduler_delivery_result(result)
         record_job_run(job_name, status, detail, trace_id)
@@ -150,6 +191,28 @@ def _deliver_job_message(job_name: str, room_key: str, builder: JobBuilder) -> N
             meta={"job_name": job_name},
         )
         record_job_run(job_name, "failed", str(exc), trace_id)
+
+
+def _deliver_scheduled_job(
+    spec: ScheduledJobSpec,
+    timezone: str,
+    recent_misfire_grace_seconds: int,
+    *,
+    current_now: datetime | None = None,
+) -> None:
+    scheduled_for = _resolve_recent_schedule_slot(
+        spec.trigger,
+        timezone,
+        current_now=current_now,
+        lookback_seconds=recent_misfire_grace_seconds,
+    )
+    _deliver_job_message_for_slot(
+        spec.job_name,
+        spec.room_key,
+        spec.builder,
+        scheduled_for=scheduled_for,
+        dedupe_ttl_seconds=recent_misfire_grace_seconds,
+    )
 
 
 def _iter_room_job_specs() -> list[ScheduledJobSpec]:
@@ -237,10 +300,10 @@ def _sync_room_jobs(scheduler: Any, timezone: str, misfire_grace_seconds: int | 
     for spec in _iter_room_job_specs():
         job_id = _build_scheduler_job_id(spec.room_key, spec.job_name, spec.job_index, spec.trigger, spec.trigger_index)
         scheduler.add_job(
-            lambda job_name=spec.job_name, room_key=spec.room_key, builder=spec.builder: _deliver_job_message(
-                job_name,
-                room_key,
-                builder,
+            lambda spec=spec, timezone=timezone, recent_misfire_grace_seconds=resolved_misfire_grace_seconds: _deliver_scheduled_job(
+                spec,
+                timezone,
+                recent_misfire_grace_seconds,
             ),
             trigger=_build_cron_trigger(spec.trigger, timezone),
             id=job_id,
@@ -291,7 +354,13 @@ def _deliver_recently_due_jobs(
             due_time,
             delay_seconds,
         )
-        _deliver_job_message(spec.job_name, spec.room_key, spec.builder)
+        _deliver_job_message_for_slot(
+            spec.job_name,
+            spec.room_key,
+            spec.builder,
+            scheduled_for=due_time,
+            dedupe_ttl_seconds=grace_seconds,
+        )
         delivered_job_ids.append(job_id)
         _safe_record_scheduler_event(
             "catch_up_delivered",

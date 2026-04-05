@@ -778,6 +778,13 @@ def promote_official_page_item_to_finding(
         return None
     if page_item.item_type in {"investor_event", "earnings", "presentation"} and page_item.scheduled_for_kst:
         return None
+    if (
+        page_item.item_type == "page_update"
+        and page_item.freshness_state == "substantive_update"
+        and page_item.changed_fields
+        and set(page_item.changed_fields) == {"title"}
+    ):
+        return None
 
     if discovery_only:
         confidence = 0.55

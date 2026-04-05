@@ -84,6 +84,9 @@ class AppSettings:
     openai_api_key: str
     gemini_api_key: str
     google_api_key: str
+    fmp_api_key: str
+    sec_edgar_user_agent: str
+    # Deprecated. Retained for config/test compatibility while sec-api runtime usage is removed.
     sec_api_key: str
     opendart_api_key: str
     openfda_api_key: str
@@ -212,6 +215,8 @@ def load_settings() -> AppSettings:
         openai_api_key=os.getenv("OPENAI_API_KEY", "replace_me").strip(),
         gemini_api_key=os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", "replace_me")).strip(),
         google_api_key=os.getenv("GOOGLE_API_KEY", "replace_me").strip(),
+        fmp_api_key=os.getenv("FMP_API_KEY", "replace_me").strip(),
+        sec_edgar_user_agent=os.getenv("SEC_EDGAR_USER_AGENT", "").strip(),
         sec_api_key=os.getenv("SEC_API_KEY", "replace_me").strip(),
         opendart_api_key=os.getenv("OPENDART_API_KEY", "replace_me").strip(),
         openfda_api_key=os.getenv("OPENFDA_API_KEY", "replace_me").strip(),

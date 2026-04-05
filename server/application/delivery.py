@@ -157,6 +157,7 @@ def deliver_room_messages(
     meta: dict[str, Any] | None = None,
     allow_fallback: bool = True,
     dedupe_key: str | None = None,
+    dedupe_ttl_seconds_override: int | None = None,
 ) -> dict[str, Any]:
     normalized_messages = _expand_messages_for_room(room_key, _normalize_messages(messages, message))
     if not normalized_messages:
@@ -165,6 +166,8 @@ def deliver_room_messages(
     room = get_room_policy(room_key)
     resolved_trace_id = (trace_id or make_trace_id()).strip()
     dedupe_ttl_seconds = room.delivery.dedupe_ttl_seconds if room else 600
+    if dedupe_ttl_seconds_override is not None:
+        dedupe_ttl_seconds = max(dedupe_ttl_seconds, int(dedupe_ttl_seconds_override))
     resolved_dedupe_key = dedupe_key.strip() if isinstance(dedupe_key, str) and dedupe_key.strip() else None
     if resolved_dedupe_key and not register_delivery_dedupe(
         dedupe_key=resolved_dedupe_key,

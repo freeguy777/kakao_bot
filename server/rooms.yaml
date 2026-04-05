@@ -129,8 +129,8 @@ rooms:
 
   # 방 3: 가족 카톡방
   family_room_home:
-    display_name: "가족 카톡방"
-    channel_id: ""
+    display_name: "가족방"
+    channel_id: "465100940258877"
     features:
       youtube_summary: true
       news_brief: false
@@ -138,7 +138,7 @@ rooms:
       weather_brief: true
       child_age: true
     schedules:
-      enabled: false
+      enabled: true
       jobs:
         - name: family_morning_brief
           triggers:
@@ -177,8 +177,8 @@ rooms:
           triggers:
             - id_suffix: morning
               #day_of_week: "mon-fri"
-              hour: 8
-              minute: 15
+              hour: 10
+              minute: 49
     delivery:
       admin_room_key: admin_test_room
       notify_admin_on_error: true

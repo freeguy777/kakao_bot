@@ -351,6 +351,52 @@ function previewText(text, limit) {
   return value.substring(0, maxLength) + "...";
 }
 
+function previewAny(value, limit) {
+  var text = "";
+  try {
+    if (typeof value === "string") {
+      text = value;
+    } else if (value === null || value === undefined) {
+      text = "";
+    } else {
+      text = JSON.stringify(value);
+    }
+  } catch (e) {
+    try {
+      text = String(value);
+    } catch (e2) {
+      text = "[unprintable]";
+    }
+  }
+  return previewText(text, limit || 120);
+}
+
+function buildPollingItemDebugInfo(item, messages) {
+  var rawMessages;
+  var parts = [];
+  parts.push("id=" + safeString(item && item.id));
+  parts.push("roomKey=" + previewAny(item && item.room_key, 60));
+  parts.push("roomName=" + previewAny(item && item.room_name, 60));
+  parts.push("channelId=" + previewAny(item && item.channel_id, 40));
+  parts.push("sourceType=" + previewAny(item && item.source_type, 60));
+  parts.push("traceId=" + previewAny(item && item.trace_id, 60));
+  if (messages !== undefined) {
+    parts.push("messageCount=" + String(messages && messages.length ? messages.length : 0));
+    if (messages && messages.length > 0) {
+      parts.push("messagePreview=" + previewAny(messages[0], 80));
+    }
+    return parts.join(" ");
+  }
+
+  rawMessages = item && item.messages;
+  if (isArray(rawMessages) && rawMessages.length > 0) {
+    parts.push("rawMessagePreview=" + previewAny(rawMessages[0], 80));
+  } else {
+    parts.push("rawMessagePreview=" + previewAny(item && item.message, 80));
+  }
+  return parts.join(" ");
+}
+
 function nowIsoString() {
   var sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX");
   return String(sdf.format(new java.util.Date()));
@@ -1438,6 +1484,8 @@ function httpPostJson(url, payload, options) {
   var response;
   var body;
   var parsed;
+  var parseErrorText = "";
+  var recordError = "";
   var endpoint = trimString(options && options.endpoint) || "http_post";
   var timeoutMs = parseInt(options && options.timeoutMs, 10);
   var startedAtMs = nowMillis();
@@ -1462,16 +1510,25 @@ function httpPostJson(url, payload, options) {
     parsed = null;
     try {
       parsed = JSON.parse(body);
-    } catch (parseError) {}
+    } catch (parseError) {
+      parseErrorText = safeString(parseError);
+    }
 
-    elapsedMs = recordHttpCall(endpoint, startedAtMs, response.statusCode(), "");
+    if (parseErrorText) {
+      recordError =
+        "json_parse_error=" + parseErrorText +
+        " bodyPreview=" + previewText(body, 160);
+    }
+
+    elapsedMs = recordHttpCall(endpoint, startedAtMs, response.statusCode(), recordError);
 
     return {
       ok: response.statusCode() >= 200 && response.statusCode() < 300,
       status: response.statusCode(),
       body: body,
       json: parsed,
-      error: "",
+      error: recordError,
+      parseError: parseErrorText,
       elapsedMs: elapsedMs
     };
   } catch (e) {
@@ -1933,6 +1990,7 @@ function runSinglePollingCycle(triggerReason) {
   var startedAtMs = nowMillis();
   var elapsedMs = 0;
   var normalizedTrigger = trimString(triggerReason) || "manual";
+  var currentItemDebug = "";
 
   if (!CONFIG.POLLING_ENABLED) {
     return {
@@ -1999,56 +2057,81 @@ function runSinglePollingCycle(triggerReason) {
 
     for (i = 0; i < items.length; i++) {
       item = items[i];
-      target = resolveOutboxTarget(item);
-      messages = extractOutboxMessages(item);
+      currentItemDebug = buildPollingItemDebugInfo(item);
 
-      if (!target || !target.roomName || messages.length === 0) {
+      try {
+        target = resolveOutboxTarget(item);
+        messages = extractOutboxMessages(item);
+        currentItemDebug = buildPollingItemDebugInfo(item, messages);
+
+        if (!target || !target.roomName || messages.length === 0) {
+          ackOk = ackOutboxItem(
+            item.id,
+            false,
+            CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE,
+            "invalid target or empty messages"
+          );
+          if (ackOk) {
+            ackFailCount += 1;
+          }
+          continue;
+        }
+
+        sendResult = sendMessagesToRoom(
+          target.roomName,
+          messages,
+          target.packageName,
+          trimString(item.trace_id) || ("outbox-" + String(item.id))
+        );
+
+        if (sendResult.ok) {
+          sentCount += sendResult.sentCount;
+        }
+
         ackOk = ackOutboxItem(
           item.id,
-          false,
-          CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE,
-          "invalid target or empty messages"
+          sendResult.ok,
+          CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE && !sendResult.ok,
+          sendResult.error
         );
+
         if (ackOk) {
-          ackFailCount += 1;
+          if (sendResult.ok) {
+            ackSuccessCount += 1;
+          } else {
+            ackFailCount += 1;
+          }
         }
-        continue;
-      }
 
-      sendResult = sendMessagesToRoom(
-        target.roomName,
-        messages,
-        target.packageName,
-        trimString(item.trace_id) || ("outbox-" + String(item.id))
-      );
-
-      if (sendResult.ok) {
-        sentCount += sendResult.sentCount;
-      }
-
-      ackOk = ackOutboxItem(
-        item.id,
-        sendResult.ok,
-        CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE && !sendResult.ok,
-        sendResult.error
-      );
-
-      if (ackOk) {
-        if (sendResult.ok) {
-          ackSuccessCount += 1;
-        } else {
-          ackFailCount += 1;
+        if (!sendResult.ok) {
+          STATE.pollingLastError =
+            "delivery failed id=" + String(item.id) +
+            " room=" + safeString(target.roomName) +
+            " error=" + safeString(sendResult.error);
+          recordLastError("polling_send", STATE.pollingLastError);
+          Log.e(STATE.pollingLastError);
         }
-      }
-
-      if (!sendResult.ok) {
+      } catch (itemError) {
         STATE.pollingLastError =
-          "delivery failed id=" + String(item.id) +
-          " room=" + safeString(target.roomName) +
-          " error=" + safeString(sendResult.error);
-        recordLastError("polling_send", STATE.pollingLastError);
-        Log.e(STATE.pollingLastError);
+          "polling item exception trigger=" + normalizedTrigger +
+          " " + currentItemDebug +
+          " error=" + safeString(itemError);
+        recordLastError("polling_item_exception", STATE.pollingLastError);
+        notifyPollingError(STATE.pollingLastError);
+        if (item && item.id !== null && item.id !== undefined) {
+          ackOk = ackOutboxItem(
+            item.id,
+            false,
+            CONFIG.POLLING_ACK_INCREMENT_RETRY_ON_FAILURE,
+            STATE.pollingLastError
+          );
+          if (ackOk) {
+            ackFailCount += 1;
+          }
+        }
       }
+
+      currentItemDebug = "";
     }
 
     STATE.pollingLastSuccessAt = nowIsoString();
@@ -2090,6 +2173,7 @@ function runSinglePollingCycle(triggerReason) {
   } catch (e) {
     STATE.pollingLastError =
       "polling exception trigger=" + normalizedTrigger +
+      (currentItemDebug ? " " + currentItemDebug : "") +
       " error=" + safeString(e);
     recordLastError("polling_exception", STATE.pollingLastError);
     notifyPollingError(STATE.pollingLastError);

@@ -29,16 +29,17 @@ from server.infra.hanall_news_collectors import (
     CrisCollector,
     CrossrefCollector,
     EuropePmcCollector,
+    FmpCollector,
     MfdsCollector,
     NcbiCollector,
     OpenDartCollector,
     OpenFdaCollector,
-    SecApiCollector,
+    SecOfficialCollector,
     _decode_data_go_kr_service_key,
     _mask_secret_text,
     collect_hanall_page_checks,
 )
-from server.infra.sqlite_store import init_db
+from server.infra.sqlite_store import get_page_observation, init_db
 from server.utils import now_kst
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "hanall"
@@ -138,6 +139,8 @@ def _stage1_json() -> str:
 class HanallCollectorFixtureRegressionTest(unittest.TestCase):
     def _settings(self, **overrides: str) -> SimpleNamespace:
         values = {
+            "fmp_api_key": "fmp-key",
+            "sec_edgar_user_agent": "HanAll Biopharma ops@hanall.com",
             "sec_api_key": "sec-key",
             "opendart_api_key": "dart-key",
             "openfda_api_key": "openfda-key",
@@ -149,120 +152,225 @@ class HanallCollectorFixtureRegressionTest(unittest.TestCase):
         values.update(overrides)
         return SimpleNamespace(**values)
 
-    def test_sec_api_parses_fixture_variants_and_captures_429_gap(self) -> None:
-        collector = SecApiCollector(
+    def test_fmp_parses_filings_and_best_effort_full_text(self) -> None:
+        collector = FmpCollector(
             self._settings(),
             {
                 "enabled": True,
                 "requires_api_key": True,
                 "endpoints": {
-                    "api_root": "https://api.sec-api.io",
-                    "full_text_search": "https://api.sec-api.io/full-text-search",
-                    "form_8k": "https://api.sec-api.io/form-8k",
-                    "insider_trading": "https://api.sec-api.io/insider-trading",
-                    "sec_litigation_releases": "https://api.sec-api.io/sec-litigation-releases",
+                    "latest_sec_filings": "https://financialmodelingprep.com/stable/sec-filings-financials",
+                    "latest_8k": "https://financialmodelingprep.com/stable/sec-filings-8k",
+                    "filings_by_form_type": "https://financialmodelingprep.com/stable/sec-filings-search/form-type",
+                    "filings_by_symbol": "https://financialmodelingprep.com/stable/sec-filings-search/symbol",
+                    "filings_by_cik": "https://financialmodelingprep.com/stable/sec-filings-search/cik",
+                    "filings_by_name": "https://financialmodelingprep.com/stable/sec-filings-company-search/name",
+                    "company_search_by_symbol": "https://financialmodelingprep.com/stable/sec-filings-company-search/symbol",
+                    "company_search_by_cik": "https://financialmodelingprep.com/stable/sec-filings-company-search/cik",
+                    "insider_latest": "https://financialmodelingprep.com/stable/insider-trading/latest",
+                    "insider_search": "https://financialmodelingprep.com/stable/insider-trading/search",
                 },
             },
         )
+        filing_payload = [
+            {
+                "companyName": "Immunovant, Inc.",
+                "symbol": "IMVT",
+                "cik": "0001764013",
+                "formType": "8-K",
+                "description": "Immunovant update for batoclimab program",
+                "accessionNumber": "0001764013-26-000015",
+                "acceptedDate": "2026-03-28T22:15:00Z",
+                "finalLink": "https://www.sec.gov/Archives/edgar/data/1764013/000176401326000015/imvt-20260328x8k.htm",
+            }
+        ]
+        insider_payload = [
+            {
+                "companyName": "Immunovant, Inc.",
+                "symbol": "IMVT",
+                "cik": "0001764013",
+                "formType": "4",
+                "reportingName": "Jane Doe",
+                "officerTitle": "Chief Financial Officer",
+                "securitiesTransacted": "2500",
+                "transactionPrice": "17.35",
+                "transactionDate": "2026-03-28",
+                "accessionNumber": "0001764013-26-000016",
+                "finalLink": "https://www.sec.gov/Archives/edgar/data/1764013/000176401326000016/xslF345X05/wk-form4_1711660000.xml",
+            }
+        ]
         collector._request_json = Mock(
             side_effect=[
-                _fixture_json("sec_api", "api_root"),
-                _fixture_json("sec_api", "empty"),
-                _fixture_json("sec_api", "api_root"),
-                _fixture_json("sec_api", "insider_trading"),
-                _http_error(429, _fixture_text("openfda", "http_429", "txt")),
+                filing_payload,
+                filing_payload,
+                [{"companyName": "Immunovant, Inc.", "symbol": "IMVT", "cik": "0001764013"}],
+                [{"companyName": "Immunovant, Inc.", "symbol": "IMVT", "cik": "0001764013"}],
+                filing_payload,
+                [{"companyName": "Immunovant, Inc.", "symbol": "IMVT", "cik": "0001764013"}],
+                filing_payload,
+                filing_payload,
+                insider_payload,
+                insider_payload,
             ]
         )
+        collector._request_sec_text = Mock(return_value="<html><body>Immunovant batoclimab IMVT-1401 HL161 program update</body></html>")
 
         result = collector.collect(Mock(), current_now=NOW)
 
-        self.assertTrue(any(finding.document_id == "insider-1" for finding in result.findings))
-        self.assertTrue(any(finding.filing_type == "P" for finding in result.findings))
-        self.assertTrue(any(finding.published_at_kst for finding in result.findings if finding.document_id == "insider-1"))
-        self.assertTrue(any(gap.gap_type == "http_429_rate_limited" for gap in result.coverage_gaps))
-
-    def test_sec_api_captures_actual_invalid_token_and_route_mismatch_body(self) -> None:
-        collector = SecApiCollector(
-            self._settings(),
-            {
-                "enabled": True,
-                "requires_api_key": True,
-                "endpoints": {
-                    "api_root": "https://api.sec-api.io",
-                    "full_text_search": "https://api.sec-api.io/full-text-search",
-                    "form_8k": "https://api.sec-api.io/form-8k",
-                    "insider_trading": "https://api.sec-api.io/insider-trading",
-                    "sec_litigation_releases": "https://api.sec-api.io/sec-litigation-releases",
-                },
-            },
-        )
-        collector._request_json = Mock(
-            side_effect=[
-                _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token"))),
-                _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token"))),
-                _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token"))),
-                _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token"))),
-                _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token"))),
-                _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token"))),
-                _http_error(404, _fixture_text("sec_api", "actual_insider_404", "html")),
-                _http_error(404, _fixture_text("sec_api", "actual_litigation_404", "html")),
-            ]
-        )
-
-        result = collector.collect(Mock(), current_now=NOW)
-
-        invalid_token_gap = next(gap for gap in result.coverage_gaps if gap.http_status == 403)
-        route_mismatch_gap = next(gap for gap in result.coverage_gaps if gap.http_status == 404)
-        self.assertIn("API token invalid", invalid_token_gap.detail)
-        self.assertIn("Cannot GET /insider-trading", route_mismatch_gap.detail)
-
-    def test_sec_api_uses_post_with_authorization_then_token_fallback(self) -> None:
-        collector = SecApiCollector(
-            self._settings(sec_api_key="sec-key"),
-            {
-                "enabled": True,
-                "requires_api_key": True,
-                "endpoints": {
-                    "api_root": "https://api.sec-api.io",
-                    "full_text_search": "https://api.sec-api.io/full-text-search",
-                    "form_8k": "https://api.sec-api.io/form-8k",
-                    "insider_trading": "https://api.sec-api.io/insider-trading",
-                    "sec_litigation_releases": "https://api.sec-api.io/sec-litigation-releases",
-                },
-            },
-        )
-
-        def _side_effect(*args, **kwargs):
-            params = kwargs.get("params")
-            headers = kwargs.get("headers")
-            endpoint = kwargs.get("endpoint")
-            if endpoint == "https://api.sec-api.io" and headers and headers.get("Authorization") == "sec-key":
-                raise _http_error(403, json.dumps(_fixture_json("sec_api", "actual_invalid_token")), url=endpoint)
-            if endpoint == "https://api.sec-api.io" and params == {"token": "sec-key"}:
-                return _fixture_json("sec_api", "actual_query_post_success")
-            if endpoint == "https://api.sec-api.io/full-text-search":
-                return _fixture_json("sec_api", "empty")
-            if endpoint == "https://api.sec-api.io/form-8k":
-                return _fixture_json("sec_api", "api_root")
-            if endpoint == "https://api.sec-api.io/insider-trading":
-                return _fixture_json("sec_api", "actual_insider_post_success")
-            if endpoint == "https://api.sec-api.io/sec-litigation-releases":
-                return _fixture_json("sec_api", "actual_litigation_post_empty")
-            raise AssertionError(f"unexpected call endpoint={endpoint} params={params} headers={headers}")
-
-        collector._request_json = Mock(side_effect=_side_effect)
-
-        result = collector.collect(Mock(), current_now=NOW)
-
-        first_call = collector._request_json.call_args_list[0].kwargs
-        fallback_call = collector._request_json.call_args_list[1].kwargs
-        self.assertEqual(first_call["method"], "POST")
-        self.assertEqual(first_call["headers"], {"Authorization": "sec-key"})
-        self.assertIsNone(first_call["params"])
-        self.assertEqual(fallback_call["params"], {"token": "sec-key"})
-        self.assertTrue(any("auth=token_query_param" in entry.note for entry in result.checked_source_log if entry.source_name == "sec_api"))
         self.assertTrue(any(finding.document_id == "0001764013-26-000015" for finding in result.findings))
-        self.assertTrue(any(finding.filing_type == "4" for finding in result.findings))
+        self.assertTrue(any(finding.insider_person == "Jane Doe" for finding in result.findings))
+        matched_filing = next(finding for finding in result.findings if finding.document_id == "0001764013-26-000015")
+        self.assertIn("best_effort_full_text_match", matched_filing.source_note or "")
+        self.assertTrue(any("auth_mode=apikey_query_param" in entry.note for entry in result.checked_source_log))
+        self.assertFalse(any(gap.gap_type == "limited_full_text_search" for gap in result.coverage_gaps))
+
+    def test_fmp_classifies_invalid_api_key_as_auth_invalid(self) -> None:
+        collector = FmpCollector(
+            self._settings(fmp_api_key="bad-key"),
+            {
+                "enabled": True,
+                "requires_api_key": True,
+                "endpoints": {
+                    "latest_sec_filings": "https://financialmodelingprep.com/stable/sec-filings-financials",
+                    "latest_8k": "https://financialmodelingprep.com/stable/sec-filings-8k",
+                    "filings_by_form_type": "https://financialmodelingprep.com/stable/sec-filings-search/form-type",
+                    "filings_by_symbol": "https://financialmodelingprep.com/stable/sec-filings-search/symbol",
+                    "filings_by_cik": "https://financialmodelingprep.com/stable/sec-filings-search/cik",
+                    "filings_by_name": "https://financialmodelingprep.com/stable/sec-filings-company-search/name",
+                    "company_search_by_symbol": "https://financialmodelingprep.com/stable/sec-filings-company-search/symbol",
+                    "company_search_by_cik": "https://financialmodelingprep.com/stable/sec-filings-company-search/cik",
+                    "insider_latest": "https://financialmodelingprep.com/stable/insider-trading/latest",
+                    "insider_search": "https://financialmodelingprep.com/stable/insider-trading/search",
+                },
+            },
+        )
+
+        def _raise_invalid(*args, **kwargs):
+            raise _http_error(403, '{"Error Message":"Invalid API KEY."}')
+
+        collector._request_json = Mock(side_effect=_raise_invalid)
+
+        result = collector.collect(Mock(), current_now=NOW)
+
+        self.assertTrue(any(entry.status == "auth_invalid" for entry in result.checked_source_log))
+        self.assertTrue(any(gap.gap_type == "auth_invalid" for gap in result.coverage_gaps))
+
+    def test_fmp_broad_8k_feed_does_not_use_immunovant_metadata_as_match(self) -> None:
+        collector = FmpCollector(
+            self._settings(),
+            {
+                "enabled": True,
+                "requires_api_key": True,
+                "endpoints": {
+                    "latest_8k": "https://financialmodelingprep.com/stable/sec-filings-8k",
+                    "filings_by_form_type": "https://financialmodelingprep.com/stable/sec-filings-search/form-type",
+                    "filings_by_cik": "https://financialmodelingprep.com/stable/sec-filings-search/cik",
+                },
+            },
+        )
+        unrelated_item = {
+            "companyName": "Acme Holdings, Inc.",
+            "symbol": "ACME",
+            "cik": "0000123456",
+            "formType": "8-K",
+            "description": "Entry into a Material Definitive Agreement",
+            "acceptedDate": "2026-03-28T22:15:00Z",
+            "accessionNumber": "0000123456-26-000001",
+            "finalLink": "https://www.sec.gov/Archives/edgar/data/123456/000012345626000001/acme-8k.htm",
+        }
+
+        broad_results = collector._parse_fmp_filing_items(
+            [unrelated_item],
+            endpoint_key="filings_by_form_type",
+            endpoint="https://financialmodelingprep.com/stable/sec-filings-search/form-type",
+            company_metadata={"entity": "Immunovant, Inc.", "symbol": "IMVT", "cik": "0001764013"},
+        )
+        company_specific_results = collector._parse_fmp_filing_items(
+            [
+                {
+                    "formType": "8-K",
+                    "acceptedDate": "2026-03-28T22:15:00Z",
+                    "accessionNumber": "0001764013-26-000015",
+                    "finalLink": "https://www.sec.gov/Archives/edgar/data/1764013/000176401326000015/imvt-20260328x8k.htm",
+                }
+            ],
+            endpoint_key="filings_by_cik",
+            endpoint="https://financialmodelingprep.com/stable/sec-filings-search/cik",
+            company_metadata={"entity": "Immunovant, Inc.", "symbol": "IMVT", "cik": "0001764013"},
+        )
+
+        self.assertEqual(broad_results, [])
+        self.assertEqual(len(company_specific_results), 1)
+        self.assertEqual(company_specific_results[0].entity, "Immunovant")
+
+    def test_sec_official_parses_relevant_litigation_release(self) -> None:
+        collector = SecOfficialCollector(
+            self._settings(),
+            {
+                "enabled": True,
+                "endpoints": {
+                    "litigation_releases": "https://www.sec.gov/enforcement-litigation/litigation-releases",
+                },
+            },
+        )
+        collector._request_sec_text = Mock(
+            return_value="""
+            <html><body>
+            <p>Mar. 28, 2026</p>
+            <a href="/litigation/litreleases/2026/lr26499.htm">Immunovant, Inc.</a>
+            <p>Release No. LR-26499</p>
+            <p>See Also: <a href="/litigation/complaints/2026/comp-pr2026-1.pdf">SEC Complaint</a></p>
+            </body></html>
+            """
+        )
+
+        result = collector.collect(Mock(), current_now=NOW)
+
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].document_type, "sec_litigation_release")
+        self.assertEqual(result.findings[0].document_id, "LR-26499")
+        self.assertEqual(result.checked_source_log[0].status, "checked")
+
+    def test_sec_official_records_low_gap_when_no_relevant_release_exists(self) -> None:
+        collector = SecOfficialCollector(
+            self._settings(),
+            {
+                "enabled": True,
+                "endpoints": {
+                    "litigation_releases": "https://www.sec.gov/enforcement-litigation/litigation-releases",
+                },
+            },
+        )
+        collector._request_sec_text = Mock(
+            return_value="""
+            <html><body>
+            <p>Mar. 28, 2026</p>
+            <a href="/litigation/litreleases/2026/lr26498.htm">Unrelated Respondent</a>
+            <p>Release No. LR-26498</p>
+            </body></html>
+            """
+        )
+
+        result = collector.collect(Mock(), current_now=NOW)
+
+        self.assertEqual(len(result.findings), 0)
+        self.assertTrue(any(gap.gap_type == "no_relevant_match" and gap.severity == "low" for gap in result.coverage_gaps))
+
+    def test_sec_official_appends_fair_access_note_on_rate_limit(self) -> None:
+        collector = SecOfficialCollector(
+            self._settings(),
+            {
+                "enabled": True,
+                "endpoints": {
+                    "litigation_releases": "https://www.sec.gov/enforcement-litigation/litigation-releases",
+                },
+            },
+        )
+        collector._request_sec_text = Mock(side_effect=_http_error(429, "Too many requests", url="https://www.sec.gov/test"))
+
+        result = collector.collect(Mock(), current_now=NOW)
+
+        self.assertTrue(any("fair access" in gap.detail.lower() for gap in result.coverage_gaps))
 
     def test_opendart_parses_zip_xml_fixture(self) -> None:
         collector = OpenDartCollector(
@@ -943,6 +1051,51 @@ class HanallPageCheckPromotionTest(unittest.TestCase):
         self.assertEqual(second.findings[0].last_update_posted, "2026-03-29")
         self.assertIn("recruitment_status", second.findings[0].changed_fields)
         self.assertIn("enrollment", second.findings[0].changed_fields)
+
+    def test_title_only_generic_page_update_is_suppressed_and_title_change_is_stored(self) -> None:
+        first_check = datetime(2026, 3, 29, 9, 0, tzinfo=NOW.tzinfo)
+        second_check = datetime(2026, 3, 29, 12, 0, tzinfo=NOW.tzinfo)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_db(str(Path(temp_dir) / "page-checks.db"))
+            first = self._collect_page_check(
+                html_name="generic_page_update_v1",
+                source_name="generic_page_updates",
+                source_group="competitor_official",
+                entity="Amgen",
+                checked_at=first_check,
+                url="https://example.com/company-updates",
+            )
+            second = self._collect_page_check(
+                html_name="generic_page_update_v2",
+                source_name="generic_page_updates",
+                source_group="competitor_official",
+                entity="Amgen",
+                checked_at=second_check,
+                url="https://example.com/company-updates",
+            )
+            page_row = get_page_observation(
+                source_name="generic_page_updates",
+                page_name="generic_page_updates",
+                item_url="https://example.com/about/fcrn",
+            )
+
+        self.assertEqual(len(first.findings), 1)
+        self.assertEqual(first.page_items[0].freshness_state, "new_item")
+        self.assertEqual(second.page_items[0].freshness_state, "substantive_update")
+        self.assertEqual(second.page_items[0].changed_fields, ["title"])
+        self.assertEqual(second.findings, [])
+        self.assertEqual(
+            second.page_items[0].raw_snapshot.get("title_change"),
+            {
+                "before": "FcRn Overview",
+                "after": "Corporate Overview",
+                "observed_at_kst": "2026-03-29 12:00 KST",
+            },
+        )
+        self.assertIsNotNone(page_row)
+        self.assertEqual(page_row["item_title"], "Corporate Overview")
+        self.assertEqual(page_row["previous_item_title"], "FcRn Overview")
+        self.assertEqual(page_row["title_change_observed_at_kst"], "2026-03-29 12:00 KST")
 
     def test_krx_detail_followup_populates_structured_fields_and_changed_fields(self) -> None:
         first_check = datetime(2026, 3, 29, 9, 0, tzinfo=NOW.tzinfo)

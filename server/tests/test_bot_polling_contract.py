@@ -25,6 +25,11 @@ class BotPollingContractTest(unittest.TestCase):
         self.assertNotIn("socket push is active", self.bot_text)
         self.assertNotIn("deliveryMode: socket", self.bot_text)
 
+    def test_bot_script_keeps_polling_item_diagnostics(self) -> None:
+        self.assertIn("function buildPollingItemDebugInfo(item, messages)", self.bot_text)
+        self.assertIn("polling item exception trigger=", self.bot_text)
+        self.assertIn("json_parse_error=", self.bot_text)
+
 
 if __name__ == "__main__":
     unittest.main()

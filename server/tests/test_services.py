@@ -74,10 +74,13 @@ from server.core.hanall_news_models import (
 )
 from server.infra.hanall_news_collectors import MfdsCollector, _dedupe_findings, collect_hanall_official_findings
 from server.infra.llm_clients import call_gemini_text, call_openai_text
+from server.infra import sqlite_store
 from server.infra.sqlite_store import (
     ack_outbox_messages,
     count_outbox_messages,
+    get_hanall_brief_snapshot,
     init_db,
+    list_polling_heartbeats,
     list_stage2_finding_provenance,
     list_stage2_search_evidence,
     list_stage2_verification_runs,
@@ -85,6 +88,7 @@ from server.infra.sqlite_store import (
     list_scheduler_events,
     pull_pending_outbox_messages,
     finalize_stage2_verification_run,
+    record_polling_heartbeat,
     record_scheduler_event,
     record_stage2_verification_run_start,
     register_admin_alert_attempt,
@@ -482,6 +486,38 @@ class HanallDedupeTest(unittest.TestCase):
 
         self.assertEqual(len(deduped), 2)
 
+    def test_dedupe_merges_cross_source_sec_filing_by_accession(self) -> None:
+        findings = [
+            RawFinding(
+                source_family="fmp",
+                source_name="fmp",
+                entity="Immunovant",
+                category="company_direct",
+                title="Immunovant 8-K",
+                document_id="0001764013-26-000015",
+                filing_type="8-K",
+                primary_source_url="https://www.sec.gov/Archives/edgar/data/1764013/000176401326000015/imvt-20260328x8k.htm",
+                source_note="endpoint=latest_sec_filings",
+                raw_payload={"_best_effort_full_text_match_terms": ["immunovant"]},
+            ),
+            RawFinding(
+                source_family="sec",
+                source_name="sec_official",
+                entity="Immunovant",
+                category="company_direct",
+                title="Immunovant 8-K",
+                document_id="000176401326000015",
+                primary_source_url="https://www.sec.gov/Archives/edgar/data/1764013/000176401326000015/imvt-20260328x8k.htm",
+                summary="best-effort full-text match terms: immunovant",
+                raw_payload={},
+            ),
+        ]
+
+        deduped = _dedupe_findings(findings)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertIn("best-effort full-text match terms", deduped[0].summary or "")
+
 
 class HanallStage1OverlayMergeTest(unittest.TestCase):
     @staticmethod
@@ -586,6 +622,15 @@ class HanallStage1OverlayMergeTest(unittest.TestCase):
 
 
 class BuildHanallNewsBriefTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._original_db_path = sqlite_store._DB_PATH
+        init_db(str(Path(self._temp_dir.name) / "hanall-brief-cache.db"))
+
+    def tearDown(self) -> None:
+        sqlite_store._DB_PATH = self._original_db_path
+        self._temp_dir.cleanup()
+
     @staticmethod
     def _build_pipeline_result(raw_text: str) -> HanallNewsPipelineResult:
         return HanallNewsPipelineResult(
@@ -738,7 +783,15 @@ Omission Audit
                     status="checked",
                     checked_at_kst="2026-03-26 09:00 KST",
                     note="items=1",
-                )
+                ),
+                CheckedSourceLogEntry(
+                    source_family="fmp",
+                    source_name="fmp",
+                    source_group="regulator_disclosure",
+                    status="request_error",
+                    checked_at_kst="2026-03-26 09:00 KST",
+                    note="timeout",
+                ),
             ],
             unverified_leads=[
                 StageFinding(
@@ -819,6 +872,34 @@ Omission Audit
         self.assertTrue(_final_text_has_required_sections(result))
 
     @patch("server.application.news.run_hanall_news_pipeline")
+    def test_reuses_same_day_cached_brief_without_rerunning_pipeline(self, mocked_pipeline) -> None:
+        mocked_pipeline.return_value = self._build_pipeline_result(self._build_valid_hanall_text())
+
+        first = build_hanall_news_brief()
+        second = build_hanall_news_brief()
+        cached = get_hanall_brief_snapshot(cache_date_kst=now_kst().strftime("%Y-%m-%d"))
+
+        self.assertEqual(first, second)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["detailed_text"], first)
+        mocked_pipeline.assert_called_once()
+
+    @patch("server.application.news.run_hanall_news_pipeline")
+    def test_cached_public_snapshot_is_reused_for_admin_and_public_variants(self, mocked_pipeline) -> None:
+        mocked_pipeline.return_value = self._build_public_pipeline_result()
+
+        public_result = build_hanall_news_brief(room_key="stock_openchat_news")
+        admin_result = build_hanall_news_brief(room_key="admin_test_room")
+        cached = get_hanall_brief_snapshot(cache_date_kst=now_kst().strftime("%Y-%m-%d"))
+
+        self.assertTrue(_public_text_has_required_sections(public_result))
+        self.assertIn("Primary source:", admin_result)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["public_text"], public_result)
+        self.assertEqual(cached["detailed_text"], admin_result)
+        mocked_pipeline.assert_called_once()
+
+    @patch("server.application.news.run_hanall_news_pipeline")
     def test_returns_reader_friendly_public_brief_for_non_admin_room(self, mocked_pipeline) -> None:
         mocked_pipeline.return_value = self._build_public_pipeline_result()
 
@@ -831,7 +912,6 @@ Omission Audit
         self.assertIn("🧭 경쟁사 관련 업데이트", result)
         self.assertIn("🗺 경쟁 구도 한눈에 보기", result)
         self.assertIn("🔎 확인한 자료", result)
-        self.assertIn("⚠ 추가 확인이 필요한 단서", result)
         self.assertIn("1. 기준:", result)
         self.assertIn("2. 범위:", result)
         self.assertIn("3. 커버리지:", result)
@@ -847,7 +927,10 @@ Omission Audit
         self.assertIn("핵심 내용:", result)
         self.assertIn("원문 링크:", result)
         self.assertIn("확인 근거: 공식 자료 재확인", result)
-        self.assertIn("아직 확정하지 못한 이유:", result)
+        self.assertNotIn("⚠ 추가 확인이 필요한 단서", result)
+        self.assertNotIn("아직 확정하지 못한 이유:", result)
+        self.assertNotIn("추가 확인 필요", result)
+        self.assertNotIn("연결 오류", result)
         self.assertNotIn("Coverage Gaps", result)
         self.assertNotIn("Omission Audit", result)
         self.assertNotIn("검증 메모", result)
@@ -887,6 +970,7 @@ Omission Audit
         self.assertIn("Coverage Gaps", detailed_message)
         self.assertIn("Omission Audit", detailed_message)
         self.assertIn("검증 메모", detailed_message)
+        self.assertIn("Unverified Leads", detailed_message)
 
     @patch("server.application.news.run_hanall_news_pipeline")
     def test_strips_code_fence_wrapper(self, mocked_pipeline) -> None:
@@ -3686,6 +3770,75 @@ class SchedulerEventStoreTest(unittest.TestCase):
             self.assertEqual(result["meta"]["scheduler_recent_events"][0]["event_type"], "started")
             self.assertEqual(result["meta"]["socket_transport"]["status"], "inactive")
 
+    def test_record_polling_heartbeat_persists_recent_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "polling.db"
+            init_db(str(db_path))
+
+            record_polling_heartbeat(
+                "pull",
+                trace_id="trace-pull-1",
+                checked_at="2026-04-03T08:15:10+09:00",
+                meta={"ok": True, "count": 1},
+            )
+            record_polling_heartbeat(
+                "ack",
+                trace_id="trace-ack-1",
+                checked_at="2026-04-03T08:15:11+09:00",
+                meta={"ok": True, "updated_count": 1},
+            )
+
+            recent = list_polling_heartbeats(10)
+            recent_pull = list_polling_heartbeats(1, "pull")
+
+            self.assertEqual(len(recent), 2)
+            self.assertEqual(recent[0]["event_type"], "ack")
+            self.assertEqual(recent[1]["event_type"], "pull")
+            self.assertEqual(recent_pull[0]["trace_id"], "trace-pull-1")
+
+    def test_runtime_health_includes_recent_polling_heartbeats_and_stale_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "polling.db"
+            init_db(str(db_path))
+            reset_polling_status()
+            record_polling_heartbeat(
+                "pull",
+                trace_id="trace-pull-1",
+                checked_at="2026-04-03T08:15:10+09:00",
+                meta={"ok": True, "count": 1},
+            )
+            record_polling_heartbeat(
+                "ack",
+                trace_id="trace-ack-1",
+                checked_at="2026-04-03T08:15:11+09:00",
+                meta={"ok": True, "updated_count": 1},
+            )
+
+            settings = SimpleNamespace(
+                app_env="test",
+                timezone="Asia/Seoul",
+                api_base_path="/kakao",
+                api_base_url="http://127.0.0.1:8000/kakao",
+                scheduler_recent_misfire_grace_seconds=900,
+                socket=SimpleNamespace(enabled=False),
+            )
+            use_case = RuntimeHealthUseCase(
+                settings_provider=lambda: settings,
+                scheduler_event_lister=list_scheduler_events,
+                polling_heartbeat_lister=list_polling_heartbeats,
+                trace_id_factory=lambda: "trace-health",
+                now_factory=lambda: datetime(2026, 4, 3, 8, 17, 0, tzinfo=now_kst().tzinfo),
+            )
+
+            result = use_case.build_health(None)
+
+            self.assertEqual(result["meta"]["last_observed_pull_at"], "2026-04-03T08:15:10+09:00")
+            self.assertEqual(result["meta"]["last_pull_age_seconds"], 110)
+            self.assertTrue(result["meta"]["polling_stale"])
+            self.assertEqual(result["meta"]["polling_stale_threshold_seconds"], 60)
+            self.assertEqual(len(result["meta"]["recent_polling_heartbeats"]), 2)
+            self.assertEqual(result["meta"]["recent_polling_heartbeats"][0]["event_type"], "ack")
+
     def test_room_target_warning_logs_empty_channel_id_risks(self) -> None:
         rooms = {
             "stock_openchat_alpha": SimpleNamespace(
@@ -3866,6 +4019,16 @@ class HanallSqliteMigrationGuardTest(unittest.TestCase):
                     item_url="https://www.immunovant.com/presentations/deck",
                     item_identity_key="presentation:deck-20260330",
                 )
+                sqlite_store.persist_hanall_brief_snapshot(
+                    cache_date_kst="2026-03-30",
+                    source_room_key="stock_openchat_news",
+                    trace_id="trace-old-schema",
+                    created_at_kst="2026-03-30 09:15 KST",
+                    public_text="[한올/Immunovant 24시간 브리핑]\npublic",
+                    detailed_text="[한올/Immunovant 24시간 브리핑]\ndetailed",
+                    raw_output_text="raw snapshot",
+                )
+                brief_snapshot = sqlite_store.get_hanall_brief_snapshot(cache_date_kst="2026-03-30")
                 sqlite_store.record_competitor_universe_observation(
                     competitor="argenx",
                     asset="efgartigimod",
@@ -3894,6 +4057,12 @@ class HanallSqliteMigrationGuardTest(unittest.TestCase):
         self.assertEqual(run_rows[0]["reused_evidence_count"], 1)
         self.assertEqual(page_row["item_identity_key"], "presentation:deck-20260330")
         self.assertEqual(page_row["structured_payload"]["item_type"], "presentation")
+        self.assertIsNone(page_row["previous_item_title"])
+        self.assertIsNone(page_row["title_change_observed_at_kst"])
+        self.assertIsNotNone(brief_snapshot)
+        self.assertEqual(brief_snapshot["cache_date_kst"], "2026-03-30")
+        self.assertEqual(brief_snapshot["source_room_key"], "stock_openchat_news")
+        self.assertEqual(brief_snapshot["raw_output_text"], "raw snapshot")
         self.assertEqual(competitor_rows[0]["aliases"], ["Vyvgart"])
         self.assertEqual(competitor_rows[0]["layer"], "direct_class")
 

@@ -12,8 +12,11 @@ from server.scheduler import (
     JOB_BUILDERS,
     _build_scheduler_job_id,
     _deliver_job_message,
+    _deliver_job_message_for_slot,
     _deliver_recently_due_jobs,
+    _deliver_scheduled_job,
     _iter_room_job_specs,
+    _resolve_recent_schedule_slot,
     _sync_room_jobs,
     register_jobs,
 )
@@ -137,7 +140,7 @@ class SchedulerCatchUpTest(unittest.TestCase):
 
         with (
             patch("server.scheduler._iter_room_job_specs", return_value=[spec]),
-            patch("server.scheduler._deliver_job_message") as mocked_deliver,
+            patch("server.scheduler._deliver_job_message_for_slot") as mocked_deliver,
             patch("server.scheduler._safe_record_scheduler_event") as mocked_record,
         ):
             delivered = _deliver_recently_due_jobs(
@@ -147,7 +150,10 @@ class SchedulerCatchUpTest(unittest.TestCase):
             )
 
         self.assertEqual(delivered, ["room-alpha:family_morning_brief:1:1"])
-        mocked_deliver.assert_called_once_with("family_morning_brief", "room-alpha", builder)
+        mocked_deliver.assert_called_once()
+        self.assertEqual(mocked_deliver.call_args.args[:3], ("family_morning_brief", "room-alpha", builder))
+        self.assertEqual(mocked_deliver.call_args.kwargs["scheduled_for"], datetime(2026, 3, 29, 8, 10, tzinfo=ZoneInfo("Asia/Seoul")))
+        self.assertEqual(mocked_deliver.call_args.kwargs["dedupe_ttl_seconds"], 900)
         mocked_record.assert_called_once()
         self.assertEqual(mocked_record.call_args.args[0], "catch_up_delivered")
         self.assertEqual(mocked_record.call_args.kwargs["meta"]["grace_seconds"], 900)
@@ -178,6 +184,16 @@ class SchedulerCatchUpTest(unittest.TestCase):
         self.assertEqual(delivered, [])
         mocked_deliver.assert_not_called()
         mocked_record.assert_not_called()
+
+    def test_resolve_recent_schedule_slot_returns_original_slot(self) -> None:
+        resolved = _resolve_recent_schedule_slot(
+            {"hour": 13, "minute": 41},
+            "Asia/Seoul",
+            current_now=datetime(2026, 4, 2, 13, 43, 47, tzinfo=ZoneInfo("Asia/Seoul")),
+            lookback_seconds=900,
+        )
+
+        self.assertEqual(resolved, datetime(2026, 4, 2, 13, 41, tzinfo=ZoneInfo("Asia/Seoul")))
 
 
 class SchedulerJobRegistrationTest(unittest.TestCase):
@@ -259,6 +275,66 @@ class SchedulerDeliveryResultTest(unittest.TestCase):
 
         mocked_record.assert_called_once()
         self.assertEqual(mocked_record.call_args.args[1], "queued")
+
+    def test_deliver_job_message_for_slot_uses_slot_based_dedupe_key_and_extended_ttl(self) -> None:
+        scheduled_for = datetime(2026, 4, 2, 13, 41, tzinfo=ZoneInfo("Asia/Seoul"))
+        with (
+            patch("server.scheduler.deliver_room_messages") as mocked_deliver,
+            patch("server.scheduler.record_job_run") as mocked_record,
+        ):
+            mocked_deliver.return_value = {
+                "ok": True,
+                "transport": "polling",
+                "via": "polling_outbox",
+                "queued": True,
+                "delivered": False,
+                "outbox_ids": [11],
+                "error": None,
+            }
+
+            _deliver_job_message_for_slot(
+                "hanall_news_brief",
+                "openchat_test",
+                lambda room_key: "brief",
+                scheduled_for=scheduled_for,
+                dedupe_ttl_seconds=900,
+            )
+
+        mocked_deliver.assert_called_once()
+        self.assertEqual(
+            mocked_deliver.call_args.kwargs["dedupe_key"],
+            "schedule:openchat_test:hanall_news_brief:202604021341",
+        )
+        self.assertEqual(mocked_deliver.call_args.kwargs["dedupe_ttl_seconds_override"], 960)
+        self.assertEqual(
+            mocked_deliver.call_args.kwargs["meta"]["scheduled_for"],
+            "2026-04-02T13:41:00+09:00",
+        )
+        mocked_record.assert_called_once()
+
+    def test_deliver_scheduled_job_uses_recent_schedule_slot_not_current_minute(self) -> None:
+        spec = SimpleNamespace(
+            room_key="openchat_test",
+            job_name="hanall_news_brief",
+            job_index=2,
+            builder=Mock(return_value="brief"),
+            trigger={"hour": 13, "minute": 41},
+            trigger_index=1,
+        )
+        with patch("server.scheduler._deliver_job_message_for_slot") as mocked_deliver:
+            _deliver_scheduled_job(
+                spec,
+                "Asia/Seoul",
+                900,
+                current_now=datetime(2026, 4, 2, 13, 43, 47, tzinfo=ZoneInfo("Asia/Seoul")),
+            )
+
+        mocked_deliver.assert_called_once()
+        self.assertEqual(
+            mocked_deliver.call_args.kwargs["scheduled_for"],
+            datetime(2026, 4, 2, 13, 41, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+        self.assertEqual(mocked_deliver.call_args.kwargs["dedupe_ttl_seconds"], 900)
 
     def test_deliver_job_message_records_dedupe_skip_as_skipped(self) -> None:
         with (

@@ -137,6 +137,8 @@ STAGE1_ITEM_ALIAS_MAPS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 SOURCE_FAMILY_FALLBACKS = {
     "sec_api": "sec",
+    "sec_official": "sec",
+    "fmp": "fmp",
     "opendart": "opendart",
     "openfda": "openfda",
     "clinicaltrials": "clinicaltrials",
@@ -150,6 +152,7 @@ SOURCE_FAMILY_FALLBACKS = {
 }
 SOURCE_GROUP_FALLBACKS = {
     "sec": "regulator_disclosure",
+    "fmp": "regulator_disclosure",
     "opendart": "regulator_disclosure",
     "openfda": "regulator_disclosure",
     "mfds": "regulator_disclosure",
@@ -1398,7 +1401,9 @@ def _friendly_source_name(source_family: str | None, source_name: str | None) ->
     mapping = {
         "clinicaltrials": "ClinicalTrials.gov",
         "sec_api": "SEC 공시",
+        "sec_official": "SEC 공시",
         "sec": "SEC 공시",
+        "fmp": "FMP SEC 공시",
         "opendart": "OpenDART",
         "openfda": "openFDA",
         "cris": "CRIS",

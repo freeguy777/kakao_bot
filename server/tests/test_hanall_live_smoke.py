@@ -64,8 +64,11 @@ class HanallLiveCollectorSmokeTest(unittest.TestCase):
             f"SMOKE source={source_key} findings={len(result.findings)} statuses={status_summary} auth_modes={auth_mode_summary} gaps={gap_summary}"
         )
 
-    def test_sec_api(self) -> None:
-        self._run_source("sec_api")
+    def test_fmp(self) -> None:
+        self._run_source("fmp")
+
+    def test_sec_official(self) -> None:
+        self._run_source("sec_official")
 
     def test_opendart(self) -> None:
         self._run_source("opendart")
