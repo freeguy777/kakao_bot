@@ -1,0 +1,451 @@
+/*
+  MessengerBotR API2 gateway bot
+  - Message event docs: https://violetxf.gitbook.io/messengerbot/api2/event
+  - Database docs: https://violetxf.gitbook.io/messengerbot/api2/database
+  - Socket communication note: https://violetxf.gitbook.io/messengerbot/tips/socket-communication
+
+  Notes:
+  - Inbound path remains: Kakao event -> bot_gateway -> FastAPI webhook.
+  - Outbound control messages arrive through MessengerBot's built-in socket debugRoom transport.
+  - This script must not open its own socket port.
+*/
+
+var GATEWAY_CONFIG = {
+  webhookUrl: "http://192.168.0.10:8000/kakao/webhook",
+  botSecret: "8d3f6c1b9e4a7f2d5c8b1e6a3f9d4c7e",
+  socketToken: "2f7a9d4c6e1b8f3d5a0c7e9b4d1f6a2c",
+  controlAuthorName: "__FASTAPI__",
+  controlRoomName: "__MB_SOCKET_CONTROL__",
+  adminRoomName: "김휘태",
+  packageName: "com.kakao.talk",
+  dedupeFile: "gateway_message_ids.json",
+  dedupeLimit: 500,
+  pendingQueueFile: "gateway_pending_events.json",
+  pendingQueueLimit: 200,
+  webhookRetryCount: 3,
+  webhookRetryBaseDelayMs: 1500,
+  pendingFlushBatchSize: 20,
+  pendingFlushIntervalMs: 30000
+};
+
+var bot = BotManager.getCurrentBot();
+var pendingFlushThread = null;
+var pendingFlushWorkerToken = 0;
+var gson = new com.google.gson.Gson();
+var gatewayReady = false;
+
+function log(message) {
+  java.lang.System.out.println("[bot_gateway] " + message);
+}
+
+function validateGatewayConfig() {
+  if (!GATEWAY_CONFIG.botSecret || GATEWAY_CONFIG.botSecret === "change-me") {
+    throw new Error("GATEWAY_CONFIG.botSecret must be replaced before startup");
+  }
+  if (!GATEWAY_CONFIG.socketToken || GATEWAY_CONFIG.socketToken === "change-me-too") {
+    throw new Error("GATEWAY_CONFIG.socketToken must be replaced before startup");
+  }
+  if (!GATEWAY_CONFIG.adminRoomName || GATEWAY_CONFIG.adminRoomName === "change-me-admin-room") {
+    throw new Error("GATEWAY_CONFIG.adminRoomName must be replaced before startup");
+  }
+  if (!GATEWAY_CONFIG.controlAuthorName) {
+    throw new Error("GATEWAY_CONFIG.controlAuthorName must not be empty");
+  }
+  if (!GATEWAY_CONFIG.controlRoomName) {
+    throw new Error("GATEWAY_CONFIG.controlRoomName must not be empty");
+  }
+}
+
+function nowIsoString() {
+  var format = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX");
+  format.setTimeZone(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+  return format.format(new java.util.Date());
+}
+
+function nowMillis() {
+  return new java.util.Date().getTime();
+}
+
+function sleepMs(ms) {
+  java.lang.Thread.sleep(ms);
+}
+
+function readObjectFile(path, emptyValue) {
+  if (!Database.exists(path)) {
+    return emptyValue;
+  }
+  var payload = Database.readObject(path);
+  return payload == null ? emptyValue : payload;
+}
+
+function writeObjectFile(path, payload) {
+  Database.writeObject(path, payload);
+}
+
+function loadProcessedIds() {
+  var payload = readObjectFile(GATEWAY_CONFIG.dedupeFile, { ids: {} });
+  if (payload.ids == null) {
+    return {};
+  }
+  return payload.ids;
+}
+
+function saveProcessedIds(ids) {
+  var keys = Object.keys(ids);
+  if (keys.length > GATEWAY_CONFIG.dedupeLimit) {
+    keys.sort(function(a, b) {
+      return ids[b] - ids[a];
+    });
+    var trimmed = {};
+    for (var i = 0; i < GATEWAY_CONFIG.dedupeLimit; i++) {
+      trimmed[keys[i]] = ids[keys[i]];
+    }
+    ids = trimmed;
+  }
+  writeObjectFile(GATEWAY_CONFIG.dedupeFile, { ids: ids });
+}
+
+function hasProcessedMessage(messageId) {
+  var ids = loadProcessedIds();
+  return ids[String(messageId)] != null;
+}
+
+function rememberMessage(messageId) {
+  var ids = loadProcessedIds();
+  ids[String(messageId)] = nowMillis();
+  saveProcessedIds(ids);
+}
+
+function buildFallbackLogId(message) {
+  var stableTimestamp = "";
+  if (message.timestamp != null) stableTimestamp = String(message.timestamp);
+  else if (message.time != null) stableTimestamp = String(message.time);
+  else if (message.createdAt != null) stableTimestamp = String(message.createdAt);
+
+  var seed = [
+    String(message.room || ""),
+    String(message.content || ""),
+    String(message.packageName || ""),
+    message.author ? String(message.author.name || "") : "",
+    stableTimestamp
+  ].join("|");
+  return Security.sha256(seed);
+}
+
+function extractLogId(message) {
+  if (message.logId != null) {
+    return String(message.logId);
+  }
+  return buildFallbackLogId(message);
+}
+
+function loadPendingEvents() {
+  var payload = readObjectFile(GATEWAY_CONFIG.pendingQueueFile, { events: [] });
+  if (payload.events == null) {
+    return [];
+  }
+  return payload.events;
+}
+
+function savePendingEvents(events) {
+  if (events.length > GATEWAY_CONFIG.pendingQueueLimit) {
+    events.sort(function(a, b) {
+      return Number(a.enqueued_at || 0) - Number(b.enqueued_at || 0);
+    });
+    events = events.slice(events.length - GATEWAY_CONFIG.pendingQueueLimit);
+  }
+  writeObjectFile(GATEWAY_CONFIG.pendingQueueFile, { events: events });
+}
+
+function upsertPendingEvent(payload, errorText) {
+  var events = loadPendingEvents();
+  var logId = String(payload.logId || "");
+  var updated = false;
+  for (var i = 0; i < events.length; i++) {
+    if (String(events[i].payload.logId || "") === logId) {
+      events[i].retry_count = Number(events[i].retry_count || 0) + 1;
+      events[i].last_error = String(errorText || "");
+      events[i].next_attempt_at = nowMillis() + retryDelayMs(events[i].retry_count);
+      updated = true;
+      break;
+    }
+  }
+  if (!updated) {
+    events.push({
+      payload: payload,
+      retry_count: 0,
+      enqueued_at: nowMillis(),
+      next_attempt_at: nowMillis(),
+      last_error: String(errorText || "")
+    });
+  }
+  savePendingEvents(events);
+}
+
+function retryDelayMs(retryCount) {
+  var exponent = Math.min(Number(retryCount || 0), 5);
+  return GATEWAY_CONFIG.webhookRetryBaseDelayMs * Math.pow(2, exponent);
+}
+
+function postJson(urlText, payload, headers) {
+  var url = new java.net.URL(urlText);
+  var connection = url.openConnection();
+  connection.setRequestMethod("POST");
+  connection.setDoOutput(true);
+  connection.setConnectTimeout(5000);
+  connection.setReadTimeout(10000);
+  connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+  if (headers != null) {
+    for (var key in headers) {
+      connection.setRequestProperty(String(key), String(headers[key]));
+    }
+  }
+
+  var output = new java.io.OutputStreamWriter(connection.getOutputStream(), "UTF-8");
+  output.write(gson.toJson(payload));
+  output.flush();
+  output.close();
+
+  var code = connection.getResponseCode();
+  var stream = code >= 200 && code < 400 ? connection.getInputStream() : connection.getErrorStream();
+  var reader = new java.io.BufferedReader(new java.io.InputStreamReader(stream, "UTF-8"));
+  var responseBuilder = new java.lang.StringBuilder();
+  var line;
+  while ((line = reader.readLine()) != null) {
+    responseBuilder.append(line);
+  }
+  reader.close();
+  return { code: code, body: String(responseBuilder.toString()) };
+}
+
+function deliverInboundPayload(payload) {
+  var lastError = "";
+  for (var attempt = 0; attempt < GATEWAY_CONFIG.webhookRetryCount; attempt++) {
+    try {
+      var result = postJson(GATEWAY_CONFIG.webhookUrl, payload, {
+        "X-Bot-Secret": GATEWAY_CONFIG.botSecret
+      });
+      if (result.code >= 200 && result.code < 300) {
+        return { ok: true, error: "" };
+      }
+      lastError = "webhook failed: " + result.code + " " + result.body;
+      log(lastError);
+    } catch (error) {
+      lastError = "webhook exception: " + error;
+      log(lastError);
+    }
+    if (attempt + 1 < GATEWAY_CONFIG.webhookRetryCount) {
+      sleepMs(GATEWAY_CONFIG.webhookRetryBaseDelayMs * (attempt + 1));
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+function flushPendingEvents() {
+  var events = loadPendingEvents();
+  if (events.length === 0) {
+    return;
+  }
+  var remaining = [];
+  var processed = 0;
+  var currentMs = nowMillis();
+  for (var i = 0; i < events.length; i++) {
+    var entry = events[i];
+    if (processed >= GATEWAY_CONFIG.pendingFlushBatchSize) {
+      remaining.push(entry);
+      continue;
+    }
+    if (Number(entry.next_attempt_at || 0) > currentMs) {
+      remaining.push(entry);
+      continue;
+    }
+    processed += 1;
+    var result = deliverInboundPayload(entry.payload);
+    if (!result.ok) {
+      entry.retry_count = Number(entry.retry_count || 0) + 1;
+      entry.last_error = result.error;
+      entry.next_attempt_at = nowMillis() + retryDelayMs(entry.retry_count);
+      remaining.push(entry);
+    }
+  }
+  savePendingEvents(remaining);
+}
+
+function startPendingFlushWorker() {
+  if (!gatewayReady) {
+    log("gateway disabled: pending flush worker not started");
+    return;
+  }
+  if (pendingFlushThread != null) {
+    return;
+  }
+
+  pendingFlushWorkerToken += 1;
+  var workerToken = pendingFlushWorkerToken;
+  pendingFlushThread = new java.lang.Thread(new java.lang.Runnable({
+    run: function() {
+      log("pending flush worker started");
+      while (workerToken === pendingFlushWorkerToken) {
+        try {
+          flushPendingEvents();
+        } catch (error) {
+          log("pending flush worker error: " + error);
+        }
+        var sleepFor = Number(GATEWAY_CONFIG.pendingFlushIntervalMs || 30000);
+        while (workerToken === pendingFlushWorkerToken && sleepFor > 0) {
+          var step = Math.min(sleepFor, 1000);
+          sleepMs(step);
+          sleepFor -= step;
+        }
+      }
+      log("pending flush worker stopped");
+    }
+  }));
+  pendingFlushThread.start();
+}
+
+function stopPendingFlushWorker() {
+  if (pendingFlushThread == null) {
+    return;
+  }
+  pendingFlushWorkerToken += 1;
+  pendingFlushThread = null;
+}
+
+function sendAdminReport(text) {
+  try {
+    if (!bot.canReply(GATEWAY_CONFIG.adminRoomName, GATEWAY_CONFIG.packageName)) {
+      log("admin room is not replyable: " + text);
+      return;
+    }
+    bot.send(GATEWAY_CONFIG.adminRoomName, text, GATEWAY_CONFIG.packageName);
+  } catch (error) {
+    log("admin report failed: " + error + " / original=" + text);
+  }
+}
+
+function isControlMessage(message) {
+  if (message == null) {
+    return false;
+  }
+  if (message.isDebugRoom !== true) {
+    return false;
+  }
+  var authorName = message.author ? String(message.author.name || "") : "";
+  if (authorName !== String(GATEWAY_CONFIG.controlAuthorName || "")) {
+    return false;
+  }
+  return String(message.room || "") === String(GATEWAY_CONFIG.controlRoomName || "");
+}
+
+function handleControlMessage(message) {
+  if (!isControlMessage(message)) {
+    return false;
+  }
+
+  var content = String(message.content || "");
+  var command = null;
+  try {
+    command = JSON.parse(content);
+  } catch (error) {
+    sendAdminReport("[gateway][control] malformed JSON ignored: " + error);
+    return true;
+  }
+
+  if (String(command.token || "") !== GATEWAY_CONFIG.socketToken) {
+    sendAdminReport("[gateway][control] invalid token for message_id=" + String(command.message_id || ""));
+    return true;
+  }
+
+  if (String(command.type || "") !== "send_message") {
+    sendAdminReport("[gateway][control] unsupported type=" + String(command.type || ""));
+    return true;
+  }
+
+  var messageId = String(command.message_id || "");
+  if (!messageId) {
+    sendAdminReport("[gateway][control] missing message_id");
+    return true;
+  }
+
+  if (hasProcessedMessage(messageId)) {
+    log("duplicate control message ignored: " + messageId);
+    return true;
+  }
+
+  var roomName = String(command.target_room || "");
+  var text = String(command.text || "");
+  var packageName = String(command.package_name || GATEWAY_CONFIG.packageName);
+  if (!roomName || !text) {
+    sendAdminReport("[gateway][control] invalid payload for message_id=" + messageId);
+    return true;
+  }
+
+  try {
+    if (!bot.canReply(roomName, packageName)) {
+      sendAdminReport("[gateway][delivery] cannot reply to room=" + roomName + " message_id=" + messageId);
+      return true;
+    }
+
+    var success = bot.send(roomName, text, packageName);
+    if (!success) {
+      sendAdminReport("[gateway][delivery] bot.send returned false for room=" + roomName + " message_id=" + messageId);
+      return true;
+    }
+
+    rememberMessage(messageId);
+  } catch (error2) {
+    sendAdminReport("[gateway][delivery] exception for room=" + roomName + " message_id=" + messageId + ": " + String(error2));
+  }
+  return true;
+}
+
+function forwardInbound(message) {
+  if (!gatewayReady) {
+    log("gateway disabled: inbound forwarding skipped");
+    return;
+  }
+  flushPendingEvents();
+  var payload = {
+    room: String(message.room || ""),
+    content: String(message.content || ""),
+    logId: extractLogId(message),
+    packageName: String(message.packageName || GATEWAY_CONFIG.packageName),
+    author: {
+      name: message.author ? String(message.author.name || "") : null,
+      hash: null
+    },
+    client_received_at: nowIsoString()
+  };
+
+  var result = deliverInboundPayload(payload);
+  if (!result.ok) {
+    upsertPendingEvent(payload, result.error);
+  }
+}
+
+try {
+  bot.removeAllListeners(Event.MESSAGE);
+  bot.removeAllListeners(Event.START_COMPILE);
+} catch (ignore) {}
+
+bot.on(Event.MESSAGE, function(message) {
+  if (handleControlMessage(message)) {
+    return;
+  }
+  forwardInbound(message);
+});
+
+bot.on(Event.START_COMPILE, function() {
+  stopPendingFlushWorker();
+});
+
+try {
+  validateGatewayConfig();
+  gatewayReady = true;
+  flushPendingEvents();
+  startPendingFlushWorker();
+} catch (error) {
+  gatewayReady = false;
+  log("gateway startup blocked: " + error);
+}

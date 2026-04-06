@@ -1,0 +1,62 @@
+rooms:
+  - name: "한올바이오파마 주식 관련 카카오 오픈채팅방"
+    key: "hanall_openchat"
+    admin: false
+    package_name: "com.kakao.talk"
+    persona_path: "config/personas/room1.md"
+    features:
+      youtube_summary: true
+      llm_chat: true
+      hanall_briefing: true
+      weather: false
+      child_age: false
+      admin_commands: false
+    hanall_publish_time: "09:00"
+    weather:
+      enabled: false
+
+  - name: "테스트방방방"
+    key: "friends_room"
+    admin: false
+    package_name: "com.kakao.talk"
+    persona_path: "config/personas/room2.md"
+    features:
+      youtube_summary: true
+      llm_chat: true
+      hanall_briefing: false
+      weather: false
+      child_age: false
+      admin_commands: false
+    weather:
+      enabled: false
+
+  - name: "가족 카톡방"
+    key: "family_room"
+    admin: false
+    package_name: "com.kakao.talk"
+    persona_path: "config/personas/room3.md"
+    features:
+      youtube_summary: true
+      llm_chat: true
+      hanall_briefing: false
+      weather: true
+      child_age: true
+      admin_commands: false
+    weather:
+      enabled: true
+      location_label: "김해율하"
+      grid_x: 95
+      grid_y: 77
+      publish_time: "08:10"
+
+  - name: "김휘태"
+    key: "admin_room"
+    admin: true
+    package_name: "com.kakao.talk"
+    features:
+      youtube_summary: false
+      llm_chat: false
+      hanall_briefing: false
+      weather: false
+      child_age: false
+      admin_commands: true
