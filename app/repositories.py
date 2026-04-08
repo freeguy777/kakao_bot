@@ -62,6 +62,8 @@ class EventRepository:
                 return InboundEventClaim(duplicate=True, should_process=False, already_processed=False)
             if record.processing_status == constants.INBOUND_STATUS_PROCESSED:
                 return InboundEventClaim(duplicate=duplicate, should_process=False, already_processed=True)
+            if record.processing_status == constants.INBOUND_STATUS_PROCESSING:
+                return InboundEventClaim(duplicate=True, should_process=False, already_processed=False)
 
             record.processing_status = constants.INBOUND_STATUS_PROCESSING
             record.processing_started_at = now

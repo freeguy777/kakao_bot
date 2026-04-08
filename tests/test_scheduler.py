@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
 from datetime import date
+from pathlib import Path
 
+import yaml
+
+from app.router import RoomRegistry
 from app import constants
 from app.scheduler import SchedulerService
 from app.schemas import DeliveryResult
@@ -20,19 +25,21 @@ class FakeScheduledJobRepository:
 
 class FakeRoomRegistry:
     def __init__(self, room) -> None:
-        self._room = room
+        self._rooms = {room.name: room}
 
     def resolve_room(self, room_name: str):
-        return self._room if room_name == self._room.name else None
+        return self._rooms.get(room_name)
 
     def list_rooms(self):
-        return [self._room]
+        return list(self._rooms.values())
+
+    def reload_if_config_changed(self) -> bool:
+        return False
 
 
 class FakeRoom:
-    def __init__(self, *, name: str, key: str, package_name: str, hanall_publish_time: str | None, features: dict[str, bool], publish_time: str = "08:10") -> None:
+    def __init__(self, *, name: str, package_name: str, hanall_publish_time: str | None, features: dict[str, bool], publish_time: str = "08:10") -> None:
         self.name = name
-        self.key = key
         self.package_name = package_name
         self.hanall_publish_time = hanall_publish_time
         self.features = features
@@ -92,10 +99,52 @@ class FakeAdminNotifier:
         self.calls.append(kwargs)
 
 
+class FakeOverrideRepository:
+    def get_overrides(self, room_name: str) -> dict[str, bool]:
+        return {}
+
+
+def _write_rooms_config(path: Path, *, hanall_enabled: bool, hanall_publish_time: str | None) -> None:
+    payload = {
+        "rooms": [
+            {
+                "name": "테스트하는방방방",
+                "admin": False,
+                "package_name": "com.kakao.talk",
+                "features": {
+                    "youtube_summary": True,
+                    "llm_chat": True,
+                    "hanall_briefing": hanall_enabled,
+                    "weather": False,
+                    "child_age": False,
+                    "admin_commands": False,
+                },
+                "hanall_publish_time": hanall_publish_time,
+                "weather": {"enabled": False},
+            },
+            {
+                "name": "김휘태",
+                "admin": True,
+                "package_name": "com.kakao.talk",
+                "features": {
+                    "youtube_summary": False,
+                    "llm_chat": False,
+                    "hanall_briefing": False,
+                    "weather": False,
+                    "child_age": False,
+                    "admin_commands": True,
+                },
+            },
+        ]
+    }
+    path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    stat_result = path.stat()
+    os.utime(path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000))
+
+
 async def test_publish_hanall_marks_failed_when_public_delivery_fails(test_settings) -> None:
     room = FakeRoom(
         name="hanall_room",
-        key="hanall_openchat",
         package_name="com.kakao.talk",
         hanall_publish_time="09:00",
         features={"hanall_briefing": True},
@@ -121,7 +170,6 @@ async def test_publish_hanall_marks_failed_when_public_delivery_fails(test_setti
 async def test_publish_hanall_uses_existing_artifact_for_public_and_admin_delivery(test_settings) -> None:
     room = FakeRoom(
         name="hanall_room",
-        key="hanall_openchat",
         package_name="com.kakao.talk",
         hanall_publish_time="09:00",
         features={"hanall_briefing": True},
@@ -163,7 +211,6 @@ async def test_publish_hanall_uses_existing_artifact_for_public_and_admin_delive
 async def test_publish_hanall_fails_when_collect_artifact_is_missing(test_settings) -> None:
     room = FakeRoom(
         name="hanall_room",
-        key="hanall_openchat",
         package_name="com.kakao.talk",
         hanall_publish_time="09:00",
         features={"hanall_briefing": True},
@@ -195,7 +242,6 @@ async def test_publish_hanall_fails_when_collect_artifact_is_missing(test_settin
 async def test_publish_family_marks_failed_when_delivery_fails(test_settings) -> None:
     room = FakeRoom(
         name="family_room",
-        key="family_room",
         package_name="com.kakao.talk",
         hanall_publish_time=None,
         features={"weather": True, "child_age": True},
@@ -216,3 +262,44 @@ async def test_publish_family_marks_failed_when_delivery_fails(test_settings) ->
     await scheduler.publish_family_brief(room.name)
 
     assert any(status == constants.SCHEDULED_STATUS_FAILED for _, status, _ in scheduled_repo.records)
+
+
+async def test_scheduler_refreshes_room_jobs_when_rooms_config_changes(test_settings, tmp_path: Path) -> None:
+    rooms_path = tmp_path / "rooms.yaml"
+    _write_rooms_config(rooms_path, hanall_enabled=True, hanall_publish_time="09:00")
+    settings = test_settings.model_copy(
+        update={
+            "room_config_path": rooms_path,
+            "room_config_reload_interval_seconds": 60,
+        }
+    )
+    room_registry = RoomRegistry(settings, FakeOverrideRepository())
+    scheduler = SchedulerService(
+        settings=settings,
+        room_registry=room_registry,
+        delivery_service=FakeDeliveryService([]),
+        admin_notifier=FakeAdminNotifier(),
+        hanall_research_service=FakeHanallResearchService(),
+        family_brief_service=FakeFamilyBriefService(),
+        scheduled_job_repository=FakeScheduledJobRepository(),
+    )
+
+    scheduler.start()
+    try:
+        job = scheduler._scheduler.get_job("hanall_publish::테스트하는방방방")
+        assert job is not None
+        assert str(job.trigger) == "cron[hour='9', minute='0']"
+
+        _write_rooms_config(rooms_path, hanall_enabled=True, hanall_publish_time="17:04")
+        await scheduler.refresh_room_jobs_if_needed()
+
+        job = scheduler._scheduler.get_job("hanall_publish::테스트하는방방방")
+        assert job is not None
+        assert str(job.trigger) == "cron[hour='17', minute='4']"
+
+        _write_rooms_config(rooms_path, hanall_enabled=False, hanall_publish_time=None)
+        await scheduler.refresh_room_jobs_if_needed()
+
+        assert scheduler._scheduler.get_job("hanall_publish::테스트하는방방방") is None
+    finally:
+        scheduler.shutdown()

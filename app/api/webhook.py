@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
-from app.schemas import InboundWebhookPayload, NormalizedInboundEvent
+from app.schemas import InboundWebhookPayload, NormalizedInboundEvent, PollingAckRequest
 
 router = APIRouter(prefix="/kakao", tags=["kakao"])
 logger = logging.getLogger(__name__)
@@ -45,3 +46,35 @@ async def kakao_webhook(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="event routing failed") from exc
     request.app.state.event_repository.mark_processed(event.log_id)
     return {"status": "ok", "duplicate": claim.duplicate, "processed": True}
+
+
+@router.post("/polling/pull")
+async def polling_pull() -> dict[str, object]:
+    # Compatibility shim for older phone-side polling clients. This app's active
+    # delivery path is socket push, so we explicitly return an empty outbox.
+    return {
+        "ok": True,
+        "trace_id": str(uuid4()),
+        "action": "polling.outbox.pull",
+        "messages": [],
+        "error": None,
+        "meta": {
+            "count": 0,
+            "items": [],
+        },
+    }
+
+
+@router.post("/polling/ack")
+async def polling_ack(payload: PollingAckRequest) -> dict[str, object]:
+    return {
+        "ok": True,
+        "trace_id": str(uuid4()),
+        "action": "polling.outbox.ack",
+        "messages": ["처리 완료"],
+        "error": None,
+        "meta": {
+            "updated_count": len(payload.message_ids),
+            "success": payload.success,
+        },
+    }

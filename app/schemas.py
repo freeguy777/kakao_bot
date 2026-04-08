@@ -34,6 +34,12 @@ class NormalizedInboundEvent(BaseModel):
     server_received_at: datetime
 
 
+class PollingAckRequest(BaseModel):
+    message_ids: list[int] = Field(default_factory=list)
+    success: bool = True
+    increment_retry: bool | None = None
+
+
 class SocketControlCommand(BaseModel):
     type: Literal["send_message"] = "send_message"
     token: str
@@ -86,7 +92,6 @@ class RoomConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    key: str
     admin: bool = False
     package_name: str | None = None
     persona_path: Path | None = None
@@ -108,7 +113,6 @@ class RoomRegistryConfig(BaseModel):
 
 class EffectiveRoomConfig(BaseModel):
     name: str
-    key: str
     admin: bool
     package_name: str | None
     persona_path: Path | None

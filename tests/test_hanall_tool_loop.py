@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import httpx
+
 from app.services.hanall_research_service import HanallResearchService
 
 PUBLIC_BRIEF = "한올/IMVT 직접 업데이트 1건\n경쟁사 중요 업데이트 0건"
@@ -87,9 +89,11 @@ class FakeCompletions:
     def __init__(self):
         self.calls = 0
         self.received_messages = []
+        self.received_tools = []
 
     async def create(self, **kwargs: object):
         self.received_messages.append(kwargs["messages"])
+        self.received_tools.append(kwargs.get("tools"))
         self.calls += 1
         if self.calls == 1:
             return FakeResponse(
@@ -107,6 +111,89 @@ class FakeCompletions:
 class FakeClient:
     def __init__(self):
         self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+
+class ExhaustedLoopCompletions:
+    def __init__(self, final_text: str) -> None:
+        self._final_text = final_text
+        self.calls = 0
+        self.received_messages = []
+        self.received_tools = []
+
+    async def create(self, **kwargs: object):
+        self.calls += 1
+        self.received_messages.append(kwargs["messages"])
+        self.received_tools.append(kwargs.get("tools"))
+        if kwargs.get("tools") is None:
+            return FakeResponse("stop", FakeMessage(self._final_text))
+        return FakeResponse(
+            "tool_calls",
+            FakeMessage(None, [FakeToolCall(f"call_{self.calls}", "web_search", '{"query":"hanall biopharma"}')]),
+        )
+
+
+class ExhaustedLoopClient:
+    def __init__(self, final_text: str) -> None:
+        self.chat = type("Chat", (), {"completions": ExhaustedLoopCompletions(final_text)})()
+
+
+class WebSearchLimitedCompletions:
+    def __init__(self, final_text: str) -> None:
+        self._final_text = final_text
+        self.calls = 0
+        self.received_messages = []
+        self.received_tools = []
+
+    async def create(self, **kwargs: object):
+        self.calls += 1
+        self.received_messages.append(kwargs["messages"])
+        self.received_tools.append(kwargs.get("tools"))
+        if kwargs.get("tools") is None:
+            return FakeResponse("stop", FakeMessage(self._final_text))
+        return FakeResponse(
+            "tool_calls",
+            FakeMessage(None, [FakeToolCall(f"call_{self.calls}", "web_search", '{"query":"hanall biopharma"}')]),
+        )
+
+
+class WebSearchLimitedClient:
+    def __init__(self, final_text: str) -> None:
+        self.chat = type("Chat", (), {"completions": WebSearchLimitedCompletions(final_text)})()
+
+
+class FakeFiberResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+
+class RecordingHttpClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._payload = payload
+
+    async def post(self, url: str, headers: dict[str, str], json: dict[str, object]):
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        return FakeFiberResponse(self._payload)
+
+
+class FlakyHttpClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._payload = payload
+
+    async def post(self, url: str, headers: dict[str, str], json: dict[str, object]):
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        if len(self.calls) == 1:
+            request = httpx.Request("POST", url)
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("server error", request=request, response=response)
+        return FakeFiberResponse(self._payload)
 
 
 async def test_hanall_tool_loop_resolves_all_tool_calls(test_settings) -> None:
@@ -131,3 +218,120 @@ async def test_hanall_tool_loop_resolves_all_tool_calls(test_settings) -> None:
     second_round_messages = service._client.chat.completions.received_messages[1]
     assistant_context = next(message for message in second_round_messages if message.get("role") == "assistant")
     assert assistant_context["reasoning_content"] == "step-by-step reasoning"
+
+
+async def test_hanall_tool_loop_requests_final_render_without_tools_when_iterations_are_exhausted(test_settings) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = HanallResearchService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        artifact_repository=type("Repo", (), {"get_by_key": lambda *_: None, "save": lambda *args, **kwargs: args[1]})(),
+    )
+    test_settings.kimi_max_iterations = 2
+    service._client = ExhaustedLoopClient(final_text)
+    service._load_formula_tools = lambda: [{"type": "function", "function": {"name": "web_search"}}]
+
+    async def fake_resolve(tool_calls):
+        return [{"role": "tool", "tool_call_id": tool_calls[0].id, "content": "search result"}]
+
+    service._resolve_tool_calls = fake_resolve
+
+    artifact = await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    assert artifact.summary_text == PUBLIC_BRIEF
+    assert artifact.detail_text == ADMIN_REPORT.strip()
+    assert service._client.chat.completions.received_tools == [
+        [{"type": "function", "function": {"name": "web_search"}}],
+        [{"type": "function", "function": {"name": "web_search"}}],
+        None,
+    ]
+    final_request_messages = service._client.chat.completions.received_messages[-1]
+    assert final_request_messages[-1]["role"] == "user"
+    assert "추가 도구 호출을 중단" in final_request_messages[-1]["content"]
+
+
+async def test_hanall_tool_loop_limits_web_search_rounds_before_final_render(test_settings) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = HanallResearchService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        artifact_repository=type("Repo", (), {"get_by_key": lambda *_: None, "save": lambda *args, **kwargs: args[1]})(),
+    )
+    service._client = WebSearchLimitedClient(final_text)
+    service._load_formula_tools = lambda: [{"type": "function", "function": {"name": "web_search"}}]
+
+    resolve_calls = 0
+
+    async def fake_resolve(tool_calls):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return [{"role": "tool", "tool_call_id": tool_calls[0].id, "content": "search result"}]
+
+    service._resolve_tool_calls = fake_resolve
+
+    artifact = await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    assert artifact.summary_text == PUBLIC_BRIEF
+    assert resolve_calls == 2
+    assert service._client.chat.completions.received_tools == [
+        [{"type": "function", "function": {"name": "web_search"}}],
+        [{"type": "function", "function": {"name": "web_search"}}],
+        None,
+    ]
+    final_request_messages = service._client.chat.completions.received_messages[-1]
+    assert final_request_messages[-1]["role"] == "user"
+    previous_message = final_request_messages[-2]
+    assert previous_message["role"] == "tool"
+
+
+async def test_invoke_formula_wraps_tool_call_for_fiber_request(test_settings) -> None:
+    service = HanallResearchService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        artifact_repository=type("Repo", (), {"get_by_key": lambda *_: None, "save": lambda *args, **kwargs: args[1]})(),
+    )
+    service._tool_name_to_formula_uri["date"] = "moonshot/date:latest"
+    client = RecordingHttpClient({"context": {"output": "2026-04-07 12:24:40"}})
+
+    result = await service._invoke_formula(
+        client,
+        {"Authorization": "Bearer test"},
+        FakeToolCall("call_1", "date", '{"operation":"time","zone":"Asia/Seoul"}'),
+    )
+
+    assert result == {"role": "tool", "tool_call_id": "call_1", "content": "2026-04-07 12:24:40"}
+    assert client.calls == [
+        {
+            "url": "https://api.moonshot.ai/v1/formulas/moonshot%2Fdate%3Alatest/fibers",
+            "headers": {"Authorization": "Bearer test"},
+            "json": {
+                "tool_call": {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "date",
+                        "arguments": '{"operation":"time","zone":"Asia/Seoul"}',
+                    },
+                }
+            },
+        }
+    ]
+
+
+async def test_invoke_formula_retries_retryable_http_status(test_settings) -> None:
+    service = HanallResearchService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        artifact_repository=type("Repo", (), {"get_by_key": lambda *_: None, "save": lambda *args, **kwargs: args[1]})(),
+    )
+    service._tool_name_to_formula_uri["date"] = "moonshot/date:latest"
+    client = FlakyHttpClient({"context": {"output": "2026-04-07 12:24:40"}})
+
+    result = await service._invoke_formula(
+        client,
+        {"Authorization": "Bearer test"},
+        FakeToolCall("call_1", "date", '{"operation":"time","zone":"Asia/Seoul"}'),
+    )
+
+    assert result == {"role": "tool", "tool_call_id": "call_1", "content": "2026-04-07 12:24:40"}
+    assert len(client.calls) == 2

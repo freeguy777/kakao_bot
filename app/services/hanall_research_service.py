@@ -20,6 +20,8 @@ from app.schemas import HanallArtifact, HanallRenderedOutput, PromptLibrary
 
 
 class HanallResearchService:
+    RETRYABLE_FORMULA_STATUS_CODES = {429, 500, 502, 503, 504}
+    FORMULA_MAX_RETRIES = 2
     REQUIRED_ADMIN_SECTIONS = (
         "A. 요약",
         "B. Confirmed Updates — Company Direct",
@@ -79,8 +81,9 @@ class HanallResearchService:
         deadline = asyncio.get_running_loop().time() + self._settings.kimi_overall_deadline_seconds
         final_text = ""
         raw_response: dict[str, Any] = {}
+        web_search_rounds = 0
 
-        for _ in range(self._settings.kimi_max_iterations):
+        for iteration_index in range(self._settings.kimi_max_iterations):
             if asyncio.get_running_loop().time() >= deadline:
                 raise ExternalAPIError("Hanall research exceeded overall deadline")
             response = await client.chat.completions.create(
@@ -92,11 +95,27 @@ class HanallResearchService:
             raw_response = response.model_dump(mode="json")
             choice = response.choices[0]
             assistant_message = choice.message
-            messages.append(self._assistant_message_to_context(assistant_message))
             if choice.finish_reason != "tool_calls" or not assistant_message.tool_calls:
+                messages.append(self._assistant_message_to_context(assistant_message))
                 final_text = assistant_message.content or ""
                 break
+            has_web_search = self._tool_calls_include_function(assistant_message.tool_calls, "web_search")
+            if has_web_search and web_search_rounds >= self._settings.hanall_max_web_search_rounds:
+                self._append_assistant_context_without_tool_calls(messages, assistant_message)
+                break
+            if iteration_index == self._settings.kimi_max_iterations - 1:
+                self._append_assistant_context_without_tool_calls(messages, assistant_message)
+                break
+            messages.append(self._assistant_message_to_context(assistant_message))
             messages.extend(await self._resolve_tool_calls(assistant_message.tool_calls))
+            if has_web_search:
+                web_search_rounds += 1
+                if web_search_rounds >= self._settings.hanall_max_web_search_rounds:
+                    break
+        if not final_text:
+            response = await self._request_final_render_without_tools(client, messages, deadline)
+            raw_response = response.model_dump(mode="json")
+            final_text = response.choices[0].message.content or ""
         if not final_text:
             raise ExternalAPIError("Hanall research produced no final text")
         rendered_output = self._parse_rendered_output(final_text)
@@ -162,18 +181,72 @@ class HanallResearchService:
         formula_uri = self._tool_name_to_formula_uri.get(function_name)
         if not formula_uri:
             raise ExternalAPIError(f"No formula URI mapped for function.name={function_name}")
-        arguments = json.loads(tool_call.function.arguments or "{}")
+        fiber_payload = self._build_formula_fiber_payload(tool_call, function_name)
         url = f"{self._settings.kimi_base_url.rstrip('/')}/formulas/{quote(formula_uri, safe='')}/fibers"
-        response = await client.post(url, headers=headers, json=arguments)
-        response.raise_for_status()
-        payload = response.json()
-        context = payload.get("context") or {}
-        content = context.get("output") or context.get("encrypted_output")
-        if content is None:
-            raise ExternalAPIError(f"Formula fiber returned no content for {function_name}")
-        if not isinstance(content, str):
-            content = json.dumps(content, ensure_ascii=False)
-        return {"role": "tool", "tool_call_id": tool_call.id, "content": content}
+        for attempt in range(self.FORMULA_MAX_RETRIES + 1):
+            try:
+                response = await client.post(url, headers=headers, json=fiber_payload)
+                response.raise_for_status()
+                payload = response.json()
+                context = payload.get("context") or {}
+                content = context.get("output") or context.get("encrypted_output")
+                if content is None:
+                    raise ExternalAPIError(f"Formula fiber returned no content for {function_name}")
+                if not isinstance(content, str):
+                    content = json.dumps(content, ensure_ascii=False)
+                return {"role": "tool", "tool_call_id": tool_call.id, "content": content}
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code not in self.RETRYABLE_FORMULA_STATUS_CODES or attempt >= self.FORMULA_MAX_RETRIES:
+                    raise
+            except httpx.RequestError:
+                if attempt >= self.FORMULA_MAX_RETRIES:
+                    raise
+        raise ExternalAPIError(f"Formula invocation failed after retries for {function_name}")
+
+    async def _request_final_render_without_tools(
+        self,
+        client: AsyncOpenAI,
+        messages: list[dict[str, Any]],
+        deadline: float,
+    ) -> Any:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise ExternalAPIError("Hanall research exceeded overall deadline before final synthesis")
+        forced_final_message = {
+            "role": "user",
+            "content": (
+                "추가 도구 호출을 중단하고, 이미 수집한 정보만 사용해 지금 즉시 최종 답변을 작성하라.\n"
+                "최상위 태그는 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
+                "태그 밖 텍스트, 사족, 조사 계획은 금지한다."
+            ),
+        }
+        return await client.chat.completions.create(
+            model=self._settings.kimi_model,
+            messages=[*messages, forced_final_message],
+            timeout=remaining_seconds,
+        )
+
+    @staticmethod
+    def _build_formula_fiber_payload(tool_call: Any, function_name: str) -> dict[str, Any]:
+        raw_arguments = tool_call.function.arguments or "{}"
+        if isinstance(raw_arguments, str):
+            json.loads(raw_arguments)
+        else:
+            raw_arguments = json.dumps(raw_arguments, ensure_ascii=False)
+
+        payload: dict[str, Any] = {
+            "tool_call": {
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": raw_arguments,
+                },
+            }
+        }
+        if getattr(tool_call, "id", None):
+            payload["tool_call"]["id"] = tool_call.id
+        return payload
 
     @staticmethod
     def _assistant_message_to_context(message: Any) -> dict[str, Any]:
@@ -188,6 +261,18 @@ class HanallResearchService:
         if reasoning_content:
             payload["reasoning_content"] = reasoning_content
         return payload
+
+    @staticmethod
+    def _tool_calls_include_function(tool_calls: list[Any], function_name: str) -> bool:
+        return any(getattr(tool_call.function, "name", None) == function_name for tool_call in tool_calls)
+
+    @staticmethod
+    def _append_assistant_context_without_tool_calls(messages: list[dict[str, Any]], message: Any) -> None:
+        payload = HanallResearchService._assistant_message_to_context(message)
+        payload.pop("tool_calls", None)
+        if payload.get("content") is None and not payload.get("reasoning_content"):
+            return
+        messages.append(payload)
 
     @staticmethod
     def _artifact_key(artifact_date: date) -> str:

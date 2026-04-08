@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from app import constants
 from app.errors import FatalDeliveryError, RetryableDeliveryError
 from app.repositories import DeliveryRepository, sqlite_policy_from_settings
+from app.schemas import DeliveryQueueSnapshot
 from app.services.admin_notify import AdminNotifyService
 from app.services.delivery_service import DeliveryService
 
@@ -23,6 +24,14 @@ class FakeSocketClient:
 
     async def probe(self) -> dict[str, str]:
         return {"status": "reachable", "mode": "connect_only"}
+
+
+class FakeQueueSnapshotRepository:
+    def __init__(self, snapshot: DeliveryQueueSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def get_queue_snapshot(self) -> DeliveryQueueSnapshot:
+        return self._snapshot
 
 
 async def test_delivery_retries_transport_errors_until_success(app, test_settings) -> None:
@@ -135,3 +144,21 @@ async def test_socket_status_reports_transport_reachability(app, test_settings) 
     )
 
     assert await service.socket_status() == "transport reachable (connect_only)"
+
+
+def test_queue_snapshot_formats_korean_status_message(test_settings) -> None:
+    admin_notifier = AdminNotifyService(test_settings)
+    service = DeliveryService(
+        settings=test_settings,
+        delivery_repository=FakeQueueSnapshotRepository(
+            DeliveryQueueSnapshot(
+                pending_count=2,
+                failed_count=1,
+                latest_failed_ids=["msg-1"],
+            )
+        ),
+        socket_client=FakeSocketClient([None]),
+        admin_notifier=admin_notifier,
+    )
+
+    assert service.queue_snapshot() == "대기 2건 / 실패 1건 / 최근 실패: msg-1"

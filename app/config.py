@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_youtube_model: str = "gemini-2.5-flash"
     gemini_timeout_seconds: int = 60
+    youtube_dynamic_routing_enabled: bool = False
+    youtube_transcript_timeout_seconds: int = 3
+    youtube_transcript_max_chars: int = 18000
 
     kimi_api_key: str | None = None
     kimi_base_url: str = "https://api.moonshot.ai/v1"
@@ -54,7 +57,8 @@ class Settings(BaseSettings):
     kimi_formula_uris: str = ",".join(DEFAULT_KIMI_FORMULA_URIS)
     kimi_tool_timeout_seconds: int = 25
     kimi_max_iterations: int = 5
-    kimi_overall_deadline_seconds: int = 120
+    kimi_overall_deadline_seconds: int = 360
+    hanall_max_web_search_rounds: int = 2
 
     weather_api_key: str | None = None
     weather_grid_x: int = 95
@@ -65,6 +69,7 @@ class Settings(BaseSettings):
     child_birth_date: str = "2024-09-26"
 
     room_config_path: Path = Path("config/rooms.yaml")
+    room_config_reload_interval_seconds: int = 5
     prompt_config_path: Path = Path("config/prompts.yaml")
     hanall_spec_path: Path = Path("docs/hanall_monitoring_prompt.md")
 
@@ -74,7 +79,11 @@ class Settings(BaseSettings):
 
     @cached_property
     def kma_base_slot_list(self) -> list[str]:
-        return [item.strip() for item in self.kma_base_slots.split(",") if item.strip()]
+        slots = [item.strip() for item in self.kma_base_slots.split(",") if item.strip()]
+        try:
+            return sorted(slots, key=lambda item: int(item))
+        except ValueError as exc:
+            raise ConfigurationError("KMA_BASE_SLOTS must contain HHMM values") from exc
 
     def ensure_directory_structure(self) -> None:
         db_path = self.database_url.removeprefix("sqlite:///")

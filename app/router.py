@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from app.config import Settings
+from app.errors import ConfigurationError
 from app.repositories import FeatureOverrideRepository
 from app.schemas import EffectiveRoomConfig, NormalizedInboundEvent
 
@@ -14,7 +15,10 @@ class RoomRegistry:
     def __init__(self, settings: Settings, override_repository: FeatureOverrideRepository) -> None:
         self._settings = settings
         self._override_repository = override_repository
-        self._rooms = {room.name: room for room in settings.load_rooms().rooms}
+        self._room_config_path = self._resolve_config_path(settings.room_config_path)
+        self._room_config_signature: tuple[int, int] | None = None
+        self._rooms: dict[str, object] = {}
+        self._load_rooms()
 
     def resolve_room(self, room_name: str) -> EffectiveRoomConfig | None:
         base_room = self._rooms.get(room_name)
@@ -28,7 +32,6 @@ class RoomRegistry:
         persona_path = self._resolve_persona_path(base_room.persona_path)
         return EffectiveRoomConfig(
             name=base_room.name,
-            key=base_room.key,
             admin=base_room.admin,
             package_name=base_room.package_name or self._settings.default_package_name,
             persona_path=persona_path,
@@ -42,6 +45,21 @@ class RoomRegistry:
 
     def has_room(self, room_name: str) -> bool:
         return room_name in self._rooms
+
+    def reload_if_config_changed(self) -> bool:
+        try:
+            signature = self._room_config_signature_for_file()
+        except Exception:  # noqa: BLE001
+            logger.exception("room_config_signature_failed", extra={"path": str(self._room_config_path)})
+            return False
+        if signature == self._room_config_signature:
+            return False
+        try:
+            self._load_rooms(expected_signature=signature)
+        except Exception:  # noqa: BLE001
+            logger.exception("room_config_reload_failed", extra={"path": str(self._room_config_path)})
+            return False
+        return True
 
     def load_persona_text(self, room_name: str) -> str:
         room = self.resolve_room(room_name)
@@ -68,6 +86,22 @@ class RoomRegistry:
         if persona_path.is_absolute():
             return persona_path
         return Path.cwd() / persona_path
+
+    def _resolve_config_path(self, path: Path) -> Path:
+        if path.is_absolute():
+            return path
+        return Path.cwd() / path
+
+    def _load_rooms(self, *, expected_signature: tuple[int, int] | None = None) -> None:
+        loaded = self._settings.load_rooms().rooms
+        self._rooms = {room.name: room for room in loaded}
+        self._room_config_signature = expected_signature or self._room_config_signature_for_file()
+
+    def _room_config_signature_for_file(self) -> tuple[int, int]:
+        if not self._room_config_path.exists():
+            raise ConfigurationError(f"Config file not found: {self._room_config_path}")
+        stat_result = self._room_config_path.stat()
+        return (stat_result.st_mtime_ns, stat_result.st_size)
 
 
 class MessageRouter:

@@ -5,12 +5,15 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app import constants
 from app.config import Settings
 
 
 class SchedulerService:
+    ROOM_JOB_PREFIXES = ("hanall_publish::", "family_brief::")
+
     def __init__(
         self,
         *,
@@ -39,26 +42,13 @@ class SchedulerService:
             id="hanall_collect",
             replace_existing=True,
         )
-        for room in self._room_registry.list_rooms():
-            if room.features.get("hanall_briefing") and room.hanall_publish_time:
-                hour, minute = map(int, room.hanall_publish_time.split(":"))
-                self._scheduler.add_job(
-                    self.publish_hanall_room,
-                    CronTrigger(hour=hour, minute=minute, timezone=self._timezone),
-                    id=f"hanall_publish_{room.key}",
-                    replace_existing=True,
-                    kwargs={"room_name": room.name},
-                )
-            if room.features.get("weather") or room.features.get("child_age"):
-                publish_time = room.weather.publish_time or "08:10"
-                hour, minute = map(int, publish_time.split(":"))
-                self._scheduler.add_job(
-                    self.publish_family_brief,
-                    CronTrigger(hour=hour, minute=minute, timezone=self._timezone),
-                    id=f"family_brief_{room.key}",
-                    replace_existing=True,
-                    kwargs={"room_name": room.name},
-                )
+        self._scheduler.add_job(
+            self.refresh_room_jobs_if_needed,
+            IntervalTrigger(seconds=self._settings.room_config_reload_interval_seconds, timezone=self._timezone),
+            id="room_config_sync",
+            replace_existing=True,
+        )
+        self.refresh_room_jobs(force=True)
         self._scheduler.start()
 
     def shutdown(self) -> None:
@@ -77,12 +67,15 @@ class SchedulerService:
                 failure_type=constants.FAILURE_RESEARCH,
             )
 
+    async def refresh_room_jobs_if_needed(self) -> None:
+        self.refresh_room_jobs()
+
     async def publish_hanall_room(self, room_name: str) -> None:
         room = self._room_registry.resolve_room(room_name)
         if room is None or not room.features.get("hanall_briefing"):
             return
         now = datetime.now(self._timezone)
-        job_key = f"hanall:{now.date().isoformat()}:{room.key}:{room.hanall_publish_time}"
+        job_key = f"hanall:{now.date().isoformat()}:{room.name}:{room.hanall_publish_time}"
         if self._scheduled_job_repository.is_success(job_key):
             return
         try:
@@ -140,7 +133,7 @@ class SchedulerService:
             return
         publish_time = room.weather.publish_time or "08:10"
         now = datetime.now(self._timezone)
-        job_key = f"family_weather:{now.date().isoformat()}:{room.key}:{publish_time}"
+        job_key = f"family_weather:{now.date().isoformat()}:{room.name}:{publish_time}"
         if self._scheduled_job_repository.is_success(job_key):
             return
         try:
@@ -169,3 +162,62 @@ class SchedulerService:
                 error_message=str(exc),
                 failure_type=constants.FAILURE_API,
             )
+
+    def refresh_room_jobs(self, *, force: bool = False) -> bool:
+        config_changed = False
+        if force:
+            config_changed = True
+        else:
+            reload_if_config_changed = getattr(self._room_registry, "reload_if_config_changed", None)
+            if callable(reload_if_config_changed):
+                config_changed = bool(reload_if_config_changed())
+        if not config_changed:
+            return False
+
+        desired_jobs = self._build_room_job_specs()
+        desired_job_ids = set(desired_jobs)
+        existing_job_ids = {job.id for job in self._scheduler.get_jobs() if self._is_room_job(job.id)}
+
+        for job_id in existing_job_ids - desired_job_ids:
+            self._scheduler.remove_job(job_id)
+
+        for job_id, spec in desired_jobs.items():
+            self._scheduler.add_job(
+                spec["func"],
+                spec["trigger"],
+                id=job_id,
+                replace_existing=True,
+                kwargs=spec["kwargs"],
+            )
+        return True
+
+    def _build_room_job_specs(self) -> dict[str, dict[str, object]]:
+        jobs: dict[str, dict[str, object]] = {}
+        for room in self._room_registry.list_rooms():
+            if room.features.get("hanall_briefing") and room.hanall_publish_time:
+                hour, minute = map(int, room.hanall_publish_time.split(":"))
+                jobs[self._hanall_job_id(room.name)] = {
+                    "func": self.publish_hanall_room,
+                    "trigger": CronTrigger(hour=hour, minute=minute, timezone=self._timezone),
+                    "kwargs": {"room_name": room.name},
+                }
+            if room.features.get("weather") or room.features.get("child_age"):
+                publish_time = room.weather.publish_time or "08:10"
+                hour, minute = map(int, publish_time.split(":"))
+                jobs[self._family_job_id(room.name)] = {
+                    "func": self.publish_family_brief,
+                    "trigger": CronTrigger(hour=hour, minute=minute, timezone=self._timezone),
+                    "kwargs": {"room_name": room.name},
+                }
+        return jobs
+
+    def _is_room_job(self, job_id: str) -> bool:
+        return job_id.startswith(self.ROOM_JOB_PREFIXES)
+
+    @staticmethod
+    def _hanall_job_id(room_name: str) -> str:
+        return f"hanall_publish::{room_name}"
+
+    @staticmethod
+    def _family_job_id(room_name: str) -> str:
+        return f"family_brief::{room_name}"

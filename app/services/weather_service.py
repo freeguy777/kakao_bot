@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -8,6 +9,8 @@ import httpx
 from app.config import Settings
 from app.errors import ConfigurationError, ExternalAPIError
 from app.schemas import EffectiveRoomConfig, WeatherSnapshot
+
+logger = logging.getLogger(__name__)
 
 
 class WeatherService:
@@ -32,29 +35,50 @@ class WeatherService:
         grid_x = room.weather.grid_x or self._settings.weather_grid_x
         grid_y = room.weather.grid_y or self._settings.weather_grid_y
         label = room.weather.location_label or "기본 지역"
-        items = await self._fetch_with_fallback(grid_x=grid_x, grid_y=grid_y)
+        items = await self._fetch_with_fallback(
+            grid_x=grid_x,
+            grid_y=grid_y,
+            candidates=self._build_base_candidates(datetime.now(self._timezone)),
+        )
         snapshot = self._parse_snapshot(items=items, label=label)
-        if snapshot.min_temp == "-" or snapshot.max_temp == "-" or snapshot.precipitation_probability == "-":
-            items = await self._fetch_with_fallback(grid_x=grid_x, grid_y=grid_y, force_all_slots=True)
-            snapshot = self._parse_snapshot(items=items, label=label)
+        min_temp = await self._fetch_daily_min_temp(grid_x=grid_x, grid_y=grid_y)
+        if min_temp is not None:
+            snapshot = snapshot.model_copy(update={"min_temp": f"{min_temp}°"})
         return snapshot
 
-    async def _fetch_with_fallback(self, *, grid_x: int, grid_y: int, force_all_slots: bool = False) -> list[dict]:
-        now = datetime.now(self._timezone)
-        candidates = self._build_base_candidates(now, force_all_slots=force_all_slots)
+    async def _fetch_with_fallback(
+        self,
+        *,
+        grid_x: int,
+        grid_y: int,
+        candidates: list[tuple[str, str]],
+    ) -> list[dict]:
         last_error: Exception | None = None
+        errors: list[str] = []
         for base_date, base_time in candidates:
             try:
                 return await self._fetch_forecast(base_date=base_date, base_time=base_time, grid_x=grid_x, grid_y=grid_y)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                errors.append(f"{base_date} {base_time}={exc}")
+                logger.warning(
+                    "weather_forecast_fetch_failed",
+                    extra={
+                        "base_date": base_date,
+                        "base_time": base_time,
+                        "grid_x": grid_x,
+                        "grid_y": grid_y,
+                        "error": str(exc),
+                    },
+                )
         if last_error:
-            raise last_error
+            joined_errors = "; ".join(errors)
+            raise ExternalAPIError(f"KMA forecast fetch failed: {joined_errors}") from last_error
         raise ExternalAPIError("No KMA base slots available")
 
     async def _fetch_forecast(self, *, base_date: str, base_time: str, grid_x: int, grid_y: int) -> list[dict]:
         params = {
-            "serviceKey": self._settings.weather_api_key,
+            "authKey": self._settings.weather_api_key,
             "pageNo": 1,
             "numOfRows": 1000,
             "dataType": "JSON",
@@ -72,7 +96,7 @@ class WeatherService:
             raise ExternalAPIError("KMA returned no forecast items")
         return items
 
-    def _build_base_candidates(self, now: datetime, *, force_all_slots: bool) -> list[tuple[str, str]]:
+    def _build_base_candidates(self, now: datetime) -> list[tuple[str, str]]:
         slots = self._settings.kma_base_slot_list
         candidates: list[tuple[str, str]] = []
         for days_back in [0, 1]:
@@ -81,23 +105,74 @@ class WeatherService:
             for slot in slots:
                 slot_time = time(hour=int(slot[:2]), minute=int(slot[2:]))
                 slot_dt = datetime.combine(target_date, slot_time, tzinfo=self._timezone)
-                if force_all_slots or slot_dt <= now:
+                if slot_dt <= now:
                     eligible_slots.append(slot)
             for slot in reversed(eligible_slots):
                 candidates.append((target_date.strftime("%Y%m%d"), slot))
-            if candidates and not force_all_slots:
+            if candidates:
                 break
         return candidates
+
+    def _build_min_temp_candidates(self, now: datetime) -> list[tuple[str, str]]:
+        today = now.date()
+        yesterday = today - timedelta(days=1)
+        if now.time() >= time(hour=2):
+            return [
+                (today.strftime("%Y%m%d"), "0200"),
+                (yesterday.strftime("%Y%m%d"), "2300"),
+            ]
+        return [
+            (yesterday.strftime("%Y%m%d"), "2300"),
+            (yesterday.strftime("%Y%m%d"), "2000"),
+            (yesterday.strftime("%Y%m%d"), "1700"),
+        ]
+
+    async def _fetch_daily_min_temp(self, *, grid_x: int, grid_y: int) -> str | None:
+        now = datetime.now(self._timezone)
+        today = now.strftime("%Y%m%d")
+        for base_date, base_time in self._build_min_temp_candidates(now):
+            try:
+                items = await self._fetch_forecast(base_date=base_date, base_time=base_time, grid_x=grid_x, grid_y=grid_y)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "weather_daily_min_fetch_failed",
+                    extra={
+                        "base_date": base_date,
+                        "base_time": base_time,
+                        "grid_x": grid_x,
+                        "grid_y": grid_y,
+                        "error": str(exc),
+                    },
+                )
+                continue
+
+            today_items = [item for item in items if item.get("fcstDate") == today]
+            min_temp = self._pick_single(today_items, "TMN")
+            if min_temp is not None:
+                return min_temp
+
+            logger.info(
+                "weather_daily_min_missing",
+                extra={
+                    "base_date": base_date,
+                    "base_time": base_time,
+                    "grid_x": grid_x,
+                    "grid_y": grid_y,
+                },
+            )
+
+        return None
 
     def _parse_snapshot(self, *, items: list[dict], label: str) -> WeatherSnapshot:
         now = datetime.now(self._timezone)
         today = now.strftime("%Y%m%d")
+        current_hour = now.strftime("%H00")
         today_items = [item for item in items if item.get("fcstDate") == today]
         max_temp = self._pick_single(today_items, "TMX")
         min_temp = self._pick_single(today_items, "TMN")
-        precipitation_probability = self._pick_pop(today_items)
-        sky = self._pick_latest(today_items, "SKY")
-        precipitation_type = self._pick_latest(today_items, "PTY")
+        precipitation_probability = self._pick_pop(today_items, threshold_time=current_hour)
+        sky = self._pick_latest(today_items, "SKY", threshold_time=current_hour)
+        precipitation_type = self._pick_latest(today_items, "PTY", threshold_time=current_hour)
         summary = self._map_summary(sky=sky, pty=precipitation_type)
         note = self._build_note(summary=summary, precipitation_probability=precipitation_probability)
         return WeatherSnapshot(
@@ -118,23 +193,36 @@ class WeatherService:
         return None
 
     @staticmethod
-    def _pick_pop(items: list[dict]) -> str | None:
-        pops = [int(item.get("fcstValue")) for item in items if item.get("category") == "POP" and str(item.get("fcstValue")).isdigit()]
+    def _pick_pop(items: list[dict], *, threshold_time: str | None = None) -> str | None:
+        candidates = sorted(
+            [item for item in items if item.get("category") == "POP"],
+            key=lambda item: item.get("fcstTime", ""),
+        )
+        if threshold_time is not None:
+            for item in candidates:
+                if item.get("fcstTime", "") >= threshold_time and str(item.get("fcstValue")).isdigit():
+                    return str(item.get("fcstValue"))
+            for item in reversed(candidates):
+                if str(item.get("fcstValue")).isdigit():
+                    return str(item.get("fcstValue"))
+            return None
+        pops = [int(item.get("fcstValue")) for item in candidates if str(item.get("fcstValue")).isdigit()]
         if not pops:
             return None
         return str(max(pops))
 
-    def _pick_latest(self, items: list[dict], category: str) -> str | None:
+    @staticmethod
+    def _pick_latest(items: list[dict], category: str, *, threshold_time: str | None = None) -> str | None:
         candidates = sorted(
             [item for item in items if item.get("category") == category],
             key=lambda item: item.get("fcstTime", ""),
         )
         if not candidates:
             return None
-        current_time = datetime.now(self._timezone).strftime("%H%M")
-        for item in candidates:
-            if item.get("fcstTime", "") >= current_time:
-                return str(item.get("fcstValue"))
+        if threshold_time is not None:
+            for item in candidates:
+                if item.get("fcstTime", "") >= threshold_time:
+                    return str(item.get("fcstValue"))
         return str(candidates[-1].get("fcstValue"))
 
     @staticmethod

@@ -88,8 +88,8 @@ class DeliveryService:
 
     def queue_snapshot(self) -> str:
         snapshot = self._delivery_repository.get_queue_snapshot()
-        failed = ", ".join(snapshot.latest_failed_ids) if snapshot.latest_failed_ids else "?놁쓬"
-        return f"?湲?{snapshot.pending_count}嫄?/ ?ㅽ뙣 {snapshot.failed_count}嫄?/ 理쒓렐 ?ㅽ뙣: {failed}"
+        failed = ", ".join(snapshot.latest_failed_ids) if snapshot.latest_failed_ids else "없음"
+        return f"대기 {snapshot.pending_count}건 / 실패 {snapshot.failed_count}건 / 최근 실패: {failed}"
 
     @staticmethod
     def all_delivered(results: list[DeliveryResult]) -> bool:

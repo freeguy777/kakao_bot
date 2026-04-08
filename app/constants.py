@@ -22,7 +22,7 @@ SCHEDULED_STATUS_SUCCESS = "success"
 SCHEDULED_STATUS_FAILED = "failed"
 
 DEFAULT_MESSAGE_CHUNK_LIMIT = 900
-DEFAULT_KMA_BASE_SLOTS = ("2300", "0200", "0500", "0800", "1100", "1400", "1700", "2000")
+DEFAULT_KMA_BASE_SLOTS = ("0200", "0500", "0800", "1100", "1400", "1700", "2000", "2300")
 DEFAULT_KIMI_FORMULA_URIS = ("moonshot/date:latest", "moonshot/web-search:latest")
 
 ADMIN_COMMANDS = {
@@ -46,6 +46,7 @@ FEATURE_NAMES = {
 }
 
 YOUTUBE_URL_PATTERN = (
-    r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=[\w\-]{6,}|youtu\.be/[\w\-]{6,}"
-    r"|youtube\.com/shorts/[\w\-]{6,})(?:[^\s]*)?)"
+    r"(https?://(?:(?:www|m|music)\.)?(?:youtube\.com/"
+    r"(?:watch\?v=[\w\-]{6,}|shorts/[\w\-]{6,}|live/[\w\-]{6,}|embed/[\w\-]{6,})"
+    r"|youtu\.be/[\w\-]{6,})(?:[^\s]*)?)"
 )

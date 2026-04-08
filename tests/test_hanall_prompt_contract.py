@@ -8,7 +8,23 @@ import pytest
 from app.errors import ExternalAPIError
 from app.services.hanall_research_service import HanallResearchService
 
-PUBLIC_BRIEF = "직접 업데이트 1건\n경쟁사 업데이트 0건"
+PUBLIC_BRIEF = """📅 2026-04-06 08:00 KST 기준
+
+1. 🏢 한올/Immunovant 직접 업데이트
+- 지난 24시간 내 신규 공시, 보도자료, IR/SEC 업데이트는 없었습니다.
+- 배경: HanAll 공식 공시 페이지와 Immunovant Investors 기준 직전 공식 업데이트 이후 추가 변동은 확인되지 않았습니다.
+
+2. 🧬 경쟁사/파이프라인 체크
+- FcRn 경쟁축 기준 지난 24시간 내 중요 경쟁사 업데이트는 없었습니다.
+- argenx, UCB 등 핵심 경쟁사 공식 채널에서 신규 승인, 임상, 보도자료 변경은 확인되지 않았습니다.
+
+3. 🔎 이번에 확인한 범위
+- HanAll 공식 웹사이트, DART/KIND, Immunovant Investors, 경쟁사 공식 채널을 점검했습니다.
+- 공식 소스 기준으로만 확인 가능한 사실을 반영했습니다.
+
+4. 👀 참고할 포인트
+- 시간창 이전 자료는 이번 브리핑에 포함하지 않았습니다.
+- 현재는 기존 공식 일정과 경쟁축 후속 발표 여부를 계속 추적하는 구간입니다."""
 ADMIN_REPORT = """A. 요약
 - 지난 24시간 내 Confirmed 업데이트 총수: 1
 
@@ -104,6 +120,10 @@ async def test_hanall_collect_prompt_includes_verbatim_spec_and_writes_parse_met
     first_prompt = service._client.chat.completions.received_messages[0][1]["content"]
     assert spec_text in first_prompt
     assert "<public_brief>" in first_prompt
+    assert "1. 🏢 한올/Immunovant 직접 업데이트" in first_prompt
+    assert "2. 🧬 경쟁사/파이프라인 체크" in first_prompt
+    assert "3. 🔎 이번에 확인한 범위" in first_prompt
+    assert "4. 👀 참고할 포인트" in first_prompt
     assert artifact.summary_text == PUBLIC_BRIEF
     assert artifact.detail_text == ADMIN_REPORT.strip()
     assert artifact.raw_response["parse"]["parse_ok"] is True
