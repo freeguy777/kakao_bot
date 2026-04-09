@@ -12,6 +12,7 @@
 
 var GATEWAY_CONFIG = {
   webhookUrl: "http://192.168.0.10:8000/kakao/webhook",
+  deliveryAckUrl: "http://192.168.0.10:8000/kakao/delivery/ack",
   botSecret: "8d3f6c1b9e4a7f2d5c8b1e6a3f9d4c7e",
   socketToken: "2f7a9d4c6e1b8f3d5a0c7e9b4d1f6a2c",
   controlAuthorName: "__FASTAPI__",
@@ -47,6 +48,9 @@ function validateGatewayConfig() {
   }
   if (!GATEWAY_CONFIG.adminRoomName || GATEWAY_CONFIG.adminRoomName === "change-me-admin-room") {
     throw new Error("GATEWAY_CONFIG.adminRoomName must be replaced before startup");
+  }
+  if (!GATEWAY_CONFIG.deliveryAckUrl) {
+    throw new Error("GATEWAY_CONFIG.deliveryAckUrl must not be empty");
   }
   if (!GATEWAY_CONFIG.controlAuthorName) {
     throw new Error("GATEWAY_CONFIG.controlAuthorName must not be empty");
@@ -324,6 +328,29 @@ function sendAdminReport(text) {
   }
 }
 
+function sendDeliveryAck(messageId, roomName, packageName, status, errorCode, errorMessage) {
+  var payload = {
+    message_id: String(messageId || ""),
+    status: String(status || "retryable_error"),
+    target_room: String(roomName || ""),
+    package_name: String(packageName || GATEWAY_CONFIG.packageName),
+    error_code: errorCode == null ? null : String(errorCode),
+    error_message: errorMessage == null ? null : String(errorMessage)
+  };
+  try {
+    var result = postJson(GATEWAY_CONFIG.deliveryAckUrl, payload, {
+      "X-Bot-Secret": GATEWAY_CONFIG.botSecret
+    });
+    if (result.code >= 200 && result.code < 300) {
+      return true;
+    }
+    log("delivery ack failed for message_id=" + payload.message_id + ": " + result.code + " " + result.body);
+  } catch (error) {
+    log("delivery ack exception for message_id=" + payload.message_id + ": " + error);
+  }
+  return false;
+}
+
 function isControlMessage(message) {
   if (message == null) {
     return false;
@@ -368,34 +395,61 @@ function handleControlMessage(message) {
     return true;
   }
 
-  if (hasProcessedMessage(messageId)) {
-    log("duplicate control message ignored: " + messageId);
-    return true;
-  }
-
   var roomName = String(command.target_room || "");
   var text = String(command.text || "");
   var packageName = String(command.package_name || GATEWAY_CONFIG.packageName);
   if (!roomName || !text) {
     sendAdminReport("[gateway][control] invalid payload for message_id=" + messageId);
+    sendDeliveryAck(messageId, roomName, packageName, "fatal_error", "gateway_invalid_payload", "invalid target_room or text");
+    return true;
+  }
+
+  if (hasProcessedMessage(messageId)) {
+    log("duplicate control message acknowledged: " + messageId);
+    sendDeliveryAck(messageId, roomName, packageName, "ok", null, null);
     return true;
   }
 
   try {
     if (!bot.canReply(roomName, packageName)) {
-      sendAdminReport("[gateway][delivery] cannot reply to room=" + roomName + " message_id=" + messageId);
+      log("[gateway][delivery] cannot reply to room=" + roomName + " message_id=" + messageId);
+      sendDeliveryAck(
+        messageId,
+        roomName,
+        packageName,
+        "retryable_error",
+        "gateway_cannot_reply",
+        "bot.canReply returned false"
+      );
       return true;
     }
 
     var success = bot.send(roomName, text, packageName);
     if (!success) {
-      sendAdminReport("[gateway][delivery] bot.send returned false for room=" + roomName + " message_id=" + messageId);
+      log("[gateway][delivery] bot.send returned false for room=" + roomName + " message_id=" + messageId);
+      sendDeliveryAck(
+        messageId,
+        roomName,
+        packageName,
+        "retryable_error",
+        "gateway_send_false",
+        "bot.send returned false"
+      );
       return true;
     }
 
     rememberMessage(messageId);
+    sendDeliveryAck(messageId, roomName, packageName, "ok", null, null);
   } catch (error2) {
-    sendAdminReport("[gateway][delivery] exception for room=" + roomName + " message_id=" + messageId + ": " + String(error2));
+    log("[gateway][delivery] exception for room=" + roomName + " message_id=" + messageId + ": " + String(error2));
+    sendDeliveryAck(
+      messageId,
+      roomName,
+      packageName,
+      "retryable_error",
+      "gateway_exception",
+      String(error2)
+    );
   }
   return true;
 }

@@ -71,6 +71,15 @@ class DeliveryResult(BaseModel):
     error_message: str | None = None
 
 
+class DeliveryAckPayload(BaseModel):
+    message_id: str
+    status: Literal["ok", "retryable_error", "fatal_error"]
+    target_room: str | None = None
+    package_name: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
 class WeatherRoomConfig(BaseModel):
     enabled: bool = False
     location_label: str | None = None

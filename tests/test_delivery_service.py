@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 from app import constants
 from app.errors import FatalDeliveryError, RetryableDeliveryError
 from app.repositories import DeliveryRepository, sqlite_policy_from_settings
-from app.schemas import DeliveryQueueSnapshot
+from app.schemas import DeliveryQueueSnapshot, DeliveryResult
 from app.services.admin_notify import AdminNotifyService
 from app.services.delivery_service import DeliveryService
 
@@ -20,6 +20,8 @@ class FakeSocketClient:
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
+        if response is None:
+            return DeliveryResult(message_id=str(kwargs["message_id"]), status=constants.ACK_OK)
         return response
 
     async def probe(self) -> dict[str, str]:
@@ -85,6 +87,80 @@ async def test_delivery_marks_socket_failure_after_retry_exhaustion(app, test_se
     admin_notifier.notify_delivery_failure.assert_awaited_once()
 
 
+async def test_delivery_marks_gateway_retryable_failure_with_caller_failure_type(app, test_settings) -> None:
+    repository = DeliveryRepository(app.state.delivery_repository._session_factory, sqlite_policy_from_settings(test_settings))
+    admin_notifier = AdminNotifyService(test_settings)
+    admin_notifier.notify_delivery_failure = AsyncMock()
+    service = DeliveryService(
+        settings=test_settings,
+        delivery_repository=repository,
+        socket_client=FakeSocketClient(
+            [
+                DeliveryResult(
+                    message_id="ignored",
+                    status=constants.ACK_RETRYABLE_ERROR,
+                    error_code="gateway_cannot_reply",
+                    error_message="bot.canReply returned false",
+                ),
+                DeliveryResult(
+                    message_id="ignored",
+                    status=constants.ACK_RETRYABLE_ERROR,
+                    error_code="gateway_cannot_reply",
+                    error_message="bot.canReply returned false",
+                ),
+                DeliveryResult(
+                    message_id="ignored",
+                    status=constants.ACK_RETRYABLE_ERROR,
+                    error_code="gateway_cannot_reply",
+                    error_message="bot.canReply returned false",
+                ),
+            ]
+        ),
+        admin_notifier=admin_notifier,
+    )
+
+    results = await service.send_text("friend-room", "test message", failure_type=constants.FAILURE_API)
+
+    assert results[0].status == constants.ACK_RETRYABLE_ERROR
+    assert results[0].failure_type == constants.FAILURE_API
+    assert results[0].error_code == "gateway_cannot_reply"
+    stored = repository.get_message(results[0].message_id)
+    assert stored is not None
+    assert stored.failure_type == constants.FAILURE_API
+    admin_notifier.notify_delivery_failure.assert_awaited_once()
+
+
+async def test_delivery_marks_gateway_fatal_failure_without_socket_failure_type(app, test_settings) -> None:
+    repository = DeliveryRepository(app.state.delivery_repository._session_factory, sqlite_policy_from_settings(test_settings))
+    admin_notifier = AdminNotifyService(test_settings)
+    admin_notifier.notify_delivery_failure = AsyncMock()
+    service = DeliveryService(
+        settings=test_settings,
+        delivery_repository=repository,
+        socket_client=FakeSocketClient(
+            [
+                DeliveryResult(
+                    message_id="ignored",
+                    status=constants.ACK_FATAL_ERROR,
+                    error_code="gateway_invalid_payload",
+                    error_message="invalid target_room or text",
+                )
+            ]
+        ),
+        admin_notifier=admin_notifier,
+    )
+
+    results = await service.send_text("friend-room", "test message")
+
+    assert results[0].status == constants.ACK_FATAL_ERROR
+    assert results[0].failure_type == constants.FAILURE_DELIVERY
+    assert results[0].error_code == "gateway_invalid_payload"
+    stored = repository.get_message(results[0].message_id)
+    assert stored is not None
+    assert stored.failure_type == constants.FAILURE_DELIVERY
+    admin_notifier.notify_delivery_failure.assert_awaited_once()
+
+
 async def test_retry_message_preserves_package_name_and_message_id(app, test_settings) -> None:
     repository = DeliveryRepository(app.state.delivery_repository._session_factory, sqlite_policy_from_settings(test_settings))
     admin_notifier = AdminNotifyService(test_settings)
@@ -120,7 +196,9 @@ async def test_delivery_marks_socket_failure_on_fatal_transport_error(app, test_
     service = DeliveryService(
         settings=test_settings,
         delivery_repository=repository,
-        socket_client=FakeSocketClient([FatalDeliveryError("invalid built-in socket payload")]),
+        socket_client=FakeSocketClient(
+            [FatalDeliveryError("invalid built-in socket payload", error_code="socket_invalid_payload")]
+        ),
         admin_notifier=admin_notifier,
     )
 
@@ -128,7 +206,7 @@ async def test_delivery_marks_socket_failure_on_fatal_transport_error(app, test_
 
     assert results[0].status == constants.ACK_FATAL_ERROR
     assert results[0].failure_type == constants.FAILURE_SOCKET
-    assert results[0].error_code == "socket_fatal_error"
+    assert results[0].error_code == "socket_invalid_payload"
     admin_notifier.notify_delivery_failure.assert_awaited_once()
 
 

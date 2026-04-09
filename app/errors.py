@@ -20,6 +20,10 @@ class DuplicateEventError(AppError):
 class DeliveryError(AppError):
     """Raised when outbound delivery cannot be completed."""
 
+    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
 
 class RetryableDeliveryError(DeliveryError):
     """Raised when outbound delivery may succeed after retry."""

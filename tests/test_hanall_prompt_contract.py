@@ -174,3 +174,26 @@ async def test_hanall_collect_accepts_normalized_section_heading_variants(test_s
     assert artifact.summary_text == PUBLIC_BRIEF
     assert artifact.detail_text == normalized_variant_report.strip()
     assert artifact.raw_response["parse"]["missing_sections"] == []
+
+
+def test_render_public_message_wraps_long_source_bullet(test_settings, tmp_path: Path) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, final_text)
+    long_public_brief = """📅 2026-04-09 08:00 KST 기준
+
+1. 🏢 한올/Immunovant 직접 업데이트
+- 지난 24시간 내 신규 공시 없음
+
+3. 🔎 이번에 확인한 범위
+- HanAll 공식 웹사이트/DART/공시, Immunovant IR/Press Releases/SEC EDGAR(Form 4, 10-Q, 8-K), ClinicalTrials.gov batoclimab/IMVT-1402 등록항목, PubMed/학회 초록, 주요 언론"""
+    artifact = type("Artifact", (), {"summary_text": long_public_brief})()
+
+    rendered_message = service.render_public_message(artifact)
+
+    assert (
+        "- HanAll 공식 웹사이트/DART/공시, Immunovant IR/Press Releases/SEC EDGAR(Form 4, 10-Q, 8-K), "
+        "ClinicalTrials.gov batoclimab/IMVT-1402 등록항목, PubMed/학회 초록, 주요 언론"
+    ) not in rendered_message
+    assert any(line.startswith("  ") for line in rendered_message.splitlines())
+    assert "Form 4, 10-Q, 8-K" in rendered_message
+    assert "ClinicalTrials.gov batoclimab/IMVT-1402 등록항목" in rendered_message

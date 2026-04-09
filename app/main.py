@@ -21,6 +21,7 @@ from app.router import MessageRouter, RoomRegistry
 from app.scheduler import SchedulerService
 from app.services.admin_command_service import AdminCommandService
 from app.services.admin_notify import AdminNotifyService
+from app.services.delivery_ack_broker import DeliveryAckBroker
 from app.services.chat_service import ChatService
 from app.services.child_age_service import ChildAgeService
 from app.services.delivery_service import DeliveryService
@@ -51,7 +52,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     prompts = settings.load_prompts()
     room_registry = RoomRegistry(settings, override_repository)
-    socket_client = SocketClient(settings)
+    delivery_ack_broker = DeliveryAckBroker()
+    socket_client = SocketClient(settings, delivery_ack_broker)
     admin_notifier = AdminNotifyService(settings)
     delivery_service = DeliveryService(
         settings=settings,

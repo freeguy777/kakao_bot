@@ -56,6 +56,7 @@ class DeliveryService:
                     target_room=target_room,
                     text=chunk,
                     package_name=resolved_package_name,
+                    failure_type=failure_type,
                     suppress_admin_report=suppress_admin_report,
                 )
             )
@@ -76,6 +77,7 @@ class DeliveryService:
             target_room=record.target_room,
             text=record.text,
             package_name=record.package_name,
+            failure_type=record.failure_type or constants.FAILURE_DELIVERY,
             suppress_admin_report=(record.target_room == self._settings.admin_room_name),
         )
 
@@ -85,6 +87,12 @@ class DeliveryService:
             return f"transport reachable ({response.get('mode', 'connect_only')})"
         except Exception as exc:  # noqa: BLE001
             return f"transport unreachable ({exc})"
+
+    async def resolve_delivery_ack(self, result: DeliveryResult) -> bool:
+        return await self._socket_client.resolve_delivery_ack(result)
+
+    async def register_delivery_ack_waiter(self, message_id: str):
+        return await self._socket_client.register_delivery_ack_waiter(message_id)
 
     def queue_snapshot(self) -> str:
         snapshot = self._delivery_repository.get_queue_snapshot()
@@ -113,50 +121,87 @@ class DeliveryService:
         target_room: str,
         text: str,
         package_name: str,
+        failure_type: str,
         suppress_admin_report: bool,
     ) -> DeliveryResult:
         last_error_message: str | None = None
+        last_error_code: str | None = None
         for attempt_no in range(1, self._settings.socket_max_retries + 1):
             try:
-                await self._socket_client.send_message(
+                ack_result = await self._socket_client.send_message(
                     message_id=message_id,
                     target_room=target_room,
                     text=text,
                     package_name=package_name,
                 )
-                accepted_at = datetime.now(timezone.utc)
+                if ack_result.status == constants.ACK_OK:
+                    accepted_at = datetime.now(timezone.utc)
+                    self._delivery_repository.record_attempt(
+                        message_id=message_id,
+                        attempt_no=attempt_no,
+                        status=constants.ACK_OK,
+                        ack_received_at=accepted_at,
+                    )
+                    self._delivery_repository.mark_success(message_id)
+                    return DeliveryResult(message_id=message_id, status=constants.ACK_OK)
+
+                last_error_message = ack_result.error_message or ack_result.error_code or "gateway delivery failed"
+                last_error_code = ack_result.error_code
                 self._delivery_repository.record_attempt(
                     message_id=message_id,
                     attempt_no=attempt_no,
-                    status=constants.ACK_OK,
-                    ack_received_at=accepted_at,
+                    status=ack_result.status,
+                    error_code=last_error_code,
+                    error_message=last_error_message,
                 )
-                self._delivery_repository.mark_success(message_id)
-                return DeliveryResult(message_id=message_id, status=constants.ACK_OK)
+                if ack_result.status == constants.ACK_FATAL_ERROR:
+                    return await self._finalize_failure(
+                        message_id=message_id,
+                        target_room=target_room,
+                        status=constants.ACK_FATAL_ERROR,
+                        failure_type=failure_type,
+                        error_code=last_error_code or "gateway_fatal_error",
+                        error_message=last_error_message,
+                        suppress_admin_report=suppress_admin_report,
+                    )
+                if attempt_no >= self._settings.socket_max_retries:
+                    return await self._finalize_failure(
+                        message_id=message_id,
+                        target_room=target_room,
+                        status=constants.ACK_RETRYABLE_ERROR,
+                        failure_type=failure_type,
+                        error_code=last_error_code or "gateway_retryable_error",
+                        error_message=last_error_message,
+                        suppress_admin_report=suppress_admin_report,
+                    )
+                await asyncio.sleep(self._settings.socket_retry_backoff_seconds * attempt_no)
             except FatalDeliveryError as exc:
                 last_error_message = str(exc)
+                last_error_code = exc.error_code or "socket_fatal_error"
                 self._delivery_repository.record_attempt(
                     message_id=message_id,
                     attempt_no=attempt_no,
                     status=constants.ACK_FATAL_ERROR,
-                    error_code="socket_fatal_error",
+                    error_code=last_error_code,
                     error_message=last_error_message,
                 )
                 return await self._finalize_failure(
                     message_id=message_id,
                     target_room=target_room,
                     status=constants.ACK_FATAL_ERROR,
-                    error_code="socket_fatal_error",
+                    failure_type=constants.FAILURE_SOCKET,
+                    error_code=last_error_code,
                     error_message=last_error_message,
                     suppress_admin_report=suppress_admin_report,
                 )
             except RetryableDeliveryError as exc:
                 last_error_message = str(exc)
+                last_error_code = exc.error_code or "socket_retryable_error"
                 self._delivery_repository.record_attempt(
                     message_id=message_id,
                     attempt_no=attempt_no,
                     status=constants.ACK_RETRYABLE_ERROR,
-                    error_code="socket_retryable_error",
+                    error_code=last_error_code,
                     error_message=last_error_message,
                 )
                 if attempt_no >= self._settings.socket_max_retries:
@@ -164,7 +209,8 @@ class DeliveryService:
                         message_id=message_id,
                         target_room=target_room,
                         status=constants.ACK_RETRYABLE_ERROR,
-                        error_code="socket_retryable_error",
+                        failure_type=constants.FAILURE_SOCKET,
+                        error_code=last_error_code,
                         error_message=last_error_message,
                         suppress_admin_report=suppress_admin_report,
                     )
@@ -173,6 +219,7 @@ class DeliveryService:
             message_id=message_id,
             status=constants.ACK_RETRYABLE_ERROR,
             failure_type=constants.FAILURE_SOCKET,
+            error_code=last_error_code,
             error_message=last_error_message,
         )
 
@@ -182,11 +229,11 @@ class DeliveryService:
         message_id: str,
         target_room: str,
         status: str,
+        failure_type: str,
         error_code: str,
         error_message: str,
         suppress_admin_report: bool,
     ) -> DeliveryResult:
-        failure_type = constants.FAILURE_SOCKET
         self._delivery_repository.mark_failed(
             message_id,
             failure_type=failure_type,

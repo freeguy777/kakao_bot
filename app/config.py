@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     mb_socket_control_room_name: str = "__MB_SOCKET_CONTROL__"
     socket_shared_token: str = Field("change-me-too", min_length=1)
     socket_connect_timeout_seconds: int = 5
+    socket_ack_timeout_seconds: int = 15
     socket_max_retries: int = 3
     socket_retry_backoff_seconds: float = 1.0
 

@@ -22,6 +22,9 @@ from app.schemas import HanallArtifact, HanallRenderedOutput, PromptLibrary
 class HanallResearchService:
     RETRYABLE_FORMULA_STATUS_CODES = {429, 500, 502, 503, 504}
     FORMULA_MAX_RETRIES = 2
+    PUBLIC_BRIEF_BULLET_PREFIX = "- "
+    PUBLIC_BRIEF_CONTINUATION_PREFIX = "  "
+    PUBLIC_BRIEF_BODY_DISPLAY_WIDTH = 64
     REQUIRED_ADMIN_SECTIONS = (
         "A. 요약",
         "B. Confirmed Updates — Company Direct",
@@ -63,10 +66,149 @@ class HanallResearchService:
         return self._artifact_repository.get_by_key(artifact_key)
 
     def render_public_message(self, artifact: HanallArtifact) -> str:
-        return self._prompts.hanall_public_format.format(summary=artifact.summary_text)
+        return self._prompts.hanall_public_format.format(summary=self._format_public_brief(artifact.summary_text))
 
     def render_admin_message(self, artifact: HanallArtifact) -> str:
         return self._prompts.hanall_admin_format.format(detail=artifact.detail_text)
+
+    @classmethod
+    def _format_public_brief(cls, public_text: str) -> str:
+        formatted_lines: list[str] = []
+        for raw_line in public_text.splitlines():
+            stripped_line = raw_line.rstrip()
+            if stripped_line.startswith(cls.PUBLIC_BRIEF_BULLET_PREFIX):
+                formatted_lines.extend(cls._wrap_public_brief_bullet(stripped_line))
+                continue
+            formatted_lines.append(stripped_line)
+        return "\n".join(formatted_lines).strip()
+
+    @classmethod
+    def _wrap_public_brief_bullet(cls, line: str) -> list[str]:
+        body = line[len(cls.PUBLIC_BRIEF_BULLET_PREFIX) :].strip()
+        if not body or cls._display_width(body) <= cls.PUBLIC_BRIEF_BODY_DISPLAY_WIDTH:
+            return [line]
+
+        comma_segments = cls._split_top_level_comma_segments(body)
+        logical_lines = (
+            cls._pack_comma_segments(comma_segments, cls.PUBLIC_BRIEF_BODY_DISPLAY_WIDTH)
+            if len(comma_segments) > 1
+            else [body]
+        )
+
+        wrapped_lines: list[str] = []
+        for logical_line in logical_lines:
+            wrapped_lines.extend(cls._wrap_body_text(logical_line, cls.PUBLIC_BRIEF_BODY_DISPLAY_WIDTH))
+
+        if len(wrapped_lines) <= 1:
+            return [line]
+        return cls._prefix_bullet_lines(wrapped_lines)
+
+    @classmethod
+    def _split_top_level_comma_segments(cls, text: str) -> list[str]:
+        segments: list[str] = []
+        buffer: list[str] = []
+        depth = 0
+        openers = "([{"
+        closers = ")]}"
+
+        for character in text:
+            if character in openers:
+                depth += 1
+                buffer.append(character)
+                continue
+            if character in closers:
+                depth = max(depth - 1, 0)
+                buffer.append(character)
+                continue
+            if character == "," and depth == 0:
+                segment = "".join(buffer).strip()
+                if segment:
+                    segments.append(segment)
+                buffer = []
+                continue
+            buffer.append(character)
+
+        tail = "".join(buffer).strip()
+        if tail:
+            segments.append(tail)
+        return segments
+
+    @classmethod
+    def _pack_comma_segments(cls, segments: list[str], width: int) -> list[str]:
+        packed_lines: list[str] = []
+        current = ""
+
+        for index, segment in enumerate(segments):
+            suffix = "," if index < len(segments) - 1 else ""
+            piece = f"{segment}{suffix}"
+            candidate = piece if not current else f"{current} {piece}"
+            if current and cls._display_width(candidate) > width:
+                packed_lines.append(current)
+                current = piece
+                continue
+            current = candidate
+
+        if current:
+            packed_lines.append(current)
+        return packed_lines
+
+    @classmethod
+    def _wrap_body_text(cls, text: str, width: int) -> list[str]:
+        words = text.split()
+        if not words:
+            return [text]
+
+        wrapped_lines: list[str] = []
+        current = ""
+        for word in words:
+            if cls._display_width(word) > width:
+                if current:
+                    wrapped_lines.append(current)
+                    current = ""
+                split_words = cls._split_token_by_display_width(word, width)
+                wrapped_lines.extend(split_words[:-1])
+                current = split_words[-1]
+                continue
+
+            candidate = word if not current else f"{current} {word}"
+            if current and cls._display_width(candidate) > width:
+                wrapped_lines.append(current)
+                current = word
+                continue
+            current = candidate
+
+        if current:
+            wrapped_lines.append(current)
+        return wrapped_lines
+
+    @classmethod
+    def _split_token_by_display_width(cls, token: str, width: int) -> list[str]:
+        parts: list[str] = []
+        current = ""
+        for character in token:
+            if current and cls._display_width(current + character) > width:
+                parts.append(current)
+                current = character
+                continue
+            current += character
+        if current:
+            parts.append(current)
+        return parts or [token]
+
+    @classmethod
+    def _prefix_bullet_lines(cls, lines: list[str]) -> list[str]:
+        prefixed_lines: list[str] = []
+        for index, line in enumerate(lines):
+            prefix = cls.PUBLIC_BRIEF_BULLET_PREFIX if index == 0 else cls.PUBLIC_BRIEF_CONTINUATION_PREFIX
+            prefixed_lines.append(f"{prefix}{line}")
+        return prefixed_lines
+
+    @staticmethod
+    def _display_width(text: str) -> int:
+        width = 0
+        for character in text:
+            width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        return width
 
     async def _run_research(self, artifact_date: date) -> HanallArtifact:
         if not self._settings.kimi_api_key:

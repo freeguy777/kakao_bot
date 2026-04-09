@@ -5,7 +5,10 @@ import json
 
 import pytest
 
+from app import constants
 from app.errors import RetryableDeliveryError
+from app.schemas import DeliveryResult
+from app.services.delivery_ack_broker import DeliveryAckBroker
 from app.services.socket_client import SocketClient
 
 
@@ -28,7 +31,8 @@ class FakeWriter:
 
 
 async def test_socket_client_sends_built_in_socket_envelope(monkeypatch, test_settings) -> None:
-    client = SocketClient(test_settings)
+    broker = DeliveryAckBroker()
+    client = SocketClient(test_settings, broker)
     writer = FakeWriter()
 
     async def fake_open_connection(host: str, port: int):
@@ -38,12 +42,19 @@ async def test_socket_client_sends_built_in_socket_envelope(monkeypatch, test_se
 
     monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
 
-    await client.send_message(
+    async def resolve_ack() -> None:
+        await asyncio.sleep(0)
+        await broker.resolve(DeliveryResult(message_id="m1", status=constants.ACK_OK))
+
+    ack_task = asyncio.create_task(resolve_ack())
+
+    result = await client.send_message(
         message_id="m1",
         target_room="family-room",
         text="hello built-in socket",
         package_name="custom.pkg",
     )
+    await ack_task
 
     payload = json.loads(writer.buffer.decode("utf-8").strip())
     assert payload["name"] == "debugRoom"
@@ -61,11 +72,12 @@ async def test_socket_client_sends_built_in_socket_envelope(monkeypatch, test_se
         "text": "hello built-in socket",
         "package_name": "custom.pkg",
     }
+    assert result.status == constants.ACK_OK
     assert writer.closed is True
 
 
 async def test_socket_client_raises_retryable_error_on_connect_failure(monkeypatch, test_settings) -> None:
-    client = SocketClient(test_settings)
+    client = SocketClient(test_settings, DeliveryAckBroker())
 
     async def fake_open_connection(host: str, port: int):
         raise OSError("socket unavailable")
@@ -77,7 +89,7 @@ async def test_socket_client_raises_retryable_error_on_connect_failure(monkeypat
 
 
 async def test_socket_client_probe_is_connect_only(monkeypatch, test_settings) -> None:
-    client = SocketClient(test_settings)
+    client = SocketClient(test_settings, DeliveryAckBroker())
     writer = FakeWriter()
 
     async def fake_open_connection(host: str, port: int):
@@ -90,3 +102,16 @@ async def test_socket_client_probe_is_connect_only(monkeypatch, test_settings) -
     assert result == {"status": "reachable", "mode": "connect_only"}
     assert writer.buffer == b""
     assert writer.closed is True
+
+
+async def test_socket_client_times_out_when_delivery_ack_does_not_arrive(monkeypatch, test_settings) -> None:
+    client = SocketClient(test_settings.model_copy(update={"socket_ack_timeout_seconds": 0}), DeliveryAckBroker())
+    writer = FakeWriter()
+
+    async def fake_open_connection(host: str, port: int):
+        return object(), writer
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+
+    with pytest.raises(RetryableDeliveryError, match="delivery ack timeout"):
+        await client.send_message(message_id="m1", target_room="room", text="hello")

@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
-from app.schemas import InboundWebhookPayload, NormalizedInboundEvent, PollingAckRequest
+from app.schemas import DeliveryAckPayload, DeliveryResult, InboundWebhookPayload, NormalizedInboundEvent, PollingAckRequest
 
 router = APIRouter(prefix="/kakao", tags=["kakao"])
 logger = logging.getLogger(__name__)
@@ -77,4 +77,29 @@ async def polling_ack(payload: PollingAckRequest) -> dict[str, object]:
             "updated_count": len(payload.message_ids),
             "success": payload.success,
         },
+    }
+
+
+@router.post("/delivery/ack")
+async def delivery_ack(
+    payload: DeliveryAckPayload,
+    request: Request,
+    x_bot_secret: str = Header(...),
+) -> dict[str, object]:
+    settings = request.app.state.settings
+    if x_bot_secret != settings.inbound_bot_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bot secret")
+
+    await request.app.state.delivery_service.resolve_delivery_ack(
+        DeliveryResult(
+            message_id=payload.message_id,
+            status=payload.status,
+            error_code=payload.error_code,
+            error_message=payload.error_message,
+        )
+    )
+    return {
+        "ok": True,
+        "message_id": payload.message_id,
+        "status": payload.status,
     }
