@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import unicodedata
 from datetime import date, datetime, timedelta
@@ -18,8 +19,11 @@ from app.errors import ConfigurationError, ExternalAPIError
 from app.repositories import ArtifactRepository
 from app.schemas import HanallArtifact, HanallRenderedOutput, PromptLibrary
 
+logger = logging.getLogger(__name__)
+
 
 class HanallResearchService:
+    RETRYABLE_COMPLETION_STATUS_CODES = {429, 500, 502, 503, 504}
     RETRYABLE_FORMULA_STATUS_CODES = {429, 500, 502, 503, 504}
     FORMULA_MAX_RETRIES = 2
     PUBLIC_BRIEF_BULLET_PREFIX = "- "
@@ -228,11 +232,12 @@ class HanallResearchService:
         for iteration_index in range(self._settings.kimi_max_iterations):
             if asyncio.get_running_loop().time() >= deadline:
                 raise ExternalAPIError("Hanall research exceeded overall deadline")
-            response = await client.chat.completions.create(
-                model=self._settings.kimi_model,
+            response = await self._request_chat_completion(
+                client,
                 messages=messages,
                 tools=tools or None,
-                timeout=self._settings.kimi_tool_timeout_seconds,
+                request_timeout_seconds=self._settings.kimi_tool_timeout_seconds,
+                deadline=deadline,
             )
             raw_response = response.model_dump(mode="json")
             choice = response.choices[0]
@@ -363,11 +368,92 @@ class HanallResearchService:
                 "태그 밖 텍스트, 사족, 조사 계획은 금지한다."
             ),
         }
-        return await client.chat.completions.create(
-            model=self._settings.kimi_model,
+        return await self._request_chat_completion(
+            client,
             messages=[*messages, forced_final_message],
-            timeout=remaining_seconds,
+            tools=None,
+            request_timeout_seconds=remaining_seconds,
+            deadline=deadline,
         )
+
+    async def _request_chat_completion(
+        self,
+        client: AsyncOpenAI,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        request_timeout_seconds: float,
+        deadline: float,
+    ) -> Any:
+        retry_delays = self._settings.hanall_collect_retry_delay_list
+        loop = asyncio.get_running_loop()
+
+        for attempt_index in range(len(retry_delays) + 1):
+            remaining_seconds = deadline - loop.time()
+            if remaining_seconds <= 0:
+                raise ExternalAPIError("Hanall research exceeded overall deadline")
+
+            try:
+                return await client.chat.completions.create(
+                    model=self._settings.kimi_model,
+                    messages=messages,
+                    tools=tools,
+                    timeout=min(request_timeout_seconds, remaining_seconds),
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_retryable_completion_error(exc) or attempt_index >= len(retry_delays):
+                    raise
+
+                retry_delay = retry_delays[attempt_index]
+                if deadline - loop.time() <= retry_delay:
+                    raise ExternalAPIError("Hanall research exceeded overall deadline before retrying overloaded completion") from exc
+
+                logger.warning(
+                    "hanall_completion_retry_scheduled",
+                    extra={
+                        "attempt": attempt_index + 1,
+                        "retry_in_seconds": retry_delay,
+                        "status_code": self._completion_error_status_code(exc),
+                        "error_type": self._completion_error_type(exc),
+                    },
+                )
+                await self._sleep_before_retry(retry_delay)
+
+        raise ExternalAPIError("Hanall research completion retry loop exited unexpectedly")
+
+    async def _sleep_before_retry(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+    @classmethod
+    def _is_retryable_completion_error(cls, exc: Exception) -> bool:
+        status_code = cls._completion_error_status_code(exc)
+        if status_code in cls.RETRYABLE_COMPLETION_STATUS_CODES:
+            return True
+        error_type = cls._completion_error_type(exc)
+        return error_type == "engine_overloaded_error"
+
+    @staticmethod
+    def _completion_error_status_code(exc: Exception) -> int | None:
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        response = getattr(exc, "response", None)
+        response_status_code = getattr(response, "status_code", None)
+        return response_status_code if isinstance(response_status_code, int) else None
+
+    @staticmethod
+    def _completion_error_type(exc: Exception) -> str | None:
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                error_type = error.get("type")
+                if isinstance(error_type, str):
+                    return error_type
+        message = str(exc)
+        if "engine_overloaded_error" in message:
+            return "engine_overloaded_error"
+        return None
 
     @staticmethod
     def _build_formula_fiber_payload(tool_call: Any, function_name: str) -> dict[str, Any]:

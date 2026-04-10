@@ -99,6 +99,7 @@ async def test_request_summary_retries_once_after_503_and_succeeds(test_settings
         ),
     ]
     captured_calls: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
 
     class FakeAsyncClient:
         def __init__(self, *, timeout: int) -> None:
@@ -114,7 +115,11 @@ async def test_request_summary_retries_once_after_503_and_succeeds(test_settings
             captured_calls.append({"url": url, "headers": headers, "json": json})
             return self._responses.pop(0)
 
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.services.youtube_service.asyncio.sleep", fake_sleep)
 
     summary = await service._request_summary(
         endpoint="https://example.com/generate",
@@ -124,6 +129,7 @@ async def test_request_summary_retries_once_after_503_and_succeeds(test_settings
 
     assert summary == "retried summary"
     assert len(captured_calls) == 2
+    assert sleep_calls == [2.0]
 
 
 async def test_request_summary_retries_once_after_503_then_raises(test_settings, monkeypatch) -> None:
@@ -133,6 +139,7 @@ async def test_request_summary_retries_once_after_503_then_raises(test_settings,
         FakeGeminiResponse(status_code=503, text="service unavailable"),
     ]
     captured_calls: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
 
     class FakeAsyncClient:
         def __init__(self, *, timeout: int) -> None:
@@ -148,7 +155,11 @@ async def test_request_summary_retries_once_after_503_then_raises(test_settings,
             captured_calls.append({"url": url, "headers": headers, "json": json})
             return self._responses.pop(0)
 
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.services.youtube_service.asyncio.sleep", fake_sleep)
 
     with pytest.raises(ExternalAPIError, match=r"failed with status 503"):
         await service._request_summary(
@@ -158,6 +169,82 @@ async def test_request_summary_retries_once_after_503_then_raises(test_settings,
         )
 
     assert len(captured_calls) == 2
+    assert sleep_calls == [2.0]
+
+
+async def test_summarize_transcript_falls_back_to_lite_model_after_503(test_settings) -> None:
+    service = build_service(test_settings)
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        segments=[
+            TranscriptSegment(start_ms=0, text="먼저 핵심 내용을 설명하겠습니다"),
+            TranscriptSegment(start_ms=1000, text="정리하면 오늘 영상의 중요한 포인트입니다"),
+        ],
+    )
+    calls: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+
+    async def fake_request_summary(*, endpoint: str, payload: dict[str, object], error_label: str, **kwargs: object) -> str:
+        calls.append({"endpoint": endpoint, "payload": payload, "error_label": error_label})
+        if len(calls) == 1:
+            raise ExternalAPIError("Gemini transcript summarization failed with status 503", status_code=503)
+        return "fallback summary"
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    service._request_summary = fake_request_summary  # type: ignore[method-assign]
+    original_sleep = service._summarize_transcript.__globals__["asyncio"].sleep
+    service._summarize_transcript.__globals__["asyncio"].sleep = fake_sleep
+
+    try:
+        summary = await service._summarize_transcript("https://youtu.be/abc123xyz00", transcript)
+    finally:
+        service._summarize_transcript.__globals__["asyncio"].sleep = original_sleep
+
+    assert summary == "fallback summary"
+    assert len(calls) == 2
+    assert sleep_calls == [1.0]
+    assert calls[0]["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    assert calls[0]["error_label"] == "Gemini transcript summarization"
+    assert calls[1]["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+    assert calls[1]["error_label"] == "Gemini transcript summarization fallback (gemini-2.5-flash-lite)"
+
+
+async def test_summarize_transcript_falls_back_to_lite_model_after_429(test_settings) -> None:
+    service = build_service(test_settings)
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        segments=[TranscriptSegment(start_ms=0, text="먼저 핵심 내용을 설명하겠습니다")],
+    )
+    calls: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+
+    async def fake_request_summary(*, endpoint: str, payload: dict[str, object], error_label: str, **kwargs: object) -> str:
+        calls.append({"endpoint": endpoint, "payload": payload, "error_label": error_label})
+        if len(calls) == 1:
+            raise ExternalAPIError("Gemini transcript summarization failed with status 429", status_code=429)
+        return "fallback summary"
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    service._request_summary = fake_request_summary  # type: ignore[method-assign]
+    original_sleep = service._summarize_transcript.__globals__["asyncio"].sleep
+    service._summarize_transcript.__globals__["asyncio"].sleep = fake_sleep
+
+    try:
+        summary = await service._summarize_transcript("https://youtu.be/abc123xyz00", transcript)
+    finally:
+        service._summarize_transcript.__globals__["asyncio"].sleep = original_sleep
+
+    assert summary == "fallback summary"
+    assert len(calls) == 2
+    assert sleep_calls == [1.0]
+    assert calls[1]["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+    assert calls[1]["error_label"] == "Gemini transcript summarization fallback (gemini-2.5-flash-lite)"
 
 
 def test_extract_video_id_supports_common_single_video_urls(test_settings) -> None:
@@ -209,8 +296,8 @@ def test_build_transcript_bundle_uses_api_snippets_and_metadata(test_settings) -
     service = build_service(test_settings)
     fetched = FakeFetchedTranscript(
         [
-            SimpleNamespace(start=0.0, text="첫 문장"),
-            SimpleNamespace(start=1.5, text="둘째 문장"),
+            SimpleNamespace(start=0.0, duration=1.0, text="첫 문장"),
+            SimpleNamespace(start=1.5, duration=2.0, text="둘째 문장"),
         ],
         language_code="ko",
         is_generated=True,
@@ -221,6 +308,7 @@ def test_build_transcript_bundle_uses_api_snippets_and_metadata(test_settings) -
     assert transcript is not None
     assert transcript.language_code == "ko"
     assert transcript.is_auto_generated is True
+    assert transcript.estimated_duration_ms == 3500
     assert transcript.segments == [
         TranscriptSegment(start_ms=0, text="첫 문장"),
         TranscriptSegment(start_ms=1500, text="둘째 문장"),
@@ -512,6 +600,66 @@ async def test_summarize_url_falls_back_to_video_when_classifier_fails(test_sett
     assert trace.route_reason == "transcript_classifier_failed"
     assert trace.route_source == "classifier"
     assert trace.transcript_classifier_error == "Gemini transcript routing classification timed out"
+    service._summarize_transcript.assert_not_awaited()
+    service._summarize_video_url.assert_awaited_once()
+
+
+async def test_summarize_url_uses_transcript_fast_path_for_long_transcript_when_classifier_fails(test_settings) -> None:
+    test_settings.youtube_dynamic_routing_enabled = True
+    service = build_service(test_settings)
+    trace = YouTubeRoutingTrace()
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        estimated_duration_ms=301000,
+        segments=[
+            TranscriptSegment(start_ms=0, text="바람이 불어오고 네가 서 있던 거리"),
+            TranscriptSegment(start_ms=280000, text="오래된 기억이 천천히 다시 떠오른다"),
+        ],
+    )
+    service._try_fetch_transcript = AsyncMock(return_value=transcript)
+    service._classify_transcript_with_model = AsyncMock(
+        side_effect=ExternalAPIError("Gemini transcript routing classification timed out")
+    )
+    service._summarize_transcript = AsyncMock(return_value="forced fast summary")
+    service._summarize_video_url = AsyncMock(return_value="slow summary")
+
+    result = await service.summarize_url("https://youtu.be/abc123xyz00", trace=trace)
+
+    assert result == "forced fast summary"
+    assert trace.selected_path == "transcript_fast_path"
+    assert trace.route_reason == "transcript_long_form_override"
+    assert trace.route_source == "duration_rule"
+    assert trace.transcript_classifier_error == "Gemini transcript routing classification timed out"
+    service._summarize_transcript.assert_awaited_once()
+    service._summarize_video_url.assert_not_awaited()
+
+
+async def test_summarize_url_keeps_video_fallback_for_long_lyrics_transcript(test_settings) -> None:
+    test_settings.youtube_dynamic_routing_enabled = True
+    service = build_service(test_settings)
+    trace = YouTubeRoutingTrace()
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        estimated_duration_ms=301000,
+        segments=[
+            TranscriptSegment(start_ms=0, text="chorus"),
+            TranscriptSegment(start_ms=280000, text="♪ stay with me tonight ♪"),
+        ],
+    )
+    service._try_fetch_transcript = AsyncMock(return_value=transcript)
+    service._classify_transcript_with_model = AsyncMock(return_value="informative")
+    service._summarize_transcript = AsyncMock(return_value="fast summary")
+    service._summarize_video_url = AsyncMock(return_value="slow summary")
+
+    result = await service.summarize_url("https://youtu.be/abc123xyz00", trace=trace)
+
+    assert result == "slow summary"
+    assert trace.selected_path == "video_understanding"
+    assert trace.route_reason == "transcript_lyrics"
+    assert trace.route_source == "local"
+    service._classify_transcript_with_model.assert_not_awaited()
     service._summarize_transcript.assert_not_awaited()
     service._summarize_video_url.assert_awaited_once()
 

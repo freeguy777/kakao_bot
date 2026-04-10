@@ -121,3 +121,15 @@ def test_control_channel_defaults_are_loaded(tmp_path: Path) -> None:
 
     assert settings.mb_socket_control_author_name == "__FASTAPI__"
     assert settings.mb_socket_control_room_name == "__MB_SOCKET_CONTROL__"
+
+
+def test_hanall_collect_retry_delay_list_parses_csv(tmp_path: Path) -> None:
+    settings = Settings(
+        inbound_bot_secret="test-secret",
+        socket_shared_token="test-token",
+        messengerbot_bot_name="gateway-bot",
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        hanall_collect_retry_delays_seconds="60,180",
+    )
+
+    assert settings.hanall_collect_retry_delay_list == [60.0, 180.0]

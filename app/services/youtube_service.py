@@ -55,6 +55,7 @@ class TranscriptBundle:
     language_code: str | None
     is_auto_generated: bool
     segments: list[TranscriptSegment]
+    estimated_duration_ms: int = 0
 
     @property
     def text(self) -> str:
@@ -194,6 +195,15 @@ class YouTubeService:
     _TRANSCRIPT_ROUTE_LABELS = frozenset({"informative", "lyrics", "sound_effect_only", "garbled_or_unclear"})
     _TRANSCRIPT_CLASSIFIER_SAMPLE_SIZE = 12
     _TRANSCRIPT_CLASSIFIER_TIMEOUT_SECONDS = 15
+    _LONG_TRANSCRIPT_FAST_PATH_THRESHOLD_MS = 5 * 60 * 1000
+    _LONG_TRANSCRIPT_FAST_PATH_EXCLUDED_REASONS = frozenset(
+        {
+            "transcript_lyrics",
+            "transcript_sound_effect_only",
+            "transcript_garbled_or_unclear",
+        }
+    )
+    _RETRY_DELAY_SECONDS = 2.0
     _TRANSCRIPT_ROUTE_CLASSIFIER_PROMPT = (
         "Classify whether this YouTube transcript sample is reliable enough to summarize without seeing the video.\n"
         "Return exactly one label and nothing else:\n"
@@ -245,10 +255,13 @@ class YouTubeService:
             transcript = await self._try_fetch_transcript(url, trace=routing_trace)
             assessment = await self._assess_transcript_route(url, transcript, trace=routing_trace)
             routing_trace.record_transcript(transcript)
-            routing_trace.route_source = assessment.route_source
-            if assessment.should_use_fast_path:
+            force_transcript_fast_path = self._should_force_transcript_fast_path(transcript, assessment)
+            if assessment.should_use_fast_path or force_transcript_fast_path:
                 routing_trace.selected_path = "transcript_fast_path"
-                routing_trace.route_reason = assessment.route_reason
+                routing_trace.route_reason = (
+                    "transcript_long_form_override" if force_transcript_fast_path else assessment.route_reason
+                )
+                routing_trace.route_source = "duration_rule" if force_transcript_fast_path else assessment.route_source
                 try:
                     logger.info("youtube_summary_fast_path", extra=routing_trace.to_log_extra(url=url))
                     return await self._summarize_transcript(url, transcript)
@@ -260,6 +273,7 @@ class YouTubeService:
             else:
                 routing_trace.selected_path = "video_understanding"
                 routing_trace.route_reason = self._resolve_video_fallback_reason(assessment.route_reason, routing_trace)
+                routing_trace.route_source = assessment.route_source
                 logger.info("youtube_summary_video_fallback", extra=routing_trace.to_log_extra(url=url))
         else:
             routing_trace.selected_path = "video_understanding"
@@ -270,7 +284,7 @@ class YouTubeService:
         if not self._settings.gemini_api_key:
             raise ConfigurationError("GEMINI_API_KEY is not configured")
         template = self._prompts.youtube_summary["template"].replace("__SOURCE_LABEL__", "공개 YouTube 영상")
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self._settings.gemini_youtube_model}:generateContent"
+        endpoint = self._build_gemini_generate_content_endpoint(self._settings.gemini_youtube_model)
         payload = self._build_generate_content_payload(url=self._normalize_public_video_url(url), prompt=template)
         return await self._request_summary(endpoint=endpoint, payload=payload, error_label="Gemini YouTube video understanding")
 
@@ -288,7 +302,7 @@ class YouTubeService:
             "# Transcript\n"
             f"{transcript_text}"
         )
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self._settings.gemini_chat_model}:generateContent"
+        endpoint = self._build_gemini_generate_content_endpoint(self._settings.gemini_chat_model)
         payload = {
             "contents": [
                 {
@@ -297,7 +311,33 @@ class YouTubeService:
                 }
             ]
         }
-        return await self._request_summary(endpoint=endpoint, payload=payload, error_label="Gemini transcript summarization")
+        try:
+            return await self._request_summary(
+                endpoint=endpoint,
+                payload=payload,
+                error_label="Gemini transcript summarization",
+            )
+        except ExternalAPIError as exc:
+            fallback_model = self._normalize_optional_model_name(self._settings.gemini_youtube_transcript_fallback_model)
+            if exc.status_code not in {429, 503} or not fallback_model or fallback_model == self._settings.gemini_chat_model:
+                raise
+            logger.warning(
+                "youtube_transcript_summary_model_fallback",
+                extra={
+                    "url": url,
+                    "primary_model": self._settings.gemini_chat_model,
+                    "fallback_model": fallback_model,
+                    "status_code": exc.status_code,
+                    "fallback_delay_seconds": self._settings.gemini_youtube_transcript_fallback_delay_seconds,
+                },
+            )
+            await asyncio.sleep(self._settings.gemini_youtube_transcript_fallback_delay_seconds)
+            fallback_endpoint = self._build_gemini_generate_content_endpoint(fallback_model)
+            return await self._request_summary(
+                endpoint=fallback_endpoint,
+                payload=payload,
+                error_label=f"Gemini transcript summarization fallback ({fallback_model})",
+            )
 
     async def _request_summary(
         self,
@@ -324,6 +364,7 @@ class YouTubeService:
                     raise ExternalAPIError(f"{error_label} timed out") from exc
                 except httpx.HTTPStatusError as exc:
                     if self._should_retry_status(exc.response.status_code, attempt):
+                        await asyncio.sleep(self._RETRY_DELAY_SECONDS)
                         logger.warning(
                             "youtube_summary_retrying_after_503",
                             extra={
@@ -392,6 +433,7 @@ class YouTubeService:
     @classmethod
     def _build_transcript_bundle(cls, transcript: object) -> TranscriptBundle | None:
         segments: list[TranscriptSegment] = []
+        estimated_duration_ms = 0
         for snippet in transcript:
             text = cls._clean_caption_text(getattr(snippet, "text", ""))
             if not text:
@@ -403,7 +445,13 @@ class YouTubeService:
                 start_ms = max(0, int(float(start_value) * 1000))
             except (TypeError, ValueError):
                 continue
+            duration_value = getattr(snippet, "duration", 0.0)
+            try:
+                duration_ms = max(0, int(float(duration_value) * 1000))
+            except (TypeError, ValueError):
+                duration_ms = 0
             segments.append(TranscriptSegment(start_ms=start_ms, text=text))
+            estimated_duration_ms = max(estimated_duration_ms, start_ms + duration_ms)
 
         if not segments:
             return None
@@ -414,6 +462,7 @@ class YouTubeService:
                 getattr(transcript, "is_generated", getattr(transcript, "is_auto_generated", False))
             ),
             segments=segments,
+            estimated_duration_ms=estimated_duration_ms or max(segment.start_ms for segment in segments),
         )
 
     @staticmethod
@@ -463,6 +512,18 @@ class YouTubeService:
         if trace.transcript_status and trace.transcript_status != "transcript_ready":
             return trace.transcript_status
         return route_reason
+
+    @classmethod
+    def _should_force_transcript_fast_path(
+        cls,
+        transcript: TranscriptBundle | None,
+        assessment: TranscriptRouteAssessment,
+    ) -> bool:
+        if transcript is None or assessment.should_use_fast_path:
+            return False
+        if transcript.estimated_duration_ms < cls._LONG_TRANSCRIPT_FAST_PATH_THRESHOLD_MS:
+            return False
+        return assessment.route_reason not in cls._LONG_TRANSCRIPT_FAST_PATH_EXCLUDED_REASONS
 
     def _format_transcript_for_prompt(self, transcript: TranscriptBundle) -> str:
         lines: list[str] = []
@@ -521,7 +582,7 @@ class YouTubeService:
         if not self._settings.gemini_api_key:
             raise ConfigurationError("GEMINI_API_KEY is not configured")
         prompt = self._TRANSCRIPT_ROUTE_CLASSIFIER_PROMPT.format(sample=self._build_transcript_classifier_sample(transcript))
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self._settings.gemini_chat_model}:generateContent"
+        endpoint = self._build_gemini_generate_content_endpoint(self._settings.gemini_chat_model)
         payload = {
             "contents": [
                 {
@@ -642,11 +703,25 @@ class YouTubeService:
         response_text = exc.response.text.lower()
         guarded_keywords = ("youtube", "video", "private", "blocked", "unavailable", "permission", "public")
         if status_code in {400, 403, 404} and any(keyword in response_text for keyword in guarded_keywords):
-            return ExternalAPIError("YouTube video is private, blocked, or inaccessible for Gemini video understanding")
+            return ExternalAPIError(
+                "YouTube video is private, blocked, or inaccessible for Gemini video understanding",
+                status_code=status_code,
+            )
         if status_code in {408, 504}:
-            return ExternalAPIError(f"{error_label} timed out")
-        return ExternalAPIError(f"{error_label} failed with status {status_code}")
+            return ExternalAPIError(f"{error_label} timed out", status_code=status_code)
+        return ExternalAPIError(f"{error_label} failed with status {status_code}", status_code=status_code)
 
     @classmethod
     def _should_retry_status(cls, status_code: int, attempt: int) -> bool:
         return status_code in cls._RETRYABLE_STATUS_CODES and attempt < cls._MAX_SUMMARY_RETRIES
+
+    @staticmethod
+    def _build_gemini_generate_content_endpoint(model_name: str) -> str:
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+
+    @staticmethod
+    def _normalize_optional_model_name(model_name: str | None) -> str | None:
+        if model_name is None:
+            return None
+        normalized = model_name.strip()
+        return normalized or None

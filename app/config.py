@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_youtube_model: str = "gemini-2.5-flash"
+    gemini_youtube_transcript_fallback_model: str | None = "gemini-2.5-flash-lite"
+    gemini_youtube_transcript_fallback_delay_seconds: float = 1.0
     gemini_timeout_seconds: int = 60
     youtube_dynamic_routing_enabled: bool = False
     youtube_transcript_timeout_seconds: int = 3
@@ -58,8 +60,9 @@ class Settings(BaseSettings):
     kimi_formula_uris: str = ",".join(DEFAULT_KIMI_FORMULA_URIS)
     kimi_tool_timeout_seconds: int = 25
     kimi_max_iterations: int = 5
-    kimi_overall_deadline_seconds: int = 360
+    kimi_overall_deadline_seconds: int = 900
     hanall_max_web_search_rounds: int = 2
+    hanall_collect_retry_delays_seconds: str = "60,180"
 
     weather_api_key: str | None = None
     weather_grid_x: int = 95
@@ -77,6 +80,23 @@ class Settings(BaseSettings):
     @cached_property
     def kimi_formula_uri_list(self) -> list[str]:
         return [item.strip() for item in self.kimi_formula_uris.split(",") if item.strip()]
+
+    @cached_property
+    def hanall_collect_retry_delay_list(self) -> list[float]:
+        if not self.hanall_collect_retry_delays_seconds.strip():
+            return []
+
+        delays: list[float] = []
+        for item in self.hanall_collect_retry_delays_seconds.split(","):
+            normalized = item.strip()
+            try:
+                delay_seconds = float(normalized)
+            except ValueError as exc:
+                raise ConfigurationError("HANALL_COLLECT_RETRY_DELAYS_SECONDS must contain numeric seconds values") from exc
+            if delay_seconds <= 0:
+                raise ConfigurationError("HANALL_COLLECT_RETRY_DELAYS_SECONDS must contain positive values")
+            delays.append(delay_seconds)
+        return delays
 
     @cached_property
     def kma_base_slot_list(self) -> list[str]:

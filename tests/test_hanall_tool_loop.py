@@ -113,6 +113,35 @@ class FakeClient:
         self.chat = type("Chat", (), {"completions": FakeCompletions()})()
 
 
+class RetryableCompletionError(Exception):
+    def __init__(self, status_code: int, error_type: str) -> None:
+        super().__init__(f"status={status_code} type={error_type}")
+        self.status_code = status_code
+        self.body = {"error": {"type": error_type}}
+
+
+class RetryingCompletions:
+    def __init__(self, failures_before_success: int, final_text: str) -> None:
+        self._failures_before_success = failures_before_success
+        self._final_text = final_text
+        self.calls = 0
+        self.received_messages = []
+        self.received_tools = []
+
+    async def create(self, **kwargs: object):
+        self.calls += 1
+        self.received_messages.append(kwargs["messages"])
+        self.received_tools.append(kwargs.get("tools"))
+        if self.calls <= self._failures_before_success:
+            raise RetryableCompletionError(429, "engine_overloaded_error")
+        return FakeResponse("stop", FakeMessage(self._final_text))
+
+
+class RetryingClient:
+    def __init__(self, failures_before_success: int, final_text: str) -> None:
+        self.chat = type("Chat", (), {"completions": RetryingCompletions(failures_before_success, final_text)})()
+
+
 class ExhaustedLoopCompletions:
     def __init__(self, final_text: str) -> None:
         self._final_text = final_text
@@ -282,6 +311,31 @@ async def test_hanall_tool_loop_limits_web_search_rounds_before_final_render(tes
     assert final_request_messages[-1]["role"] == "user"
     previous_message = final_request_messages[-2]
     assert previous_message["role"] == "tool"
+
+
+async def test_hanall_collect_retries_overloaded_chat_completion_with_backoff(test_settings) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = HanallResearchService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        artifact_repository=type("Repo", (), {"get_by_key": lambda *_: None, "save": lambda *args, **kwargs: args[1]})(),
+    )
+    test_settings.hanall_collect_retry_delays_seconds = "60,180"
+    service._client = RetryingClient(2, final_text)
+    service._load_formula_tools = lambda: []
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    service._sleep_before_retry = fake_sleep
+
+    artifact = await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    assert artifact.summary_text == PUBLIC_BRIEF
+    assert artifact.detail_text == ADMIN_REPORT.strip()
+    assert service._client.chat.completions.calls == 3
+    assert sleep_calls == [60.0, 180.0]
 
 
 async def test_invoke_formula_wraps_tool_call_for_fiber_request(test_settings) -> None:

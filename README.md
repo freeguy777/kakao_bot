@@ -51,7 +51,7 @@ Single-app Kakao bot system built with MessengerBotR API2, FastAPI, SQLite, and 
 - Inbound dedupe uses `logId`, outbound dedupe uses `message_id`, scheduler dedupe uses `job_key`.
 - Outbound socket success means only that FastAPI wrote the control envelope to MessengerBot's built-in socket transport.
 - Device-side `bot.send()` failures are reported locally by `bot_gateway.txt` to the admin room instead of returning a socket ACK to FastAPI.
-- HanAll collect runs once at 08:00 KST and room publish jobs reuse the stored artifact.
+- HanAll collect runs once at 07:42 KST and room publish jobs reuse the stored artifact.
 
 ## MessengerBotR Docs
 - [Event](https://violetxf.gitbook.io/messengerbot/api2/event)

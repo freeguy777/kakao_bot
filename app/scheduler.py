@@ -38,7 +38,7 @@ class SchedulerService:
     def start(self) -> None:
         self._scheduler.add_job(
             self.run_daily_hanall_collect,
-            CronTrigger(hour=8, minute=0, timezone=self._timezone),
+            CronTrigger(hour=7, minute=42, timezone=self._timezone),
             id="hanall_collect",
             replace_existing=True,
         )
@@ -81,7 +81,7 @@ class SchedulerService:
         try:
             artifact = await self._hanall_research_service.get_existing_daily_artifact(now.date())
             if artifact is None:
-                detail = "daily HanAll research artifact is missing; publish reuses only the 08:00 collect result"
+                detail = "daily HanAll research artifact is missing; publish reuses only the 07:42 collect result"
                 self._scheduled_job_repository.mark_status(job_key, constants.SCHEDULED_STATUS_FAILED, detail)
                 await self._admin_notifier.notify_feature_error(
                     room_name=room.name,

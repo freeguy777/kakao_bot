@@ -286,6 +286,10 @@ async def test_scheduler_refreshes_room_jobs_when_rooms_config_changes(test_sett
 
     scheduler.start()
     try:
+        collect_job = scheduler._scheduler.get_job("hanall_collect")
+        assert collect_job is not None
+        assert str(collect_job.trigger) == "cron[hour='7', minute='42']"
+
         job = scheduler._scheduler.get_job("hanall_publish::테스트하는방방방")
         assert job is not None
         assert str(job.trigger) == "cron[hour='9', minute='0']"
