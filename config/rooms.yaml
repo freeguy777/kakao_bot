@@ -16,7 +16,7 @@ rooms:
       location_label: "김해율하"
       grid_x: 95
       grid_y: 77
-      publish_time: "08:10"
+      publish_time: "08:13"
 
   - name: "한올테맨"
     admin: false
@@ -24,7 +24,7 @@ rooms:
     persona_path: "config/personas/room1.md"
     features:
       youtube_summary: true
-      llm_chat: true
+      llm_chat: false
       hanall_briefing: true
       weather: false
       child_age: false
@@ -48,13 +48,13 @@ rooms:
       weather: true
       child_age: true
       admin_commands: false
-    hanall_publish_time: "08:20"
+    hanall_publish_time: "08:02"
     weather:
       enabled: true
       location_label: "서울강남"
       grid_x: 62
       grid_y: 125
-      publish_time: "07:40"
+      publish_time: "08:11"
 
 
   - name: "가족방"
@@ -73,7 +73,7 @@ rooms:
       location_label: "김해율하"
       grid_x: 95
       grid_y: 77
-      publish_time: "08:10"
+      publish_time: "08:06"
 
   - name: "현기휘태"
     admin: false

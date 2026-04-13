@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 class WeatherService:
     BASE_URL = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0/getVilageFcst"
+    KMA_GRID_EARTH_RADIUS_KM = 6371.00877
+    KMA_GRID_SPACING_KM = 5.0
+    KMA_GRID_STANDARD_LAT1 = 30.0
+    KMA_GRID_STANDARD_LAT2 = 60.0
+    KMA_GRID_ORIGIN_LON = 126.0
+    KMA_GRID_ORIGIN_LAT = 38.0
+    KMA_GRID_ORIGIN_X = 43.0
+    KMA_GRID_ORIGIN_Y = 136.0
+    AIR_QUALITY_SEVERITY = {"좋음": 0, "보통": 1, "나쁨": 2, "매우나쁨": 3}
 
     def __init__(self, *, settings: Settings, delivery_service: object, admin_notifier: object) -> None:
         self._settings = settings
@@ -44,6 +54,9 @@ class WeatherService:
         min_temp = await self._fetch_daily_min_temp(grid_x=grid_x, grid_y=grid_y)
         if min_temp is not None:
             snapshot = snapshot.model_copy(update={"min_temp": f"{min_temp}°"})
+        air_quality_fields = await self._fetch_air_quality_for_grid(grid_x=grid_x, grid_y=grid_y)
+        if air_quality_fields:
+            snapshot = snapshot.model_copy(update=air_quality_fields)
         return snapshot
 
     async def _fetch_with_fallback(
@@ -95,6 +108,61 @@ class WeatherService:
         if not items:
             raise ExternalAPIError("KMA returned no forecast items")
         return items
+
+    async def _fetch_air_quality_for_grid(self, *, grid_x: int, grid_y: int) -> dict[str, str]:
+        latitude, longitude = self._grid_to_latlon(grid_x=grid_x, grid_y=grid_y)
+        try:
+            pm10, pm2_5 = await self._fetch_air_quality(latitude=latitude, longitude=longitude)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "weather_air_quality_fetch_failed",
+                extra={
+                    "grid_x": grid_x,
+                    "grid_y": grid_y,
+                    "latitude": round(latitude, 6),
+                    "longitude": round(longitude, 6),
+                    "error": str(exc),
+                },
+            )
+            return {}
+
+        air_quality_grade = self._resolve_air_quality_grade(pm10=pm10, pm2_5=pm2_5)
+        if air_quality_grade is None:
+            return {}
+
+        fields: dict[str, str] = {"air_quality_grade": air_quality_grade}
+        if pm10 is not None:
+            fields["pm10"] = self._format_air_quality_value(pm10)
+        if pm2_5 is not None:
+            fields["pm2_5"] = self._format_air_quality_value(pm2_5)
+        return fields
+
+    async def _fetch_air_quality(self, *, latitude: float, longitude: float) -> tuple[float | None, float | None]:
+        params = {
+            "latitude": f"{latitude:.6f}",
+            "longitude": f"{longitude:.6f}",
+            "hourly": "pm10,pm2_5",
+            "timezone": self._settings.app_timezone,
+            "past_hours": 1,
+            "forecast_hours": 1,
+            "domains": "auto",
+        }
+        async with httpx.AsyncClient(timeout=self._settings.air_quality_timeout_seconds) as client:
+            response = await client.get(self._settings.air_quality_api_url, params=params)
+            response.raise_for_status()
+
+        payload = response.json()
+        hourly = payload.get("hourly") or {}
+        times = hourly.get("time") or []
+        if not isinstance(times, list) or not times:
+            raise ExternalAPIError("Air quality API returned no hourly timestamps")
+
+        now = datetime.now(self._timezone)
+        pm10 = self._pick_air_quality_value(times=times, values=hourly.get("pm10") or [], now=now)
+        pm2_5 = self._pick_air_quality_value(times=times, values=hourly.get("pm2_5") or [], now=now)
+        if pm10 is None and pm2_5 is None:
+            raise ExternalAPIError("Air quality API returned no PM data")
+        return pm10, pm2_5
 
     def _build_base_candidates(self, now: datetime) -> list[tuple[str, str]]:
         slots = self._settings.kma_base_slot_list
@@ -185,6 +253,31 @@ class WeatherService:
             fetched_at=now,
         )
 
+    def _grid_to_latlon(self, *, grid_x: int, grid_y: int) -> tuple[float, float]:
+        deg_to_rad = math.pi / 180.0
+        rad_to_deg = 180.0 / math.pi
+        re = self.KMA_GRID_EARTH_RADIUS_KM / self.KMA_GRID_SPACING_KM
+        slat1 = self.KMA_GRID_STANDARD_LAT1 * deg_to_rad
+        slat2 = self.KMA_GRID_STANDARD_LAT2 * deg_to_rad
+        olon = self.KMA_GRID_ORIGIN_LON * deg_to_rad
+        olat = self.KMA_GRID_ORIGIN_LAT * deg_to_rad
+
+        sn = math.tan(math.pi * 0.25 + slat2 * 0.5) / math.tan(math.pi * 0.25 + slat1 * 0.5)
+        sn = math.log(math.cos(slat1) / math.cos(slat2)) / math.log(sn)
+        sf = math.tan(math.pi * 0.25 + slat1 * 0.5)
+        sf = math.pow(sf, sn) * math.cos(slat1) / sn
+        ro = math.tan(math.pi * 0.25 + olat * 0.5)
+        ro = re * sf / math.pow(ro, sn)
+
+        xn = float(grid_x) - self.KMA_GRID_ORIGIN_X
+        yn = ro - float(grid_y) + self.KMA_GRID_ORIGIN_Y
+        ra = math.sqrt(xn * xn + yn * yn)
+        alat = math.pow(re * sf / ra, 1.0 / sn)
+        alat = 2.0 * math.atan(alat) - math.pi * 0.5
+        theta = 0.0 if xn == 0 else math.atan2(xn, yn)
+        alon = theta / sn + olon
+        return alat * rad_to_deg, alon * rad_to_deg
+
     @staticmethod
     def _pick_single(items: list[dict], category: str) -> str | None:
         for item in items:
@@ -225,6 +318,27 @@ class WeatherService:
                     return str(item.get("fcstValue"))
         return str(candidates[-1].get("fcstValue"))
 
+    def _pick_air_quality_value(self, *, times: list[object], values: list[object], now: datetime) -> float | None:
+        candidates: list[tuple[datetime, float]] = []
+        for raw_time, raw_value in zip(times, values):
+            value = self._to_float(raw_value)
+            if value is None:
+                continue
+            timestamp = datetime.fromisoformat(str(raw_time))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=self._timezone)
+            else:
+                timestamp = timestamp.astimezone(self._timezone)
+            candidates.append((timestamp, value))
+
+        if not candidates:
+            return None
+
+        past_candidates = [item for item in candidates if item[0] <= now]
+        if past_candidates:
+            return past_candidates[-1][1]
+        return candidates[0][1]
+
     @staticmethod
     def _map_summary(*, sky: str | None, pty: str | None) -> str:
         precipitation_map = {"1": "비", "2": "비/눈", "3": "눈", "4": "소나기"}
@@ -244,3 +358,43 @@ class WeatherService:
         if "맑음" in summary:
             return "무리 없이 편안한 하루 흐름만 챙기면 충분해요."
         return "큰 변수보다 일정 흐름만 가볍게 챙기면 좋아요."
+
+    @classmethod
+    def _resolve_air_quality_grade(cls, *, pm10: float | None, pm2_5: float | None) -> str | None:
+        grades = [grade for grade in (cls._grade_pm10(pm10), cls._grade_pm2_5(pm2_5)) if grade is not None]
+        if not grades:
+            return None
+        return max(grades, key=lambda grade: cls.AIR_QUALITY_SEVERITY[grade])
+
+    @staticmethod
+    def _grade_pm10(value: float | None) -> str | None:
+        return WeatherService._grade_pollutant(value, thresholds=(30.0, 80.0, 150.0))
+
+    @staticmethod
+    def _grade_pm2_5(value: float | None) -> str | None:
+        return WeatherService._grade_pollutant(value, thresholds=(15.0, 35.0, 75.0))
+
+    @staticmethod
+    def _grade_pollutant(value: float | None, *, thresholds: tuple[float, float, float]) -> str | None:
+        if value is None:
+            return None
+        if value <= thresholds[0]:
+            return "좋음"
+        if value <= thresholds[1]:
+            return "보통"
+        if value <= thresholds[2]:
+            return "나쁨"
+        return "매우나쁨"
+
+    @staticmethod
+    def _format_air_quality_value(value: float) -> str:
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _to_float(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(str(value))
+        except (TypeError, ValueError):
+            return None

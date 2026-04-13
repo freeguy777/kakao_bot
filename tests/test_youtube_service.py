@@ -90,6 +90,30 @@ def test_youtube_http_error_maps_inaccessible_video() -> None:
     assert "private, blocked, or inaccessible" in str(mapped)
 
 
+def test_generic_summary_response_matches_insufficient_info_fallback(test_settings) -> None:
+    service = build_service(test_settings)
+
+    assert service._is_generic_summary_response(
+        "정보가 부족하여 영상 내용을 요약할 수 없습니다. "
+        "영상을 분석할 수 있는 구체적인 내용(대본 또는 주요 내용 설명)을 제공해주시면 "
+        "요청하신 형식으로 핵심을 정리해 드리겠습니다."
+    )
+
+
+def test_generic_summary_response_does_not_match_structured_summary(test_settings) -> None:
+    service = build_service(test_settings)
+
+    assert not service._is_generic_summary_response(
+        "◆ 한줄 요약: 시장 금리 급등이 기술주 변동성을 키웠습니다.\n\n"
+        "• 주요 포인트\n"
+        "- 금리 상승 (00:12): 성장주 밸류에이션 부담이 커졌습니다.\n"
+        "- 기술주 약세 (01:04): 대형주 중심으로 차익 실현이 나왔습니다.\n"
+        "- 자금 이동 (02:10): 방어주와 현금 비중 확대가 관찰됩니다.\n\n"
+        "• 인사이트\n"
+        "- 단기 반등보다 금리 방향 확인이 우선입니다."
+    )
+
+
 async def test_request_summary_retries_once_after_503_and_succeeds(test_settings, monkeypatch) -> None:
     service = build_service(test_settings)
     responses = [
@@ -172,6 +196,63 @@ async def test_request_summary_retries_once_after_503_then_raises(test_settings,
     assert sleep_calls == [2.0]
 
 
+async def test_summarize_transcript_uses_default_prompt_and_flash_model(test_settings) -> None:
+    service = build_service(test_settings)
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        segments=[
+            TranscriptSegment(start_ms=0, text="먼저 핵심 내용을 설명하겠습니다"),
+            TranscriptSegment(start_ms=1000, text="정리하면 오늘 영상의 중요한 포인트입니다"),
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_request_summary(*, endpoint: str, payload: dict[str, object], error_label: str, **kwargs: object) -> str:
+        captured["endpoint"] = endpoint
+        captured["payload"] = payload
+        captured["error_label"] = error_label
+        return "summary"
+
+    service._request_summary = fake_request_summary  # type: ignore[method-assign]
+
+    summary = await service._summarize_transcript("https://youtu.be/abc123xyz00", transcript)
+
+    assert summary == "summary"
+    assert captured["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    assert captured["error_label"] == "Gemini transcript summarization"
+    prompt = captured["payload"]["contents"][0]["parts"][0]["text"]  # type: ignore[index]
+    assert "단 1분 만에 파악할 수 있도록 핵심만 정리해주는 '프로 요약러'" in prompt
+    assert "공개 YouTube 영상 자막" in prompt
+    assert "# Transcript" in prompt
+
+
+async def test_summarize_transcript_uses_lite_prompt_when_lite_model_is_selected(test_settings) -> None:
+    test_settings.gemini_youtube_transcript_model = "gemini-2.5-flash-lite"
+    service = build_service(test_settings)
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        segments=[TranscriptSegment(start_ms=0, text="먼저 핵심 내용을 설명하겠습니다")],
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_request_summary(*, endpoint: str, payload: dict[str, object], error_label: str, **kwargs: object) -> str:
+        captured["endpoint"] = endpoint
+        captured["payload"] = payload
+        captured["error_label"] = error_label
+        return "summary"
+
+    service._request_summary = fake_request_summary  # type: ignore[method-assign]
+
+    summary = await service._summarize_transcript("https://youtu.be/abc123xyz00", transcript)
+
+    assert summary == "summary"
+    assert captured["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+    prompt = captured["payload"]["contents"][0]["parts"][0]["text"]  # type: ignore[index]
+    assert "빠르고 핵심만 정리해주는 프로 요약러" in prompt
+
+
 async def test_summarize_transcript_falls_back_to_lite_model_after_503(test_settings) -> None:
     service = build_service(test_settings)
     transcript = TranscriptBundle(
@@ -245,6 +326,44 @@ async def test_summarize_transcript_falls_back_to_lite_model_after_429(test_sett
     assert sleep_calls == [1.0]
     assert calls[1]["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
     assert calls[1]["error_label"] == "Gemini transcript summarization fallback (gemini-2.5-flash-lite)"
+
+
+async def test_summarize_transcript_uses_video_model_as_fallback_when_primary_and_fallback_match(test_settings) -> None:
+    test_settings.gemini_youtube_transcript_model = "gemini-2.5-flash"
+    test_settings.gemini_youtube_transcript_fallback_model = "gemini-2.5-flash"
+    test_settings.gemini_youtube_model = "gemini-2.5-flash-lite"
+    service = build_service(test_settings)
+    transcript = TranscriptBundle(
+        language_code="ko",
+        is_auto_generated=False,
+        segments=[TranscriptSegment(start_ms=0, text="먼저 핵심 내용을 설명하겠습니다")],
+    )
+    calls: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+
+    async def fake_request_summary(*, endpoint: str, payload: dict[str, object], error_label: str, **kwargs: object) -> str:
+        calls.append({"endpoint": endpoint, "payload": payload, "error_label": error_label})
+        if len(calls) == 1:
+            raise ExternalAPIError("Gemini transcript summarization failed with status 503", status_code=503)
+        return "fallback summary"
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    service._request_summary = fake_request_summary  # type: ignore[method-assign]
+    original_sleep = service._summarize_transcript.__globals__["asyncio"].sleep
+    service._summarize_transcript.__globals__["asyncio"].sleep = fake_sleep
+
+    try:
+        summary = await service._summarize_transcript("https://youtu.be/abc123xyz00", transcript)
+    finally:
+        service._summarize_transcript.__globals__["asyncio"].sleep = original_sleep
+
+    assert summary == "fallback summary"
+    assert len(calls) == 2
+    assert sleep_calls == [1.0]
+    assert calls[0]["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    assert calls[1]["endpoint"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
 
 
 def test_extract_video_id_supports_common_single_video_urls(test_settings) -> None:
@@ -734,6 +853,38 @@ async def test_handle_url_notifies_admin_with_routing_context_on_video_timeout(t
     assert kwargs["room_name"] == "테스트하는방방방"
     assert "Gemini YouTube video understanding timed out" in kwargs["error_message"]
     assert "routing: dynamic=on, path=video_understanding, reason=transcript_unavailable" in kwargs["error_message"]
+
+
+async def test_handle_url_suppresses_generic_summary_and_notifies_admin_only(test_settings) -> None:
+    test_settings.youtube_dynamic_routing_enabled = True
+    delivery_service = SimpleNamespace(send_text=AsyncMock())
+    admin_notifier = SimpleNamespace(notify_feature_error=AsyncMock())
+    service = YouTubeService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        delivery_service=delivery_service,
+        admin_notifier=admin_notifier,
+    )
+    service.summarize_url = AsyncMock(
+        return_value=(
+            "정보가 부족하여 영상 내용을 요약할 수 없습니다. "
+            "영상을 분석할 수 있는 구체적인 내용(대본 또는 주요 내용 설명)을 제공해주시면 "
+            "요청하신 형식으로 핵심을 정리해 드리겠습니다."
+        )
+    )
+
+    await service.handle_url(
+        SimpleNamespace(name="테스트하는방방방", package_name="com.kakao.talk"),
+        SimpleNamespace(log_id="log-123"),
+        "https://youtu.be/abc123xyz00",
+    )
+
+    delivery_service.send_text.assert_not_awaited()
+    admin_notifier.notify_feature_error.assert_awaited_once()
+    kwargs = admin_notifier.notify_feature_error.await_args.kwargs
+    assert kwargs["room_name"] == "테스트하는방방방"
+    assert "일반방 전송 차단: 유튜브 요약 generic 응답" in kwargs["error_message"]
+    assert "정보가 부족하여 영상 내용을 요약할 수 없습니다." in kwargs["error_message"]
 
 
 async def test_handle_url_notifies_admin_when_transcript_summary_falls_back_then_video_times_out(test_settings) -> None:

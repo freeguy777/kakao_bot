@@ -193,6 +193,11 @@ class YouTubeService:
         }
     )
     _TRANSCRIPT_ROUTE_LABELS = frozenset({"informative", "lyrics", "sound_effect_only", "garbled_or_unclear"})
+    _GENERIC_SUMMARY_PATTERNS = (
+        re.compile(r"정보가 부족[^\n]{0,80}(영상|자막).{0,40}(요약|분석)할 수 없"),
+        re.compile(r"(영상|자막).{0,20}분석할 수 있는 구체적인 내용"),
+        re.compile(r"(대본|주요 내용 설명|추가 정보).{0,30}제공해?주시면"),
+    )
     _TRANSCRIPT_CLASSIFIER_SAMPLE_SIZE = 12
     _TRANSCRIPT_CLASSIFIER_TIMEOUT_SECONDS = 15
     _LONG_TRANSCRIPT_FAST_PATH_THRESHOLD_MS = 5 * 60 * 1000
@@ -234,6 +239,21 @@ class YouTubeService:
         routing_trace = YouTubeRoutingTrace(dynamic_routing_enabled=self._settings.youtube_dynamic_routing_enabled)
         try:
             summary = await self.summarize_url(url, trace=routing_trace)
+            if self._is_generic_summary_response(summary):
+                logger.info(
+                    "youtube_summary_generic_response_suppressed",
+                    extra=routing_trace.to_log_extra(url=url, error="generic_response_suppressed"),
+                )
+                await self._admin_notifier.notify_feature_error(
+                    room_name=room.name,
+                    feature_name="youtube_summary",
+                    error_message=self._build_generic_response_admin_message(
+                        url=url,
+                        response=summary,
+                        routing_trace=routing_trace,
+                    ),
+                )
+                return
             await self._delivery_service.send_text(
                 room.name,
                 summary,
@@ -291,7 +311,8 @@ class YouTubeService:
     async def _summarize_transcript(self, url: str, transcript: TranscriptBundle) -> str:
         if not self._settings.gemini_api_key:
             raise ConfigurationError("GEMINI_API_KEY is not configured")
-        template = self._prompts.youtube_summary["template"].replace("__SOURCE_LABEL__", "공개 YouTube 영상 자막")
+        primary_model = self._settings.gemini_youtube_transcript_model
+        template = self._resolve_transcript_summary_template(primary_model).replace("__SOURCE_LABEL__", "공개 YouTube 영상 자막")
         transcript_text = self._format_transcript_for_prompt(transcript)
         prompt = (
             f"{template}\n\n"
@@ -302,7 +323,7 @@ class YouTubeService:
             "# Transcript\n"
             f"{transcript_text}"
         )
-        endpoint = self._build_gemini_generate_content_endpoint(self._settings.gemini_chat_model)
+        endpoint = self._build_gemini_generate_content_endpoint(primary_model)
         payload = {
             "contents": [
                 {
@@ -318,14 +339,14 @@ class YouTubeService:
                 error_label="Gemini transcript summarization",
             )
         except ExternalAPIError as exc:
-            fallback_model = self._normalize_optional_model_name(self._settings.gemini_youtube_transcript_fallback_model)
-            if exc.status_code not in {429, 503} or not fallback_model or fallback_model == self._settings.gemini_chat_model:
+            fallback_model = self._resolve_transcript_fallback_model(primary_model)
+            if exc.status_code not in {429, 503} or not fallback_model:
                 raise
             logger.warning(
                 "youtube_transcript_summary_model_fallback",
                 extra={
                     "url": url,
-                    "primary_model": self._settings.gemini_chat_model,
+                    "primary_model": primary_model,
                     "fallback_model": fallback_model,
                     "status_code": exc.status_code,
                     "fallback_delay_seconds": self._settings.gemini_youtube_transcript_fallback_delay_seconds,
@@ -338,6 +359,42 @@ class YouTubeService:
                 payload=payload,
                 error_label=f"Gemini transcript summarization fallback ({fallback_model})",
             )
+
+    def _resolve_transcript_summary_template(self, primary_model: str) -> str:
+        use_lite_prompt = "lite" in primary_model.lower() and self._prompts.youtube_summary_lite is not None
+        prompt_block = self._prompts.youtube_summary_lite if use_lite_prompt else self._prompts.youtube_summary
+        return str(prompt_block["template"])
+
+    @classmethod
+    def _is_generic_summary_response(cls, text: str) -> bool:
+        normalized = cls._WHITESPACE_PATTERN.sub(" ", text).strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in cls._GENERIC_SUMMARY_PATTERNS)
+
+    @staticmethod
+    def _build_generic_response_admin_message(
+        *,
+        url: str,
+        response: str,
+        routing_trace: YouTubeRoutingTrace,
+    ) -> str:
+        return (
+            "일반방 전송 차단: 유튜브 요약 generic 응답\n"
+            f"url: {url}\n"
+            f"응답: {response}\n"
+            f"{routing_trace.to_admin_context()}"
+        )
+
+    def _resolve_transcript_fallback_model(self, primary_model: str) -> str | None:
+        candidates = (
+            self._normalize_optional_model_name(self._settings.gemini_youtube_transcript_fallback_model),
+            self._normalize_optional_model_name(self._settings.gemini_youtube_model),
+        )
+        for candidate in candidates:
+            if candidate and candidate != primary_model:
+                return candidate
+        return None
 
     async def _request_summary(
         self,

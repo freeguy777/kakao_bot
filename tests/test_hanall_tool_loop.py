@@ -277,6 +277,12 @@ async def test_hanall_tool_loop_requests_final_render_without_tools_when_iterati
     final_request_messages = service._client.chat.completions.received_messages[-1]
     assert final_request_messages[-1]["role"] == "user"
     assert "추가 도구 호출을 중단" in final_request_messages[-1]["content"]
+    assert "각 섹션 제목 줄 끝에 건수/개수를 붙여라" in final_request_messages[-1]["content"]
+    assert "건수/개수는 제목 줄에만 쓰고 bullet에서는" in final_request_messages[-1]["content"]
+    assert "bullet 1개는 사실 1건 또는 포인트 1개만 담아라" in final_request_messages[-1]["content"]
+    assert "filing 이름만 쓰지 말고 사건 의미를 먼저 적어라" in final_request_messages[-1]["content"]
+    assert "핵심 수량/거래일" in final_request_messages[-1]["content"]
+    assert "public_brief 1번 섹션에도 축약 반영하라" in final_request_messages[-1]["content"]
 
 
 async def test_hanall_tool_loop_limits_web_search_rounds_before_final_render(test_settings) -> None:

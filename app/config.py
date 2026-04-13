@@ -8,7 +8,7 @@ import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.constants import DEFAULT_KIMI_FORMULA_URIS, DEFAULT_KMA_BASE_SLOTS
+from app.constants import DEFAULT_KIMI_FORMULA_URIS, DEFAULT_KMA_BASE_SLOTS, DEFAULT_MESSAGE_CHUNK_LIMIT
 from app.errors import ConfigurationError
 from app.schemas import PromptLibrary, RoomRegistryConfig
 
@@ -40,13 +40,14 @@ class Settings(BaseSettings):
     socket_max_retries: int = 3
     socket_retry_backoff_seconds: float = 1.0
 
-    message_chunk_limit: int = 900
+    message_chunk_limit: int = DEFAULT_MESSAGE_CHUNK_LIMIT
     admin_room_name: str = "김휘태"
     default_package_name: str = "com.kakao.talk"
 
     gemini_api_key: str | None = None
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_youtube_model: str = "gemini-2.5-flash"
+    gemini_youtube_transcript_model: str = "gemini-2.5-flash"
     gemini_youtube_transcript_fallback_model: str | None = "gemini-2.5-flash-lite"
     gemini_youtube_transcript_fallback_delay_seconds: float = 1.0
     gemini_timeout_seconds: int = 60
@@ -69,6 +70,8 @@ class Settings(BaseSettings):
     weather_grid_y: int = 77
     kma_timeout_seconds: int = 10
     kma_base_slots: str = ",".join(DEFAULT_KMA_BASE_SLOTS)
+    air_quality_api_url: str = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    air_quality_timeout_seconds: int = 10
 
     child_birth_date: str = "2024-09-26"
 

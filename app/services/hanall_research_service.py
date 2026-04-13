@@ -27,8 +27,6 @@ class HanallResearchService:
     RETRYABLE_FORMULA_STATUS_CODES = {429, 500, 502, 503, 504}
     FORMULA_MAX_RETRIES = 2
     PUBLIC_BRIEF_BULLET_PREFIX = "- "
-    PUBLIC_BRIEF_CONTINUATION_PREFIX = "  "
-    PUBLIC_BRIEF_BODY_DISPLAY_WIDTH = 64
     REQUIRED_ADMIN_SECTIONS = (
         "A. 요약",
         "B. Confirmed Updates — Company Direct",
@@ -78,141 +76,41 @@ class HanallResearchService:
     @classmethod
     def _format_public_brief(cls, public_text: str) -> str:
         formatted_lines: list[str] = []
-        for raw_line in public_text.splitlines():
+        raw_lines = public_text.splitlines()
+        index = 0
+        while index < len(raw_lines):
+            raw_line = raw_lines[index]
             stripped_line = raw_line.rstrip()
             if stripped_line.startswith(cls.PUBLIC_BRIEF_BULLET_PREFIX):
-                formatted_lines.extend(cls._wrap_public_brief_bullet(stripped_line))
+                bullet_lines = [stripped_line]
+                index += 1
+                while index < len(raw_lines):
+                    continuation_line = raw_lines[index].rstrip()
+                    if continuation_line and continuation_line[:1].isspace():
+                        bullet_lines.append(continuation_line)
+                        index += 1
+                        continue
+                    break
+                body = cls._normalize_public_brief_bullet_body(bullet_lines)
+                formatted_lines.append(f"{cls.PUBLIC_BRIEF_BULLET_PREFIX}{body}".rstrip())
                 continue
             formatted_lines.append(stripped_line)
+            index += 1
         return "\n".join(formatted_lines).strip()
 
     @classmethod
-    def _wrap_public_brief_bullet(cls, line: str) -> list[str]:
-        body = line[len(cls.PUBLIC_BRIEF_BULLET_PREFIX) :].strip()
-        if not body or cls._display_width(body) <= cls.PUBLIC_BRIEF_BODY_DISPLAY_WIDTH:
-            return [line]
-
-        comma_segments = cls._split_top_level_comma_segments(body)
-        logical_lines = (
-            cls._pack_comma_segments(comma_segments, cls.PUBLIC_BRIEF_BODY_DISPLAY_WIDTH)
-            if len(comma_segments) > 1
-            else [body]
-        )
-
-        wrapped_lines: list[str] = []
-        for logical_line in logical_lines:
-            wrapped_lines.extend(cls._wrap_body_text(logical_line, cls.PUBLIC_BRIEF_BODY_DISPLAY_WIDTH))
-
-        if len(wrapped_lines) <= 1:
-            return [line]
-        return cls._prefix_bullet_lines(wrapped_lines)
-
-    @classmethod
-    def _split_top_level_comma_segments(cls, text: str) -> list[str]:
-        segments: list[str] = []
-        buffer: list[str] = []
-        depth = 0
-        openers = "([{"
-        closers = ")]}"
-
-        for character in text:
-            if character in openers:
-                depth += 1
-                buffer.append(character)
-                continue
-            if character in closers:
-                depth = max(depth - 1, 0)
-                buffer.append(character)
-                continue
-            if character == "," and depth == 0:
-                segment = "".join(buffer).strip()
-                if segment:
-                    segments.append(segment)
-                buffer = []
-                continue
-            buffer.append(character)
-
-        tail = "".join(buffer).strip()
-        if tail:
-            segments.append(tail)
-        return segments
-
-    @classmethod
-    def _pack_comma_segments(cls, segments: list[str], width: int) -> list[str]:
-        packed_lines: list[str] = []
-        current = ""
-
-        for index, segment in enumerate(segments):
-            suffix = "," if index < len(segments) - 1 else ""
-            piece = f"{segment}{suffix}"
-            candidate = piece if not current else f"{current} {piece}"
-            if current and cls._display_width(candidate) > width:
-                packed_lines.append(current)
-                current = piece
-                continue
-            current = candidate
-
-        if current:
-            packed_lines.append(current)
-        return packed_lines
-
-    @classmethod
-    def _wrap_body_text(cls, text: str, width: int) -> list[str]:
-        words = text.split()
-        if not words:
-            return [text]
-
-        wrapped_lines: list[str] = []
-        current = ""
-        for word in words:
-            if cls._display_width(word) > width:
-                if current:
-                    wrapped_lines.append(current)
-                    current = ""
-                split_words = cls._split_token_by_display_width(word, width)
-                wrapped_lines.extend(split_words[:-1])
-                current = split_words[-1]
-                continue
-
-            candidate = word if not current else f"{current} {word}"
-            if current and cls._display_width(candidate) > width:
-                wrapped_lines.append(current)
-                current = word
-                continue
-            current = candidate
-
-        if current:
-            wrapped_lines.append(current)
-        return wrapped_lines
-
-    @classmethod
-    def _split_token_by_display_width(cls, token: str, width: int) -> list[str]:
+    def _normalize_public_brief_bullet_body(cls, lines: list[str]) -> str:
         parts: list[str] = []
-        current = ""
-        for character in token:
-            if current and cls._display_width(current + character) > width:
-                parts.append(current)
-                current = character
-                continue
-            current += character
-        if current:
-            parts.append(current)
-        return parts or [token]
-
-    @classmethod
-    def _prefix_bullet_lines(cls, lines: list[str]) -> list[str]:
-        prefixed_lines: list[str] = []
         for index, line in enumerate(lines):
-            prefix = cls.PUBLIC_BRIEF_BULLET_PREFIX if index == 0 else cls.PUBLIC_BRIEF_CONTINUATION_PREFIX
-            prefixed_lines.append(f"{prefix}{line}")
-        return prefixed_lines
-
-    @staticmethod
-    def _display_width(text: str) -> int:
-        width = 0
-        for character in text:
-            width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
-        return width
+            if index == 0:
+                body = line[len(cls.PUBLIC_BRIEF_BULLET_PREFIX) :].strip()
+            else:
+                body = line.strip()
+            if body:
+                parts.append(body)
+        merged = " ".join(parts)
+        merged = re.sub(r"\s+", " ", merged).strip()
+        return re.sub(r"(?<=\d),\s+(?=\d{3}(?:\D|$))", ",", merged)
 
     async def _run_research(self, artifact_date: date) -> HanallArtifact:
         if not self._settings.kimi_api_key:
@@ -364,6 +262,12 @@ class HanallResearchService:
             "role": "user",
             "content": (
                 "추가 도구 호출을 중단하고, 이미 수집한 정보만 사용해 지금 즉시 최종 답변을 작성하라.\n"
+                "public_brief는 각 섹션 제목 줄 끝에 건수/개수를 붙여라. 예: `1. 🏢 한올/IMVT 직접 업데이트 : 2건`.\n"
+                "건수/개수는 제목 줄에만 쓰고 bullet에서는 `직접 업데이트 1건`처럼 반복하지 말라.\n"
+                "bullet 1개는 사실 1건 또는 포인트 1개만 담아라. 2건이면 bullet 2개로 나눠라.\n"
+                "직접 회사 SEC/DART/KRX/Form 4 공시가 확인되면 public_brief 1번 섹션에는 filing 이름만 쓰지 말고 사건 의미를 먼저 적어라.\n"
+                "가능하면 이벤트 유형(신규 RSU/stock option 부여, sell to cover 매도, 옵션 행사 등), 대상자 직책, 핵심 수량/거래일을 한 문장에 포함하라.\n"
+                "B. Confirmed Updates — Company Direct 표에 넣는 direct filing fact와 핵심 숫자/날짜를 public_brief 1번 섹션에도 축약 반영하라.\n"
                 "최상위 태그는 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
                 "태그 밖 텍스트, 사족, 조사 계획은 금지한다."
             ),
@@ -521,6 +425,7 @@ class HanallResearchService:
             run_time_kst=run_time.strftime("%Y-%m-%d %H:%M KST"),
             window_start_kst=window_start.strftime("%Y-%m-%d %H:%M KST"),
             window_end_kst=run_time.strftime("%Y-%m-%d %H:%M KST"),
+            max_web_search_rounds=self._settings.hanall_max_web_search_rounds,
             required_sections=required_sections,
         )
 

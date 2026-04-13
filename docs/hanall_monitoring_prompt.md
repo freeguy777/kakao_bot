@@ -323,7 +323,7 @@ C. Low impact
 
 A. 요약
 - 지난 24시간 내 Confirmed 업데이트 총수
-- 한올/Immunovant 직접 업데이트 수
+- 한올/IMVT 직접 업데이트 수
 - 경쟁사 중요 업데이트 수
 - 가장 중요한 5개 이슈
 - 전반적 커버리지 수준(High / Medium / Low)과 이유 1문장

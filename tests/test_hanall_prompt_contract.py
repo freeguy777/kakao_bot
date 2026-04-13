@@ -10,7 +10,7 @@ from app.services.hanall_research_service import HanallResearchService
 
 PUBLIC_BRIEF = """📅 2026-04-06 08:00 KST 기준
 
-1. 🏢 한올/Immunovant 직접 업데이트
+1. 🏢 한올/IMVT 직접 업데이트
 - 지난 24시간 내 신규 공시, 보도자료, IR/SEC 업데이트는 없었습니다.
 - 배경: HanAll 공식 공시 페이지와 Immunovant Investors 기준 직전 공식 업데이트 이후 추가 변동은 확인되지 않았습니다.
 
@@ -120,10 +120,15 @@ async def test_hanall_collect_prompt_includes_verbatim_spec_and_writes_parse_met
     first_prompt = service._client.chat.completions.received_messages[0][1]["content"]
     assert spec_text in first_prompt
     assert "<public_brief>" in first_prompt
-    assert "1. 🏢 한올/Immunovant 직접 업데이트" in first_prompt
-    assert "2. 🧬 경쟁사/파이프라인 체크" in first_prompt
-    assert "3. 🔎 이번에 확인한 범위" in first_prompt
-    assert "4. 👀 참고할 포인트" in first_prompt
+    assert "1. 🏢 한올/IMVT 직접 업데이트 : N건" in first_prompt
+    assert "2. 🧬 경쟁사/파이프라인 체크 : N건" in first_prompt
+    assert "3. 🔎 이번에 확인한 범위 : N개 범주" in first_prompt
+    assert "4. 👀 참고할 포인트 : N개" in first_prompt
+    assert "web_search는 최대 2라운드까지만 사용하라." in first_prompt
+    assert "SEC Form 4 보고" in first_prompt
+    assert "B. Confirmed Updates — Company Direct 표에 넣을 direct filing fact" in first_prompt
+    assert "건수/개수는 섹션 제목 줄에만 쓰고" in first_prompt
+    assert "bullet 1개는 사실 1건 또는 포인트 1개만 담아라" in first_prompt
     assert artifact.summary_text == PUBLIC_BRIEF
     assert artifact.detail_text == ADMIN_REPORT.strip()
     assert artifact.raw_response["parse"]["parse_ok"] is True
@@ -176,12 +181,24 @@ async def test_hanall_collect_accepts_normalized_section_heading_variants(test_s
     assert artifact.raw_response["parse"]["missing_sections"] == []
 
 
-def test_render_public_message_wraps_long_source_bullet(test_settings, tmp_path: Path) -> None:
+async def test_hanall_collect_prompt_uses_configured_web_search_round_limit(test_settings, tmp_path: Path) -> None:
+    test_settings.hanall_max_web_search_rounds = 3
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, final_text)
+
+    await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    first_prompt = service._client.chat.completions.received_messages[0][1]["content"]
+    assert "web_search는 최대 3라운드까지만 사용하라." in first_prompt
+    assert "설정된 최대 라운드를 넘는 web_search는 금지한다." in first_prompt
+
+
+def test_render_public_message_flattens_long_source_bullet(test_settings, tmp_path: Path) -> None:
     final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
     service = build_service(test_settings, tmp_path, final_text)
     long_public_brief = """📅 2026-04-09 08:00 KST 기준
 
-1. 🏢 한올/Immunovant 직접 업데이트
+1. 🏢 한올/IMVT 직접 업데이트
 - 지난 24시간 내 신규 공시 없음
 
 3. 🔎 이번에 확인한 범위
@@ -193,7 +210,85 @@ def test_render_public_message_wraps_long_source_bullet(test_settings, tmp_path:
     assert (
         "- HanAll 공식 웹사이트/DART/공시, Immunovant IR/Press Releases/SEC EDGAR(Form 4, 10-Q, 8-K), "
         "ClinicalTrials.gov batoclimab/IMVT-1402 등록항목, PubMed/학회 초록, 주요 언론"
-    ) not in rendered_message
-    assert any(line.startswith("  ") for line in rendered_message.splitlines())
+    ) in rendered_message
+    assert not any(line.startswith("  ") for line in rendered_message.splitlines())
     assert "Form 4, 10-Q, 8-K" in rendered_message
     assert "ClinicalTrials.gov batoclimab/IMVT-1402 등록항목" in rendered_message
+
+
+def test_render_public_message_flattens_pre_wrapped_company_bullet(test_settings, tmp_path: Path) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, final_text)
+    public_brief = """📅 2026-04-11 07:42 KST 기준
+
+1. 🏢 한올/IMVT 직접 업데이트
+- Immunovant: Gloria Melanie COO가 RSU vesting 관련 세금 납부를
+  위해 8,
+  722주 매도 (sell to cover), 2026-04-08 거래,
+  2026-04-10 SEC Form 4 보고
+"""
+    artifact = type("Artifact", (), {"summary_text": public_brief})()
+
+    rendered_message = service.render_public_message(artifact)
+
+    assert "8,722주" in rendered_message
+    assert "2026-04-10 SEC Form 4 보고" in rendered_message
+    assert "sell to cover" in rendered_message
+    assert "  위해 8,722주" not in rendered_message
+    assert "8,\n  722주" not in rendered_message
+    assert "SEC Form\n  4" not in rendered_message
+
+
+def test_render_public_message_keeps_inline_note_in_same_bullet(test_settings, tmp_path: Path) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, final_text)
+    public_brief = """📅 2026-04-11 07:42 KST 기준
+
+1. 🏢 한올/IMVT 직접 업데이트
+- 한올바이오파마: 24시간 내 공시/보도자료 신규 업데이트 없음 (직전 공시 2026-03-09 감사보고서)
+"""
+    artifact = type("Artifact", (), {"summary_text": public_brief})()
+
+    rendered_message = service.render_public_message(artifact)
+
+    assert "- 한올바이오파마: 24시간 내 공시/보도자료 신규 업데이트 없음 (직전 공시 2026-03-09 감사보고서)" in rendered_message
+    assert "  (직전 공시 2026-03-09 감사보고서)" not in rendered_message
+
+
+def test_render_public_message_preserves_competitor_name_phrase(test_settings, tmp_path: Path) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, final_text)
+    public_brief = """📅 2026-04-11 07:42 KST 기준
+
+2. 🧬 경쟁사/파이프라인 체크
+- FcRn 직접 경쟁사(Johnson & Johnson/nipocalimab, argenx/efgartigimod, UCB/rozanolixizumab)의 24시간 내 신규 규제/임상 업데이트 없음
+"""
+    artifact = type("Artifact", (), {"summary_text": public_brief})()
+
+    rendered_message = service.render_public_message(artifact)
+
+    assert "Johnson & Johnson/nipocalimab" in rendered_message
+    assert "argenx/efgartigimod" in rendered_message
+    assert "UCB/rozanolixizumab" in rendered_message
+
+
+def test_render_public_message_preserves_heading_counts_and_fact_per_bullet(test_settings, tmp_path: Path) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, final_text)
+    public_brief = """📅 2026-04-11 07:42 KST 기준
+
+1. 🏢 한올/IMVT 직접 업데이트 : 2건
+- Immunovant COO Gloria Melanie의 8,722주 sell to cover 매도가 2026-04-10 SEC Form 4에 반영됨
+- CFO 및 주요 경영진 대상 RSU·스톡옵션 신규 부여가 같은 Form 4에서 확인됨
+
+2. 🧬 경쟁사/파이프라인 체크 : 0건
+- argenx efgartigimod seronegative gMG sBLA는 PDUFA 목표일 2026-05-10 대기 중
+"""
+    artifact = type("Artifact", (), {"summary_text": public_brief})()
+
+    rendered_message = service.render_public_message(artifact)
+
+    assert "1. 🏢 한올/IMVT 직접 업데이트 : 2건" in rendered_message
+    assert "- Immunovant COO Gloria Melanie의 8,722주 sell to cover 매도가 2026-04-10 SEC Form 4에 반영됨" in rendered_message
+    assert "- CFO 및 주요 경영진 대상 RSU·스톡옵션 신규 부여가 같은 Form 4에서 확인됨" in rendered_message
+    assert "2. 🧬 경쟁사/파이프라인 체크 : 0건" in rendered_message

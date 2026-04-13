@@ -36,6 +36,15 @@ class FakeQueueSnapshotRepository:
         return self._snapshot
 
 
+def build_delivery_service(settings) -> DeliveryService:
+    return DeliveryService(
+        settings=settings,
+        delivery_repository=object(),
+        socket_client=object(),
+        admin_notifier=object(),
+    )
+
+
 async def test_delivery_retries_transport_errors_until_success(app, test_settings) -> None:
     repository = DeliveryRepository(app.state.delivery_repository._session_factory, sqlite_policy_from_settings(test_settings))
     admin_notifier = AdminNotifyService(test_settings)
@@ -222,6 +231,30 @@ async def test_socket_status_reports_transport_reachability(app, test_settings) 
     )
 
     assert await service.socket_status() == "transport reachable (connect_only)"
+
+
+def test_split_message_uses_1600_char_default_limit(test_settings) -> None:
+    service = build_delivery_service(test_settings)
+
+    assert service._split_message("a" * 1600) == ["a" * 1600]
+    assert service._split_message("a" * 1601) == ["a" * 1600, "a"]
+
+
+def test_split_message_prefers_newline_near_limit(test_settings) -> None:
+    settings = test_settings.model_copy(update={"message_chunk_limit": 120})
+    service = build_delivery_service(settings)
+
+    assert service._split_message(("a" * 110) + "\n" + ("b" * 20)) == [("a" * 110), ("b" * 20)]
+
+
+def test_split_message_falls_back_to_space_when_newline_is_too_early(test_settings) -> None:
+    settings = test_settings.model_copy(update={"message_chunk_limit": 120})
+    service = build_delivery_service(settings)
+
+    assert service._split_message(("a" * 10) + "\n" + ("b" * 89) + " " + ("c" * 30)) == [
+        ("a" * 10) + "\n" + ("b" * 89),
+        ("c" * 30),
+    ]
 
 
 def test_queue_snapshot_formats_korean_status_message(test_settings) -> None:

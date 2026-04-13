@@ -132,6 +132,7 @@ class EffectiveRoomConfig(BaseModel):
 
 class PromptLibrary(BaseModel):
     youtube_summary: dict[str, Any]
+    youtube_summary_lite: dict[str, Any] | None = None
     chat_default_system: str
     hanall_runtime_wrapper: str
     hanall_public_format: str
@@ -144,16 +145,36 @@ class WeatherSnapshot(BaseModel):
     min_temp: str
     max_temp: str
     precipitation_probability: str
+    air_quality_grade: str | None = None
+    pm10: str | None = None
+    pm2_5: str | None = None
     note: str
     fetched_at: datetime
 
     def to_message(self) -> str:
-        return (
-            f"🌤 오늘 날씨[{self.location_label}]: {self.summary}\n"
-            f"🌡 기온: {self.min_temp} / {self.max_temp}\n"
-            f"☔ 강수: {self.precipitation_probability}\n"
-            f"📝 한 줄 메모: {self.note}"
-        )
+        lines = [
+            f"🌤 오늘 날씨[{self.location_label}]: {self.summary}",
+            f"🌡 기온: {self.min_temp} / {self.max_temp}",
+            f"☔ 강수: {self.precipitation_probability}",
+        ]
+        air_quality_line = self._build_air_quality_line()
+        if air_quality_line is not None:
+            lines.append(air_quality_line)
+        lines.append(f"📝 한 줄 메모: {self.note}")
+        return "\n".join(lines)
+
+    def _build_air_quality_line(self) -> str | None:
+        if not self.air_quality_grade:
+            return None
+
+        values: list[str] = []
+        if self.pm10:
+            values.append(f"PM10 {self.pm10}")
+        if self.pm2_5:
+            values.append(f"PM2.5 {self.pm2_5}")
+
+        suffix = f" ({' / '.join(values)})" if values else ""
+        return f"😷 미세먼지: {self.air_quality_grade}{suffix}"
 
 
 class ChildAgeSnapshot(BaseModel):
