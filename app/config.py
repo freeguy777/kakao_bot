@@ -60,10 +60,25 @@ class Settings(BaseSettings):
     kimi_model: str = "kimi-k2.5"
     kimi_formula_uris: str = ",".join(DEFAULT_KIMI_FORMULA_URIS)
     kimi_tool_timeout_seconds: int = 25
+    kimi_completion_timeout_seconds: int = 240
     kimi_max_iterations: int = 5
     kimi_overall_deadline_seconds: int = 900
     hanall_max_web_search_rounds: int = 2
     hanall_collect_retry_delays_seconds: str = "60,180"
+    opendart_api_key: str | None = None
+    openfda_api_key: str | None = None
+    data_go_kr_api_key: str | None = None
+    ncbi_api_key: str | None = None
+    opendart_base_url: str = "https://opendart.fss.or.kr/api"
+    opendart_timeout_seconds: int = 15
+    hanall_dart_stock_code: str = "009420"
+    hanall_dart_corp_code: str | None = None
+    clinicaltrials_api_base_url: str = "https://clinicaltrials.gov/api/v2"
+    clinicaltrials_timeout_seconds: int = 15
+    sec_submissions_base_url: str = "https://data.sec.gov/submissions"
+    sec_timeout_seconds: int = 15
+    sec_user_agent: str | None = None
+    immunovant_sec_cik: str = "0001764013"
 
     weather_api_key: str | None = None
     weather_grid_x: int = 95

@@ -26,7 +26,11 @@ from app.services.chat_service import ChatService
 from app.services.child_age_service import ChildAgeService
 from app.services.delivery_service import DeliveryService
 from app.services.family_brief_service import FamilyBriefService
+from app.services.clinicaltrials_service import ClinicalTrialsService
 from app.services.hanall_research_service import HanallResearchService
+from app.services.hanall_prefetch_service import HanallPrefetchService
+from app.services.opendart_service import OpenDartService
+from app.services.sec_edgar_service import SecEdgarService
 from app.services.socket_client import SocketClient
 from app.services.weather_service import WeatherService
 from app.services.youtube_service import YouTubeService
@@ -86,12 +90,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         delivery_service=delivery_service,
         admin_notifier=admin_notifier,
     )
+    opendart_service = OpenDartService(settings)
+    clinicaltrials_service = ClinicalTrialsService(settings)
+    sec_edgar_service = SecEdgarService(settings)
+    hanall_prefetch_service = HanallPrefetchService(
+        opendart_service=opendart_service,
+        clinicaltrials_service=clinicaltrials_service,
+        sec_edgar_service=sec_edgar_service,
+    )
     child_age_service = ChildAgeService(settings)
     family_brief_service = FamilyBriefService(weather_service=weather_service, child_age_service=child_age_service)
     hanall_research_service = HanallResearchService(
         settings=settings,
         prompts=prompts,
         artifact_repository=artifact_repository,
+        hanall_prefetch_service=hanall_prefetch_service,
     )
     admin_command_service = AdminCommandService(
         settings=settings,

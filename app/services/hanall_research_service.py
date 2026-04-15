@@ -12,12 +12,18 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 
 from app.config import Settings
 from app.errors import ConfigurationError, ExternalAPIError
 from app.repositories import ArtifactRepository
-from app.schemas import HanallArtifact, HanallRenderedOutput, PromptLibrary
+from app.schemas import (
+    HanallApiBundle,
+    HanallArtifact,
+    HanallRenderedOutput,
+    HanallValidationResult,
+    PromptLibrary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +47,29 @@ class HanallResearchService:
         r"\A\s*<public_brief>\s*(?P<public>.*?)\s*</public_brief>\s*<admin_report>\s*(?P<admin>.*?)\s*</admin_report>\s*\Z",
         re.DOTALL,
     )
+    DIRECT_NO_UPDATE_PATTERNS = (
+        "한올/immunovant 직접 업데이트 : 0건",
+        "한올/imvt 직접 업데이트 : 0건",
+        "24시간 내 신규 공시/규제 문서/임상등록 업데이트 없음",
+        "24시간 내 신규 사실 미확인",
+        "직전 공식 업데이트",
+    )
     SECTION_HEADING_MARKUP_PATTERN = re.compile(r"^#+\s*")
     SECTION_EMPHASIS_PATTERN = re.compile(r"^\*{1,2}(?P<body>.+?)\*{1,2}$")
     DASH_VARIANTS_PATTERN = re.compile(r"[\u2010-\u2015\u2212-]")
 
-    def __init__(self, *, settings: Settings, prompts: PromptLibrary, artifact_repository: ArtifactRepository) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        prompts: PromptLibrary,
+        artifact_repository: ArtifactRepository,
+        hanall_prefetch_service: object | None = None,
+    ) -> None:
         self._settings = settings
         self._prompts = prompts
         self._artifact_repository = artifact_repository
+        self._hanall_prefetch_service = hanall_prefetch_service
         self._hanall_spec = settings.load_hanall_spec()
         self._client: AsyncOpenAI | None = None
         self._tools_cache: list[dict[str, Any]] | None = None
@@ -118,9 +139,20 @@ class HanallResearchService:
         client = self._get_client()
         loaded_tools = self._load_formula_tools()
         tools = await loaded_tools if inspect.isawaitable(loaded_tools) else loaded_tools
+        run_time = datetime.now(self._timezone)
+        window_start = run_time - timedelta(hours=24)
+        prefetch_bundle = await self._collect_prefetch_bundle(window_start=window_start, window_end=run_time)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": "반드시 한국어로 답하고 최신 자료를 우선 사용하라."},
-            {"role": "user", "content": self._build_collect_prompt(artifact_date)},
+            {
+                "role": "user",
+                "content": self._build_collect_prompt(
+                    artifact_date,
+                    run_time=run_time,
+                    window_start=window_start,
+                    prefetch_bundle=prefetch_bundle,
+                ),
+            },
         ]
         deadline = asyncio.get_running_loop().time() + self._settings.kimi_overall_deadline_seconds
         final_text = ""
@@ -134,7 +166,7 @@ class HanallResearchService:
                 client,
                 messages=messages,
                 tools=tools or None,
-                request_timeout_seconds=self._settings.kimi_tool_timeout_seconds,
+                request_timeout_seconds=self._settings.kimi_completion_timeout_seconds,
                 deadline=deadline,
             )
             raw_response = response.model_dump(mode="json")
@@ -164,6 +196,26 @@ class HanallResearchService:
         if not final_text:
             raise ExternalAPIError("Hanall research produced no final text")
         rendered_output = self._parse_rendered_output(final_text)
+        validation_result = self._validate_rendered_output(rendered_output, prefetch_bundle)
+        if not validation_result.is_valid:
+            response = await self._request_validation_repair_without_tools(
+                client,
+                messages=messages,
+                invalid_text=final_text,
+                prefetch_bundle=prefetch_bundle,
+                issues=validation_result.issues,
+                deadline=deadline,
+            )
+            raw_response = response.model_dump(mode="json")
+            corrected_text = response.choices[0].message.content or ""
+            if not corrected_text:
+                raise ExternalAPIError("Hanall research repair produced no final text")
+            rendered_output = self._parse_rendered_output(corrected_text)
+            validation_result = self._validate_rendered_output(rendered_output, prefetch_bundle)
+            validation_result.repair_attempted = True
+            if not validation_result.is_valid:
+                issue_text = "; ".join(validation_result.issues)
+                raise ExternalAPIError(f"Hanall research validation failed after repair: {issue_text}")
         return HanallArtifact(
             artifact_key=self._artifact_key(artifact_date),
             artifact_date=artifact_date,
@@ -172,12 +224,14 @@ class HanallResearchService:
             model_name=self._settings.kimi_model,
             raw_response={
                 "completion": raw_response,
+                "prefetch": prefetch_bundle.model_dump(mode="json"),
                 "parse": {
                     "parse_ok": rendered_output.parse_ok,
                     "required_sections": rendered_output.required_sections,
                     "present_sections": rendered_output.present_sections,
                     "missing_sections": rendered_output.missing_sections,
                 },
+                "validation": validation_result.model_dump(mode="json"),
             },
         )
 
@@ -268,6 +322,7 @@ class HanallResearchService:
                 "직접 회사 SEC/DART/KRX/Form 4 공시가 확인되면 public_brief 1번 섹션에는 filing 이름만 쓰지 말고 사건 의미를 먼저 적어라.\n"
                 "가능하면 이벤트 유형(신규 RSU/stock option 부여, sell to cover 매도, 옵션 행사 등), 대상자 직책, 핵심 수량/거래일을 한 문장에 포함하라.\n"
                 "B. Confirmed Updates — Company Direct 표에 넣는 direct filing fact와 핵심 숫자/날짜를 public_brief 1번 섹션에도 축약 반영하라.\n"
+                "공식 API/source status가 unavailable로 표시된 direct source는 '신규 없음'으로 단정하지 말고 Coverage Gaps/Omission Audit에 반영하라.\n"
                 "최상위 태그는 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
                 "태그 밖 텍스트, 사족, 조사 계획은 금지한다."
             ),
@@ -279,6 +334,102 @@ class HanallResearchService:
             request_timeout_seconds=remaining_seconds,
             deadline=deadline,
         )
+
+    async def _request_validation_repair_without_tools(
+        self,
+        client: AsyncOpenAI,
+        *,
+        messages: list[dict[str, Any]],
+        invalid_text: str,
+        prefetch_bundle: HanallApiBundle,
+        issues: list[str],
+        deadline: float,
+    ) -> Any:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise ExternalAPIError("Hanall research exceeded overall deadline before validation repair")
+        issue_lines = "\n".join(f"- {issue}" for issue in issues) if issues else "- 없음"
+        repair_message = {
+            "role": "user",
+            "content": (
+                "직전 최종 답변은 저장 전 검증에 실패했다. 추가 도구 호출 없이 이미 수집한 정보만 사용해 최종 답변을 다시 작성하라.\n"
+                "아래 검증 이슈를 모두 해결해야 한다.\n"
+                f"{issue_lines}\n"
+                "structured API direct fact는 B. Confirmed Updates — Company Direct와 public_brief 1번 섹션에 반영하라.\n"
+                "structured API source status가 unavailable인 범주는 direct update를 '신규 없음'으로 단정하지 말고 Coverage Gaps/Omission Audit에 반영하라.\n"
+                "최상위 태그는 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
+                "태그 밖 텍스트는 금지한다.\n\n"
+                f"{prefetch_bundle.prompt_block()}\n\n"
+                "[Invalid draft to fix]\n"
+                f"{invalid_text}"
+            ),
+        }
+        return await self._request_chat_completion(
+            client,
+            messages=[*messages, {"role": "assistant", "content": invalid_text}, repair_message],
+            tools=None,
+            request_timeout_seconds=remaining_seconds,
+            deadline=deadline,
+        )
+
+    async def _collect_prefetch_bundle(self, *, window_start: datetime, window_end: datetime) -> HanallApiBundle:
+        if self._hanall_prefetch_service is None:
+            return HanallApiBundle()
+        collect = getattr(self._hanall_prefetch_service, "collect", None)
+        if not callable(collect):
+            return HanallApiBundle()
+        bundle = await collect(window_start=window_start, window_end=window_end)
+        return bundle if isinstance(bundle, HanallApiBundle) else HanallApiBundle.model_validate(bundle)
+
+    def _validate_rendered_output(
+        self,
+        rendered_output: HanallRenderedOutput,
+        prefetch_bundle: HanallApiBundle,
+    ) -> HanallValidationResult:
+        issues: list[str] = []
+        admin_text = rendered_output.admin_text
+        public_text = rendered_output.public_text
+
+        if prefetch_bundle.has_unavailable_hard_source() and self._claims_no_direct_updates(public_text, admin_text):
+            issues.append("direct source가 unavailable인데 direct company 업데이트를 '신규 없음'으로 단정했다")
+
+        direct_public_section = self._extract_public_direct_section(public_text)
+        for fact in prefetch_bundle.direct_validation_facts():
+            fact_id = fact.source_id or fact.title
+            if not self._fact_present(admin_text, fact.validation_tokens()):
+                issues.append(f"structured direct fact 누락(admin): {fact_id}")
+            if not self._fact_present(direct_public_section, fact.validation_tokens()):
+                issues.append(f"structured direct fact 누락(public): {fact_id}")
+
+        return HanallValidationResult(is_valid=not issues, issues=issues)
+
+    def _claims_no_direct_updates(self, public_text: str, admin_text: str) -> bool:
+        normalized_text = self._normalize_validation_text(f"{public_text}\n{admin_text}")
+        return any(pattern in normalized_text for pattern in self.DIRECT_NO_UPDATE_PATTERNS)
+
+    def _fact_present(self, admin_text: str, tokens: list[str]) -> bool:
+        normalized_admin = self._normalize_validation_text(admin_text)
+        for token in tokens:
+            normalized_token = self._normalize_validation_text(token)
+            if normalized_token and normalized_token in normalized_admin:
+                return True
+        return False
+
+    @staticmethod
+    def _extract_public_direct_section(public_text: str) -> str:
+        lines = public_text.splitlines()
+        collecting = False
+        collected_lines: list[str] = []
+        for line in lines:
+            if line.startswith("1. 🏢 한올/IMVT 직접 업데이트"):
+                collecting = True
+                collected_lines.append(line)
+                continue
+            if collecting and re.match(r"^\d+\.\s", line):
+                break
+            if collecting:
+                collected_lines.append(line)
+        return "\n".join(collected_lines).strip()
 
     async def _request_chat_completion(
         self,
@@ -330,6 +481,8 @@ class HanallResearchService:
 
     @classmethod
     def _is_retryable_completion_error(cls, exc: Exception) -> bool:
+        if isinstance(exc, (APITimeoutError, httpx.TimeoutException)):
+            return True
         status_code = cls._completion_error_status_code(exc)
         if status_code in cls.RETRYABLE_COMPLETION_STATUS_CODES:
             return True
@@ -415,11 +568,16 @@ class HanallResearchService:
             self._client = AsyncOpenAI(api_key=self._settings.kimi_api_key, base_url=self._settings.kimi_base_url)
         return self._client
 
-    def _build_collect_prompt(self, artifact_date: date) -> str:
-        run_time = datetime.now(self._timezone)
-        window_start = run_time - timedelta(hours=24)
+    def _build_collect_prompt(
+        self,
+        artifact_date: date,
+        *,
+        run_time: datetime,
+        window_start: datetime,
+        prefetch_bundle: HanallApiBundle,
+    ) -> str:
         required_sections = "\n".join(f"- {section}" for section in self.REQUIRED_ADMIN_SECTIONS)
-        return self._prompts.hanall_runtime_wrapper.format(
+        prompt = self._prompts.hanall_runtime_wrapper.format(
             business_spec=self._hanall_spec,
             artifact_date=artifact_date.isoformat(),
             run_time_kst=run_time.strftime("%Y-%m-%d %H:%M KST"),
@@ -428,6 +586,10 @@ class HanallResearchService:
             max_web_search_rounds=self._settings.hanall_max_web_search_rounds,
             required_sections=required_sections,
         )
+        bundle_block = prefetch_bundle.prompt_block()
+        if bundle_block:
+            prompt = f"{prompt}\n\n{bundle_block}"
+        return prompt
 
     def _parse_rendered_output(self, text: str) -> HanallRenderedOutput:
         match = self.OUTPUT_BLOCK_PATTERN.match(text)
@@ -485,3 +647,10 @@ class HanallResearchService:
         normalized = re.sub(r"\s*-\s*", " - ", normalized)
         normalized = re.sub(r"\s+", " ", normalized)
         return normalized.strip().lower()
+
+    @classmethod
+    def _normalize_validation_text(cls, text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", text).strip().lower()
+        normalized = cls.DASH_VARIANTS_PATTERN.sub("-", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized

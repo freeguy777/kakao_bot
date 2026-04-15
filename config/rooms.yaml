@@ -108,9 +108,9 @@ rooms:
     #hanall_publish_time: "09:00"
     weather:
       enabled: true
-      location_label: "김해율하"
-      grid_x: 95
-      grid_y: 77
+      location_label: "창원 상남동"
+      grid_x: 91
+      grid_y: 76
       publish_time: "08:10"
 
   - name: "김휘태"

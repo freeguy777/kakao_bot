@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -204,6 +204,110 @@ class HanallRenderedOutput(BaseModel):
     required_sections: list[str] = Field(default_factory=list)
     present_sections: list[str] = Field(default_factory=list)
     missing_sections: list[str] = Field(default_factory=list)
+
+
+class HanallStructuredFact(BaseModel):
+    source_name: str
+    source_type: Literal["filing", "clinical_registry"]
+    entity: str
+    category: str
+    title: str
+    fact_text: str
+    source_id: str | None = None
+    source_url: str | None = None
+    observed_at: datetime | None = None
+    observed_date: date | None = None
+    validation_mode: Literal["hard", "soft"] = "soft"
+    timestamp_parse_status: str | None = None
+
+    def prompt_line(self) -> str:
+        observed_label = self._observed_label()
+        pieces = [
+            f"- [{self.validation_mode}] {observed_label}",
+            self.entity,
+            self.source_name,
+            self.title,
+            self.fact_text,
+        ]
+        if self.source_id:
+            pieces.append(f"id={self.source_id}")
+        if self.source_url:
+            pieces.append(self.source_url)
+        return " | ".join(pieces)
+
+    def validation_tokens(self) -> list[str]:
+        tokens = [self.title]
+        if self.source_id:
+            tokens.append(self.source_id)
+        if self.source_url:
+            tokens.append(self.source_url)
+        observed_label = self._observed_label()
+        if observed_label:
+            tokens.append(observed_label)
+        return [token for token in tokens if token]
+
+    def _observed_label(self) -> str:
+        if self.observed_at is not None:
+            return self.observed_at.strftime("%Y-%m-%d %H:%M KST")
+        if self.observed_date is not None:
+            return self.observed_date.isoformat()
+        return "날짜미상"
+
+
+class HanallSourceStatus(BaseModel):
+    source_name: str
+    status: Literal["ok", "unavailable", "skipped"]
+    checked_at: datetime
+    detail: str
+    hard_requirement: bool = False
+
+    def prompt_line(self) -> str:
+        checked_at = self.checked_at.strftime("%Y-%m-%d %H:%M KST")
+        requirement = "hard" if self.hard_requirement else "soft"
+        return f"- {self.source_name}: {self.status} ({requirement}) | {checked_at} | {self.detail}"
+
+
+class HanallApiBundle(BaseModel):
+    DIRECT_VALIDATION_SOURCES: ClassVar[frozenset[str]] = frozenset({"OpenDART", "ClinicalTrials.gov API", "SEC EDGAR API"})
+    facts: list[HanallStructuredFact] = Field(default_factory=list)
+    source_statuses: list[HanallSourceStatus] = Field(default_factory=list)
+
+    def prompt_block(self) -> str:
+        if not self.facts and not self.source_statuses:
+            return ""
+        lines = [
+            "[Structured API facts]",
+            "- 아래 정보는 코드가 공식 API에서 선수집한 결과다.",
+            "- direct company 판단은 이 블록의 사실을 우선 기준으로 삼아라.",
+            "- source status가 unavailable인 범주는 direct update를 '신규 없음'으로 단정하지 말고 Coverage Gaps/Omission Audit에 반영하라.",
+            "",
+            "[Structured API source status]",
+        ]
+        if self.source_statuses:
+            lines.extend(status.prompt_line() for status in self.source_statuses)
+        else:
+            lines.append("- 없음")
+        lines.extend(["", "[Structured API direct facts]"])
+        if self.facts:
+            lines.extend(fact.prompt_line() for fact in self.facts)
+        else:
+            lines.append("- 없음")
+        return "\n".join(lines)
+
+    def hard_validation_facts(self) -> list[HanallStructuredFact]:
+        return [fact for fact in self.facts if fact.validation_mode == "hard"]
+
+    def direct_validation_facts(self) -> list[HanallStructuredFact]:
+        return [fact for fact in self.facts if fact.source_name in self.DIRECT_VALIDATION_SOURCES]
+
+    def has_unavailable_hard_source(self) -> bool:
+        return any(status.hard_requirement and status.status == "unavailable" for status in self.source_statuses)
+
+
+class HanallValidationResult(BaseModel):
+    is_valid: bool = True
+    issues: list[str] = Field(default_factory=list)
+    repair_attempted: bool = False
 
 
 class DeliveryQueueSnapshot(BaseModel):

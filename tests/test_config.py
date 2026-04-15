@@ -133,3 +133,14 @@ def test_hanall_collect_retry_delay_list_parses_csv(tmp_path: Path) -> None:
     )
 
     assert settings.hanall_collect_retry_delay_list == [60.0, 180.0]
+
+
+def test_kimi_completion_timeout_seconds_defaults_for_hanall_collect(tmp_path: Path) -> None:
+    settings = Settings(
+        inbound_bot_secret="test-secret",
+        socket_shared_token="test-token",
+        messengerbot_bot_name="gateway-bot",
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+    )
+
+    assert settings.kimi_completion_timeout_seconds == 240

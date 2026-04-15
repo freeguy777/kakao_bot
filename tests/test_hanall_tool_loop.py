@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import httpx
+from openai import APITimeoutError
 
 from app.services.hanall_research_service import HanallResearchService
 
@@ -140,6 +141,28 @@ class RetryingCompletions:
 class RetryingClient:
     def __init__(self, failures_before_success: int, final_text: str) -> None:
         self.chat = type("Chat", (), {"completions": RetryingCompletions(failures_before_success, final_text)})()
+
+
+class TimeoutRetryingCompletions:
+    def __init__(self, failures_before_success: int, final_text: str) -> None:
+        self._failures_before_success = failures_before_success
+        self._final_text = final_text
+        self.calls = 0
+        self.received_messages = []
+        self.received_tools = []
+
+    async def create(self, **kwargs: object):
+        self.calls += 1
+        self.received_messages.append(kwargs["messages"])
+        self.received_tools.append(kwargs.get("tools"))
+        if self.calls <= self._failures_before_success:
+            raise APITimeoutError(request=httpx.Request("POST", "https://api.moonshot.ai/v1/chat/completions"))
+        return FakeResponse("stop", FakeMessage(self._final_text))
+
+
+class TimeoutRetryingClient:
+    def __init__(self, failures_before_success: int, final_text: str) -> None:
+        self.chat = type("Chat", (), {"completions": TimeoutRetryingCompletions(failures_before_success, final_text)})()
 
 
 class ExhaustedLoopCompletions:
@@ -328,6 +351,31 @@ async def test_hanall_collect_retries_overloaded_chat_completion_with_backoff(te
     )
     test_settings.hanall_collect_retry_delays_seconds = "60,180"
     service._client = RetryingClient(2, final_text)
+    service._load_formula_tools = lambda: []
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    service._sleep_before_retry = fake_sleep
+
+    artifact = await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    assert artifact.summary_text == PUBLIC_BRIEF
+    assert artifact.detail_text == ADMIN_REPORT.strip()
+    assert service._client.chat.completions.calls == 3
+    assert sleep_calls == [60.0, 180.0]
+
+
+async def test_hanall_collect_retries_timed_out_chat_completion_with_backoff(test_settings) -> None:
+    final_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = HanallResearchService(
+        settings=test_settings,
+        prompts=test_settings.load_prompts(),
+        artifact_repository=type("Repo", (), {"get_by_key": lambda *_: None, "save": lambda *args, **kwargs: args[1]})(),
+    )
+    test_settings.hanall_collect_retry_delays_seconds = "60,180"
+    service._client = TimeoutRetryingClient(2, final_text)
     service._load_formula_tools = lambda: []
     sleep_calls: list[float] = []
 
