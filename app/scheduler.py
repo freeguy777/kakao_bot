@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -58,7 +58,8 @@ class SchedulerService:
     async def run_daily_hanall_collect(self) -> None:
         artifact_date = datetime.now(self._timezone).date()
         try:
-            await self._hanall_research_service.get_or_create_daily_artifact(artifact_date)
+            artifact = await self._hanall_research_service.get_or_create_daily_artifact(artifact_date)
+            await self._send_hanall_admin_detail_once(artifact, artifact_date)
         except Exception as exc:  # noqa: BLE001
             await self._admin_notifier.notify_feature_error(
                 room_name="system",
@@ -104,19 +105,6 @@ class SchedulerService:
                     self._delivery_service.summarize_results(public_results),
                 )
                 return
-
-            admin_results = await self._delivery_service.send_text(
-                self._settings.admin_room_name,
-                self._hanall_research_service.render_admin_message(artifact),
-                suppress_admin_report=True,
-                correlation_key=job_key,
-            )
-            if not self._delivery_service.all_delivered(admin_results):
-                self._scheduled_job_repository.mark_status(
-                    f"{job_key}:admin",
-                    constants.SCHEDULED_STATUS_FAILED,
-                    self._delivery_service.summarize_results(admin_results),
-                )
             self._scheduled_job_repository.mark_status(job_key, constants.SCHEDULED_STATUS_SUCCESS)
         except Exception as exc:  # noqa: BLE001
             self._scheduled_job_repository.mark_status(job_key, constants.SCHEDULED_STATUS_FAILED, str(exc))
@@ -126,6 +114,27 @@ class SchedulerService:
                 error_message=str(exc),
                 failure_type=constants.FAILURE_RESEARCH,
             )
+
+    async def _send_hanall_admin_detail_once(self, artifact: object, artifact_date: date) -> None:
+        job_key = f"hanall_admin_detail:{artifact_date.isoformat()}"
+        if self._scheduled_job_repository.is_success(job_key):
+            return
+
+        admin_results = await self._delivery_service.send_text(
+            self._settings.admin_room_name,
+            self._hanall_research_service.render_admin_message(artifact),
+            suppress_admin_report=True,
+            correlation_key=job_key,
+            failure_type=constants.FAILURE_RESEARCH,
+        )
+        if self._delivery_service.all_delivered(admin_results):
+            self._scheduled_job_repository.mark_status(job_key, constants.SCHEDULED_STATUS_SUCCESS)
+            return
+        self._scheduled_job_repository.mark_status(
+            job_key,
+            constants.SCHEDULED_STATUS_FAILED,
+            self._delivery_service.summarize_results(admin_results),
+        )
 
     async def publish_family_brief(self, room_name: str) -> None:
         room = self._room_registry.resolve_room(room_name)

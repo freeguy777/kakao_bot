@@ -167,7 +167,7 @@ async def test_publish_hanall_marks_failed_when_public_delivery_fails(test_setti
     assert any(status == constants.SCHEDULED_STATUS_FAILED for _, status, _ in scheduled_repo.records)
 
 
-async def test_publish_hanall_uses_existing_artifact_for_public_and_admin_delivery(test_settings) -> None:
+async def test_publish_hanall_uses_existing_artifact_for_public_delivery_only(test_settings) -> None:
     room = FakeRoom(
         name="hanall_room",
         package_name="com.kakao.talk",
@@ -180,7 +180,6 @@ async def test_publish_hanall_uses_existing_artifact_for_public_and_admin_delive
     delivery_service = FakeDeliveryService(
         [
             [DeliveryResult(message_id="m1", status=constants.ACK_OK)],
-            [DeliveryResult(message_id="m2", status=constants.ACK_OK)],
         ]
     )
     scheduler = SchedulerService(
@@ -198,14 +197,52 @@ async def test_publish_hanall_uses_existing_artifact_for_public_and_admin_delive
     assert hanall_service.get_existing_calls == 1
     assert hanall_service.get_or_create_calls == 0
     assert admin_notifier.calls == []
-    assert len(delivery_service.calls) == 2
+    assert len(delivery_service.calls) == 1
     assert delivery_service.calls[0]["args"][0] == room.name
     assert delivery_service.calls[0]["args"][1] == "summary"
     assert delivery_service.calls[0]["kwargs"]["package_name"] == room.package_name
-    assert delivery_service.calls[1]["args"][0] == test_settings.admin_room_name
-    assert delivery_service.calls[1]["args"][1] == "detail"
-    assert delivery_service.calls[1]["kwargs"]["suppress_admin_report"] is True
     assert any(status == constants.SCHEDULED_STATUS_SUCCESS for _, status, _ in scheduled_repo.records)
+
+
+async def test_daily_hanall_collect_sends_admin_detail_once(test_settings) -> None:
+    room = FakeRoom(
+        name="hanall_room",
+        package_name="com.kakao.talk",
+        hanall_publish_time="09:00",
+        features={"hanall_briefing": True},
+    )
+    scheduled_repo = FakeScheduledJobRepository()
+    admin_notifier = FakeAdminNotifier()
+    hanall_service = FakeHanallResearchService()
+    delivery_service = FakeDeliveryService(
+        [
+            [DeliveryResult(message_id="m1", status=constants.ACK_OK)],
+        ]
+    )
+    scheduler = SchedulerService(
+        settings=test_settings,
+        room_registry=FakeRoomRegistry(room),
+        delivery_service=delivery_service,
+        admin_notifier=admin_notifier,
+        hanall_research_service=hanall_service,
+        family_brief_service=FakeFamilyBriefService(),
+        scheduled_job_repository=scheduled_repo,
+    )
+
+    await scheduler.run_daily_hanall_collect()
+    await scheduler.run_daily_hanall_collect()
+
+    assert hanall_service.get_or_create_calls == 2
+    assert admin_notifier.calls == []
+    assert len(delivery_service.calls) == 1
+    assert delivery_service.calls[0]["args"][0] == test_settings.admin_room_name
+    assert delivery_service.calls[0]["args"][1] == "detail"
+    assert delivery_service.calls[0]["kwargs"]["suppress_admin_report"] is True
+    assert delivery_service.calls[0]["kwargs"]["failure_type"] == constants.FAILURE_RESEARCH
+    assert any(
+        key.startswith("hanall_admin_detail:") and status == constants.SCHEDULED_STATUS_SUCCESS
+        for key, status, _ in scheduled_repo.records
+    )
 
 
 async def test_publish_hanall_fails_when_collect_artifact_is_missing(test_settings) -> None:
