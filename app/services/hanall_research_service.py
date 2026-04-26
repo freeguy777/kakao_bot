@@ -520,18 +520,7 @@ class HanallResearchService:
         else:
             raw_arguments = json.dumps(raw_arguments, ensure_ascii=False)
 
-        payload: dict[str, Any] = {
-            "tool_call": {
-                "type": "function",
-                "function": {
-                    "name": function_name,
-                    "arguments": raw_arguments,
-                },
-            }
-        }
-        if getattr(tool_call, "id", None):
-            payload["tool_call"]["id"] = tool_call.id
-        return payload
+        return {"name": function_name, "arguments": raw_arguments}
 
     @staticmethod
     def _assistant_message_to_context(message: Any) -> dict[str, Any]:

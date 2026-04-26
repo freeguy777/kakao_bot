@@ -413,14 +413,8 @@ async def test_invoke_formula_wraps_tool_call_for_fiber_request(test_settings) -
             "url": "https://api.moonshot.ai/v1/formulas/moonshot%2Fdate%3Alatest/fibers",
             "headers": {"Authorization": "Bearer test"},
             "json": {
-                "tool_call": {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "date",
-                        "arguments": '{"operation":"time","zone":"Asia/Seoul"}',
-                    },
-                }
+                "name": "date",
+                "arguments": '{"operation":"time","zone":"Asia/Seoul"}',
             },
         }
     ]
