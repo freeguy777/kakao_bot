@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -10,8 +10,21 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app import constants
 from app.db import commit_with_retry, session_scope
-from app.models import DeliveryAttempt, FeatureOverride, InboundEvent, OutboundMessage, ResearchArtifact, ScheduledJobRecord
-from app.schemas import DeliveryQueueSnapshot, HanallArtifact, NormalizedInboundEvent
+from app.models import (
+    DeliveryAttempt,
+    FeatureOverride,
+    InboundEvent,
+    OptionsPCRDailySummary,
+    OutboundMessage,
+    ResearchArtifact,
+    ScheduledJobRecord,
+)
+from app.schemas import (
+    DeliveryQueueSnapshot,
+    HanallArtifact,
+    NormalizedInboundEvent,
+    OptionsPCRDailySummary as OptionsPCRDailySummarySchema,
+)
 
 
 @dataclass(slots=True)
@@ -306,6 +319,152 @@ class FeatureOverrideRepository:
                 record.enabled = enabled
                 record.updated_at = now
             commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
+
+
+class OptionsSentimentSummaryRepository:
+    def __init__(self, session_factory: sessionmaker[Session], sqlite_policy: SQLitePolicy) -> None:
+        self._session_factory = session_factory
+        self._sqlite_policy = sqlite_policy
+
+    def save_daily_summary(self, summary: OptionsPCRDailySummarySchema) -> OptionsPCRDailySummarySchema:
+        by_expiry_json = json.dumps(summary.by_expiry_json, ensure_ascii=False) if summary.by_expiry_json is not None else None
+        raw_response_json = (
+            json.dumps(summary.raw_response_json, ensure_ascii=False) if summary.raw_response_json is not None else None
+        )
+        with session_scope(self._session_factory) as session:
+            record = session.scalar(
+                select(OptionsPCRDailySummary).where(
+                    OptionsPCRDailySummary.symbol == summary.symbol,
+                    OptionsPCRDailySummary.date_us == summary.date_us,
+                    OptionsPCRDailySummary.source_environment == summary.source_environment,
+                )
+            )
+            if record is None:
+                record = OptionsPCRDailySummary(
+                    symbol=summary.symbol,
+                    date_us=summary.date_us,
+                    source_environment=summary.source_environment,
+                    date_kst=summary.date_kst,
+                    close=summary.close,
+                    change_1d_pct=summary.change_1d_pct,
+                    pcr_oi_total=summary.pcr_oi_total,
+                    pcr_vol_total=summary.pcr_vol_total,
+                    put_oi_total=summary.put_oi_total,
+                    call_oi_total=summary.call_oi_total,
+                    put_vol_total=summary.put_vol_total,
+                    call_vol_total=summary.call_vol_total,
+                    total_option_volume=summary.total_option_volume,
+                    total_option_oi=summary.total_option_oi,
+                    short_dte_pcr_oi=summary.short_dte_pcr_oi,
+                    short_dte_pcr_vol=summary.short_dte_pcr_vol,
+                    data_quality_flag=summary.data_quality_flag,
+                    should_publish_public=summary.should_publish_public,
+                    no_publish_reason=summary.no_publish_reason,
+                    source=summary.source,
+                    retrieved_at_utc=summary.retrieved_at_utc,
+                    oi_effective_date=summary.oi_effective_date,
+                    by_expiry_json=by_expiry_json,
+                    raw_response_json=raw_response_json,
+                )
+                session.add(record)
+            else:
+                record.date_kst = summary.date_kst
+                record.close = summary.close
+                record.change_1d_pct = summary.change_1d_pct
+                record.pcr_oi_total = summary.pcr_oi_total
+                record.pcr_vol_total = summary.pcr_vol_total
+                record.put_oi_total = summary.put_oi_total
+                record.call_oi_total = summary.call_oi_total
+                record.put_vol_total = summary.put_vol_total
+                record.call_vol_total = summary.call_vol_total
+                record.total_option_volume = summary.total_option_volume
+                record.total_option_oi = summary.total_option_oi
+                record.short_dte_pcr_oi = summary.short_dte_pcr_oi
+                record.short_dte_pcr_vol = summary.short_dte_pcr_vol
+                record.data_quality_flag = summary.data_quality_flag
+                record.should_publish_public = summary.should_publish_public
+                record.no_publish_reason = summary.no_publish_reason
+                record.source = summary.source
+                record.retrieved_at_utc = summary.retrieved_at_utc
+                record.oi_effective_date = summary.oi_effective_date
+                record.by_expiry_json = by_expiry_json
+                record.raw_response_json = raw_response_json
+            commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
+            session.refresh(record)
+            return self._to_schema(record)
+
+    def get_daily_summary(
+        self,
+        symbol: str,
+        *,
+        date_us: date | None = None,
+        date_kst: date | None = None,
+        source_environment: str,
+    ) -> OptionsPCRDailySummarySchema | None:
+        if date_us is None and date_kst is None:
+            return None
+        with session_scope(self._session_factory) as session:
+            query = select(OptionsPCRDailySummary).where(
+                OptionsPCRDailySummary.symbol == symbol,
+                OptionsPCRDailySummary.source_environment == source_environment,
+            )
+            if date_us is not None:
+                query = query.where(OptionsPCRDailySummary.date_us == date_us)
+            if date_kst is not None:
+                query = query.where(OptionsPCRDailySummary.date_kst == date_kst)
+            record = session.scalar(query.order_by(OptionsPCRDailySummary.retrieved_at_utc.desc()))
+            return self._to_schema(record) if record is not None else None
+
+    def get_previous_summary(
+        self,
+        symbol: str,
+        *,
+        before_date_us: date,
+        source_environment: str,
+    ) -> OptionsPCRDailySummarySchema | None:
+        with session_scope(self._session_factory) as session:
+            record = session.scalar(
+                select(OptionsPCRDailySummary)
+                .where(
+                    OptionsPCRDailySummary.symbol == symbol,
+                    OptionsPCRDailySummary.source_environment == source_environment,
+                    OptionsPCRDailySummary.date_us < before_date_us,
+                )
+                .order_by(OptionsPCRDailySummary.date_us.desc(), OptionsPCRDailySummary.retrieved_at_utc.desc())
+            )
+            return self._to_schema(record) if record is not None else None
+
+    @staticmethod
+    def _to_schema(record: OptionsPCRDailySummary) -> OptionsPCRDailySummarySchema:
+        by_expiry_json = json.loads(record.by_expiry_json) if record.by_expiry_json else None
+        raw_response_json = json.loads(record.raw_response_json) if record.raw_response_json else None
+        return OptionsPCRDailySummarySchema(
+            id=record.id,
+            date_us=record.date_us,
+            date_kst=record.date_kst,
+            symbol=record.symbol,
+            close=record.close,
+            change_1d_pct=record.change_1d_pct,
+            pcr_oi_total=record.pcr_oi_total,
+            pcr_vol_total=record.pcr_vol_total,
+            put_oi_total=record.put_oi_total,
+            call_oi_total=record.call_oi_total,
+            put_vol_total=record.put_vol_total,
+            call_vol_total=record.call_vol_total,
+            total_option_volume=record.total_option_volume,
+            total_option_oi=record.total_option_oi,
+            short_dte_pcr_oi=record.short_dte_pcr_oi,
+            short_dte_pcr_vol=record.short_dte_pcr_vol,
+            data_quality_flag=record.data_quality_flag,
+            should_publish_public=record.should_publish_public,
+            no_publish_reason=record.no_publish_reason,
+            source=record.source,
+            source_environment=record.source_environment,
+            retrieved_at_utc=record.retrieved_at_utc,
+            oi_effective_date=record.oi_effective_date,
+            by_expiry_json=by_expiry_json,
+            raw_response_json=raw_response_json,
+        )
 
 
 class ScheduledJobRepository:

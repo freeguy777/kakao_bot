@@ -65,11 +65,13 @@ class HanallResearchService:
         prompts: PromptLibrary,
         artifact_repository: ArtifactRepository,
         hanall_prefetch_service: object | None = None,
+        options_sentiment_service: object | None = None,
     ) -> None:
         self._settings = settings
         self._prompts = prompts
         self._artifact_repository = artifact_repository
         self._hanall_prefetch_service = hanall_prefetch_service
+        self._options_sentiment_service = options_sentiment_service
         self._hanall_spec = settings.load_hanall_spec()
         self._client: AsyncOpenAI | None = None
         self._tools_cache: list[dict[str, Any]] | None = None
@@ -82,6 +84,7 @@ class HanallResearchService:
         if cached is not None:
             return cached
         artifact = await self._run_research(artifact_date)
+        artifact = await self._attach_options_sentiment_snapshot(artifact)
         return self._artifact_repository.save(artifact, artifact_type="hanall")
 
     async def get_existing_daily_artifact(self, artifact_date: date) -> HanallArtifact | None:
@@ -234,6 +237,30 @@ class HanallResearchService:
                 "validation": validation_result.model_dump(mode="json"),
             },
         )
+
+    async def _attach_options_sentiment_snapshot(self, artifact: HanallArtifact) -> HanallArtifact:
+        if self._options_sentiment_service is None:
+            return artifact
+
+        collect_daily_summary = getattr(self._options_sentiment_service, "collect_daily_summary", None)
+        if not callable(collect_daily_summary):
+            return artifact
+
+        raw_response = dict(artifact.raw_response or {})
+        try:
+            result = await collect_daily_summary(artifact_date_kst=artifact.artifact_date)
+            if result.collect_status == "success" and result.summary is not None:
+                save_daily_summary = getattr(self._options_sentiment_service, "save_daily_summary", None)
+                if callable(save_daily_summary):
+                    save_daily_summary(result.summary)
+            raw_response["options_sentiment"] = result.snapshot.model_dump(mode="json")
+        except Exception as exc:  # noqa: BLE001
+            raw_response["options_sentiment"] = {
+                "collect_status": "failed",
+                "reason": str(exc),
+            }
+        artifact.raw_response = raw_response
+        return artifact
 
     async def _load_formula_tools(self) -> list[dict[str, Any]]:
         if self._tools_cache is not None:

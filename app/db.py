@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -57,6 +57,85 @@ def ensure_runtime_schema(engine: Engine) -> None:
                 "WHERE processing_status IS NULL OR processed_at IS NULL"
             )
         )
+        _ensure_options_pcr_daily_summary_schema(connection)
+
+
+def _ensure_options_pcr_daily_summary_schema(connection: Connection) -> None:
+    connection.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS options_pcr_daily_summary (
+                id INTEGER NOT NULL PRIMARY KEY,
+                date_us DATE NOT NULL,
+                date_kst DATE NOT NULL,
+                symbol VARCHAR(32) NOT NULL,
+                close FLOAT,
+                change_1d_pct FLOAT,
+                pcr_oi_total FLOAT,
+                pcr_vol_total FLOAT,
+                put_oi_total INTEGER NOT NULL DEFAULT 0,
+                call_oi_total INTEGER NOT NULL DEFAULT 0,
+                put_vol_total INTEGER NOT NULL DEFAULT 0,
+                call_vol_total INTEGER NOT NULL DEFAULT 0,
+                total_option_volume INTEGER NOT NULL DEFAULT 0,
+                total_option_oi INTEGER NOT NULL DEFAULT 0,
+                short_dte_pcr_oi FLOAT,
+                short_dte_pcr_vol FLOAT,
+                data_quality_flag VARCHAR(64) NOT NULL DEFAULT 'ERROR',
+                should_publish_public BOOLEAN NOT NULL DEFAULT 0,
+                no_publish_reason VARCHAR(128),
+                source VARCHAR(64) NOT NULL DEFAULT 'tradier',
+                source_environment VARCHAR(32) NOT NULL DEFAULT 'sandbox',
+                retrieved_at_utc DATETIME NOT NULL,
+                oi_effective_date DATE,
+                by_expiry_json TEXT,
+                raw_response_json TEXT
+            )
+            """
+        )
+    )
+    existing_columns = {row[1] for row in connection.execute(text("PRAGMA table_info('options_pcr_daily_summary')"))}
+    expected_columns = {
+        "date_us": "ALTER TABLE options_pcr_daily_summary ADD COLUMN date_us DATE",
+        "date_kst": "ALTER TABLE options_pcr_daily_summary ADD COLUMN date_kst DATE",
+        "symbol": "ALTER TABLE options_pcr_daily_summary ADD COLUMN symbol VARCHAR(32)",
+        "close": "ALTER TABLE options_pcr_daily_summary ADD COLUMN close FLOAT",
+        "change_1d_pct": "ALTER TABLE options_pcr_daily_summary ADD COLUMN change_1d_pct FLOAT",
+        "pcr_oi_total": "ALTER TABLE options_pcr_daily_summary ADD COLUMN pcr_oi_total FLOAT",
+        "pcr_vol_total": "ALTER TABLE options_pcr_daily_summary ADD COLUMN pcr_vol_total FLOAT",
+        "put_oi_total": "ALTER TABLE options_pcr_daily_summary ADD COLUMN put_oi_total INTEGER NOT NULL DEFAULT 0",
+        "call_oi_total": "ALTER TABLE options_pcr_daily_summary ADD COLUMN call_oi_total INTEGER NOT NULL DEFAULT 0",
+        "put_vol_total": "ALTER TABLE options_pcr_daily_summary ADD COLUMN put_vol_total INTEGER NOT NULL DEFAULT 0",
+        "call_vol_total": "ALTER TABLE options_pcr_daily_summary ADD COLUMN call_vol_total INTEGER NOT NULL DEFAULT 0",
+        "total_option_volume": "ALTER TABLE options_pcr_daily_summary ADD COLUMN total_option_volume INTEGER NOT NULL DEFAULT 0",
+        "total_option_oi": "ALTER TABLE options_pcr_daily_summary ADD COLUMN total_option_oi INTEGER NOT NULL DEFAULT 0",
+        "short_dte_pcr_oi": "ALTER TABLE options_pcr_daily_summary ADD COLUMN short_dte_pcr_oi FLOAT",
+        "short_dte_pcr_vol": "ALTER TABLE options_pcr_daily_summary ADD COLUMN short_dte_pcr_vol FLOAT",
+        "data_quality_flag": (
+            "ALTER TABLE options_pcr_daily_summary ADD COLUMN data_quality_flag VARCHAR(64) NOT NULL DEFAULT 'ERROR'"
+        ),
+        "should_publish_public": (
+            "ALTER TABLE options_pcr_daily_summary ADD COLUMN should_publish_public BOOLEAN NOT NULL DEFAULT 0"
+        ),
+        "no_publish_reason": "ALTER TABLE options_pcr_daily_summary ADD COLUMN no_publish_reason VARCHAR(128)",
+        "source": "ALTER TABLE options_pcr_daily_summary ADD COLUMN source VARCHAR(64) NOT NULL DEFAULT 'tradier'",
+        "source_environment": (
+            "ALTER TABLE options_pcr_daily_summary ADD COLUMN source_environment VARCHAR(32) NOT NULL DEFAULT 'sandbox'"
+        ),
+        "retrieved_at_utc": "ALTER TABLE options_pcr_daily_summary ADD COLUMN retrieved_at_utc DATETIME",
+        "oi_effective_date": "ALTER TABLE options_pcr_daily_summary ADD COLUMN oi_effective_date DATE",
+        "by_expiry_json": "ALTER TABLE options_pcr_daily_summary ADD COLUMN by_expiry_json TEXT",
+        "raw_response_json": "ALTER TABLE options_pcr_daily_summary ADD COLUMN raw_response_json TEXT",
+    }
+    for column_name, ddl in expected_columns.items():
+        if column_name not in existing_columns:
+            connection.execute(text(ddl))
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_options_pcr_daily_summary_symbol_date_env "
+            "ON options_pcr_daily_summary(symbol, date_us, source_environment)"
+        )
+    )
 
 
 def commit_with_retry(session: Session, retries: int, delay_seconds: float) -> None:

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.constants import DEFAULT_KIMI_FORMULA_URIS, DEFAULT_KMA_BASE_SLOTS, DEFAULT_MESSAGE_CHUNK_LIMIT
@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     sec_timeout_seconds: int = 15
     sec_user_agent: str | None = None
     immunovant_sec_cik: str = "0001764013"
+    tradier_api: str | None = None
+    tradier_env: str = "sandbox"
+    tradier_timeout_seconds: int = 15
+    tradier_live_base_url: str = "https://api.tradier.com/v1"
+    tradier_sandbox_base_url: str = "https://sandbox.tradier.com/v1"
 
     weather_api_key: str | None = None
     weather_grid_x: int = 95
@@ -98,6 +103,14 @@ class Settings(BaseSettings):
     @cached_property
     def kimi_formula_uri_list(self) -> list[str]:
         return [item.strip() for item in self.kimi_formula_uris.split(",") if item.strip()]
+
+    @field_validator("tradier_env", mode="before")
+    @classmethod
+    def _validate_tradier_env(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in {"live", "sandbox"}:
+            raise ValueError("TRADIER_ENV must be one of: live, sandbox")
+        return normalized
 
     @cached_property
     def hanall_collect_retry_delay_list(self) -> list[float]:

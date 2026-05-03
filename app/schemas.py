@@ -197,6 +197,55 @@ class HanallArtifact(BaseModel):
     raw_response: dict[str, Any] | None = None
 
 
+class OptionsPCRDailySummary(BaseModel):
+    id: int | None = None
+    date_us: date
+    date_kst: date
+    symbol: str
+    close: float | None = None
+    change_1d_pct: float | None = None
+    pcr_oi_total: float | None = None
+    pcr_vol_total: float | None = None
+    put_oi_total: int
+    call_oi_total: int
+    put_vol_total: int
+    call_vol_total: int
+    total_option_volume: int
+    total_option_oi: int
+    short_dte_pcr_oi: float | None = None
+    short_dte_pcr_vol: float | None = None
+    data_quality_flag: str
+    should_publish_public: bool
+    no_publish_reason: str | None = None
+    source: str
+    source_environment: str
+    retrieved_at_utc: datetime
+    oi_effective_date: date | None = None
+    by_expiry_json: Any = None
+    raw_response_json: Any = None
+
+
+class OptionsSentimentSnapshot(BaseModel):
+    collect_status: Literal["success", "failed", "disabled"]
+    symbol: str
+    date_us: date | None = None
+    date_kst: date | None = None
+    source: str = "tradier"
+    source_environment: str
+    retrieved_at_utc: datetime | None = None
+    data_quality_flag: str | None = None
+    should_publish_public: bool = False
+    no_publish_reason: str | None = None
+    reason: str | None = None
+    summary: dict[str, Any] | None = None
+
+
+class OptionsSentimentCollectionResult(BaseModel):
+    collect_status: Literal["success", "failed", "disabled"]
+    summary: OptionsPCRDailySummary | None = None
+    snapshot: OptionsSentimentSnapshot
+
+
 class HanallRenderedOutput(BaseModel):
     public_text: str
     admin_text: str

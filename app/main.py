@@ -14,6 +14,7 @@ from app.repositories import (
     DeliveryRepository,
     EventRepository,
     FeatureOverrideRepository,
+    OptionsSentimentSummaryRepository,
     ScheduledJobRepository,
     sqlite_policy_from_settings,
 )
@@ -29,6 +30,7 @@ from app.services.family_brief_service import FamilyBriefService
 from app.services.clinicaltrials_service import ClinicalTrialsService
 from app.services.hanall_research_service import HanallResearchService
 from app.services.hanall_prefetch_service import HanallPrefetchService
+from app.services.options_sentiment_service import OptionsSentimentService
 from app.services.opendart_service import OpenDartService
 from app.services.sec_edgar_service import SecEdgarService
 from app.services.socket_client import SocketClient
@@ -52,6 +54,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     delivery_repository = DeliveryRepository(session_factory, sqlite_policy)
     artifact_repository = ArtifactRepository(session_factory, sqlite_policy)
     override_repository = FeatureOverrideRepository(session_factory, sqlite_policy)
+    options_summary_repository = OptionsSentimentSummaryRepository(session_factory, sqlite_policy)
     scheduled_job_repository = ScheduledJobRepository(session_factory, sqlite_policy)
 
     prompts = settings.load_prompts()
@@ -100,24 +103,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     child_age_service = ChildAgeService(settings)
     family_brief_service = FamilyBriefService(weather_service=weather_service, child_age_service=child_age_service)
+    options_sentiment_service = OptionsSentimentService(
+        settings=settings,
+        summary_repository=options_summary_repository,
+    )
     hanall_research_service = HanallResearchService(
         settings=settings,
         prompts=prompts,
         artifact_repository=artifact_repository,
         hanall_prefetch_service=hanall_prefetch_service,
-    )
-    admin_command_service = AdminCommandService(
-        settings=settings,
-        room_registry=room_registry,
-        delivery_service=delivery_service,
-    )
-    message_router = MessageRouter(
-        settings=settings,
-        room_registry=room_registry,
-        admin_command_service=admin_command_service,
-        chat_service=chat_service,
-        youtube_service=youtube_service,
-        weather_service=weather_service,
+        options_sentiment_service=options_sentiment_service,
     )
     scheduler_service = SchedulerService(
         settings=settings,
@@ -126,7 +121,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin_notifier=admin_notifier,
         hanall_research_service=hanall_research_service,
         family_brief_service=family_brief_service,
+        options_sentiment_service=options_sentiment_service,
+        options_summary_repository=options_summary_repository,
         scheduled_job_repository=scheduled_job_repository,
+    )
+    admin_command_service = AdminCommandService(
+        settings=settings,
+        room_registry=room_registry,
+        delivery_service=delivery_service,
+        scheduler_service=scheduler_service,
+    )
+    message_router = MessageRouter(
+        settings=settings,
+        room_registry=room_registry,
+        admin_command_service=admin_command_service,
+        chat_service=chat_service,
+        youtube_service=youtube_service,
+        weather_service=weather_service,
     )
 
     @asynccontextmanager

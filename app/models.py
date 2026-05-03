@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -79,6 +79,44 @@ class ResearchArtifact(Base):
     detail_text: Mapped[str] = mapped_column(Text)
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class OptionsPCRDailySummary(Base):
+    __tablename__ = "options_pcr_daily_summary"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "date_us",
+            "source_environment",
+            name="uq_options_pcr_daily_summary_symbol_date_env",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    date_us: Mapped[date] = mapped_column(Date, index=True)
+    date_kst: Mapped[date] = mapped_column(Date, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    change_1d_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pcr_oi_total: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pcr_vol_total: Mapped[float | None] = mapped_column(Float, nullable=True)
+    put_oi_total: Mapped[int] = mapped_column(Integer)
+    call_oi_total: Mapped[int] = mapped_column(Integer)
+    put_vol_total: Mapped[int] = mapped_column(Integer)
+    call_vol_total: Mapped[int] = mapped_column(Integer)
+    total_option_volume: Mapped[int] = mapped_column(Integer)
+    total_option_oi: Mapped[int] = mapped_column(Integer)
+    short_dte_pcr_oi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    short_dte_pcr_vol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    data_quality_flag: Mapped[str] = mapped_column(String(64))
+    should_publish_public: Mapped[bool] = mapped_column(Boolean)
+    no_publish_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(String(64))
+    source_environment: Mapped[str] = mapped_column(String(32))
+    retrieved_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    oi_effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    by_expiry_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class FeatureOverride(Base):

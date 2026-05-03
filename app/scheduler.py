@@ -9,6 +9,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app import constants
 from app.config import Settings
+from app.schemas import OptionsSentimentSnapshot
 
 
 class SchedulerService:
@@ -23,6 +24,8 @@ class SchedulerService:
         admin_notifier: object,
         hanall_research_service: object,
         family_brief_service: object,
+        options_sentiment_service: object | None = None,
+        options_summary_repository: object | None = None,
         scheduled_job_repository: object,
     ) -> None:
         self._settings = settings
@@ -31,6 +34,8 @@ class SchedulerService:
         self._admin_notifier = admin_notifier
         self._hanall_research_service = hanall_research_service
         self._family_brief_service = family_brief_service
+        self._options_sentiment_service = options_sentiment_service
+        self._options_summary_repository = options_summary_repository
         self._scheduled_job_repository = scheduled_job_repository
         self._timezone = ZoneInfo(settings.app_timezone)
         self._scheduler = AsyncIOScheduler(timezone=self._timezone)
@@ -71,13 +76,18 @@ class SchedulerService:
     async def refresh_room_jobs_if_needed(self) -> None:
         self.refresh_room_jobs()
 
-    async def publish_hanall_room(self, room_name: str) -> None:
+    async def publish_hanall_room(self, room_name: str, *, force: bool = False) -> None:
         room = self._room_registry.resolve_room(room_name)
         if room is None or not room.features.get("hanall_briefing"):
             return
         now = datetime.now(self._timezone)
-        job_key = f"hanall:{now.date().isoformat()}:{room.name}:{room.hanall_publish_time}"
-        if self._scheduled_job_repository.is_success(job_key):
+        job_key = self._hanall_publish_job_key(
+            publish_date=now.date(),
+            room_name=room.name,
+            publish_time=room.hanall_publish_time,
+            force=force,
+        )
+        if not force and self._scheduled_job_repository.is_success(job_key):
             return
         try:
             artifact = await self._hanall_research_service.get_existing_daily_artifact(now.date())
@@ -91,9 +101,10 @@ class SchedulerService:
                     failure_type=constants.FAILURE_RESEARCH,
                 )
                 return
+            options_summary = self._get_options_summary_for_publish(artifact)
             public_results = await self._delivery_service.send_text(
                 room.name,
-                self._hanall_research_service.render_public_message(artifact),
+                self._build_hanall_public_message(artifact=artifact, options_summary=options_summary),
                 package_name=room.package_name,
                 correlation_key=job_key,
                 failure_type=constants.FAILURE_RESEARCH,
@@ -105,6 +116,7 @@ class SchedulerService:
                     self._delivery_service.summarize_results(public_results),
                 )
                 return
+            await self._publish_hanall_options_warning(room=room, artifact=artifact, summary=options_summary)
             self._scheduled_job_repository.mark_status(job_key, constants.SCHEDULED_STATUS_SUCCESS)
         except Exception as exc:  # noqa: BLE001
             self._scheduled_job_repository.mark_status(job_key, constants.SCHEDULED_STATUS_FAILED, str(exc))
@@ -135,6 +147,115 @@ class SchedulerService:
             constants.SCHEDULED_STATUS_FAILED,
             self._delivery_service.summarize_results(admin_results),
         )
+
+    def _build_hanall_public_message(self, *, artifact: object, options_summary: object | None) -> str:
+        message = self._hanall_research_service.render_public_message(artifact)
+        if not self._should_include_options_public_message(options_summary):
+            return message
+        options_message = self._options_sentiment_service.render_public_message(options_summary).strip()
+        if not options_message:
+            return message
+        return f"{message}\n\n{options_message}"
+
+    async def _publish_hanall_options_warning(self, *, room: object, artifact: object, summary: object | None) -> None:
+        if self._options_sentiment_service is None:
+            return
+
+        if summary is not None:
+            if summary.should_publish_public:
+                return
+            await self._maybe_send_options_warning_once(
+                date_us=summary.date_us.isoformat(),
+                symbol=summary.symbol,
+                source_environment=summary.source_environment,
+                reason=self._options_sentiment_service.get_warning_reason_from_summary(summary),
+                text=self._options_sentiment_service.render_admin_warning_from_summary(
+                    summary,
+                    room_name=room.name,
+                    public_message_included=self._should_include_options_public_message(summary),
+                ),
+            )
+            return
+
+        snapshot = self._get_options_snapshot_from_artifact(artifact)
+        if snapshot is None:
+            return
+        await self._maybe_send_options_warning_once(
+            date_us=snapshot.date_us.isoformat() if snapshot.date_us is not None else artifact.artifact_date.isoformat(),
+            symbol=snapshot.symbol,
+            source_environment=snapshot.source_environment,
+            reason=self._options_sentiment_service.get_warning_reason_from_snapshot(snapshot),
+            text=self._options_sentiment_service.render_admin_warning_from_snapshot(snapshot, room_name=room.name),
+        )
+
+    def _get_options_summary_for_publish(self, artifact: object):
+        if self._options_summary_repository is None:
+            return None
+        get_daily_summary = getattr(self._options_summary_repository, "get_daily_summary", None)
+        if not callable(get_daily_summary):
+            return None
+        return get_daily_summary(
+            self._options_sentiment_service.DEFAULT_SYMBOL,
+            date_kst=artifact.artifact_date,
+            source_environment=self._settings.tradier_env,
+        )
+
+    @staticmethod
+    def _get_options_snapshot_from_artifact(artifact: object) -> OptionsSentimentSnapshot | None:
+        raw_response = getattr(artifact, "raw_response", None)
+        if not isinstance(raw_response, dict):
+            return None
+        snapshot_payload = raw_response.get("options_sentiment")
+        if not isinstance(snapshot_payload, dict):
+            return None
+        try:
+            return OptionsSentimentSnapshot.model_validate(snapshot_payload)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _should_include_options_public_message(self, summary: object | None) -> bool:
+        return (
+            summary is not None
+            and self._options_sentiment_service is not None
+            and getattr(summary, "source_environment", "").strip().lower() == "live"
+        )
+
+    async def _maybe_send_options_warning_once(
+        self,
+        *,
+        date_us: str,
+        symbol: str,
+        source_environment: str,
+        reason: str | None,
+        text: str | None,
+    ) -> None:
+        if not reason or not text:
+            return
+
+        warning_key = f"hanall_options_warning:{date_us}:{symbol}:{source_environment}:{reason}"
+        if self._scheduled_job_repository.is_success(warning_key):
+            return
+
+        warning_results = await self._delivery_service.send_text(
+            self._settings.admin_room_name,
+            text,
+            suppress_admin_report=True,
+            correlation_key=warning_key,
+            failure_type=constants.FAILURE_RESEARCH,
+        )
+        if self._delivery_service.all_delivered(warning_results):
+            self._scheduled_job_repository.mark_status(warning_key, constants.SCHEDULED_STATUS_SUCCESS)
+
+    @staticmethod
+    def _hanall_publish_job_key(
+        *,
+        publish_date: date,
+        room_name: str,
+        publish_time: str | None,
+        force: bool,
+    ) -> str:
+        prefix = "hanall_manual" if force else "hanall"
+        return f"{prefix}:{publish_date.isoformat()}:{room_name}:{publish_time}"
 
     async def publish_family_brief(self, room_name: str) -> None:
         room = self._room_registry.resolve_room(room_name)

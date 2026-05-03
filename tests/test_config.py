@@ -145,3 +145,14 @@ def test_kimi_completion_timeout_seconds_defaults_for_hanall_collect(tmp_path: P
     )
 
     assert settings.kimi_completion_timeout_seconds == 240
+
+
+def test_tradier_env_rejects_invalid_values(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            inbound_bot_secret="test-secret",
+            socket_shared_token="test-token",
+            messengerbot_bot_name="gateway-bot",
+            database_url=f"sqlite:///{tmp_path / 'test.db'}",
+            tradier_env="paper",
+        )
