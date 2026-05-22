@@ -96,6 +96,21 @@ class FakeClient:
         self.chat = type("Chat", (), {"completions": FakeCompletions(content)})()
 
 
+class SequencedCompletions:
+    def __init__(self, contents: list[str]) -> None:
+        self._contents = list(contents)
+        self.received_messages: list[list[dict[str, str]]] = []
+
+    async def create(self, **kwargs: object):
+        self.received_messages.append(kwargs["messages"])
+        return FakeResponse(self._contents.pop(0))
+
+
+class SequencedClient:
+    def __init__(self, contents: list[str]) -> None:
+        self.chat = type("Chat", (), {"completions": SequencedCompletions(contents)})()
+
+
 def build_service(test_settings, tmp_path: Path, final_text: str, spec_text: str = "한올 business spec 원문") -> HanallResearchService:
     spec_path = tmp_path / "hanall_spec.md"
     spec_path.write_text(spec_text, encoding="utf-8")
@@ -140,6 +155,39 @@ async def test_hanall_collect_fails_when_output_tags_are_missing(test_settings, 
 
     with pytest.raises(ExternalAPIError, match="must contain only <public_brief> and <admin_report> blocks"):
         await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+
+async def test_hanall_collect_recovers_when_output_has_envelope_text(test_settings, tmp_path: Path) -> None:
+    final_text = f"""최종 답변입니다.
+```xml
+<public_brief>{PUBLIC_BRIEF}</public_brief>
+<admin_report>{ADMIN_REPORT}</admin_report>
+```
+저장 부탁드립니다."""
+    service = build_service(test_settings, tmp_path, final_text)
+
+    artifact = await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    assert artifact.summary_text == PUBLIC_BRIEF
+    assert artifact.detail_text == ADMIN_REPORT.strip()
+    assert artifact.raw_response["parse"]["strict_block_parse"] is False
+    assert artifact.raw_response["parse"]["discarded_envelope_text"] is True
+    assert artifact.raw_response["parse"]["format_repair_attempted"] is False
+
+
+async def test_hanall_collect_repairs_malformed_output_tags_once(test_settings, tmp_path: Path) -> None:
+    corrected_text = f"<public_brief>{PUBLIC_BRIEF}</public_brief>\n<admin_report>{ADMIN_REPORT}</admin_report>"
+    service = build_service(test_settings, tmp_path, ADMIN_REPORT)
+    service._client = SequencedClient([ADMIN_REPORT, corrected_text])
+
+    artifact = await service.get_or_create_daily_artifact(date(2026, 4, 6))
+
+    assert artifact.summary_text == PUBLIC_BRIEF
+    assert artifact.detail_text == ADMIN_REPORT.strip()
+    assert artifact.raw_response["parse"]["strict_block_parse"] is True
+    assert artifact.raw_response["parse"]["format_repair_attempted"] is True
+    repair_prompt = service._client.chat.completions.received_messages[1][-1]["content"]
+    assert "태그 밖 텍스트, 마크다운 코드펜스, 인사말, 사족은 금지한다." in repair_prompt
 
 
 async def test_hanall_collect_fails_when_public_brief_is_empty(test_settings, tmp_path: Path) -> None:

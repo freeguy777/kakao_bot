@@ -104,6 +104,8 @@ hanall_runtime_wrapper: |
   - 1번 섹션은 direct company만, 2번 섹션은 competitor만 다루고 서로 섞지 말라.
   - 직접 회사 SEC/DART/KRX/Form 4 공시가 있으면 `SEC Form 4 보고`처럼 filing 이름만 쓰지 말고 사건 의미를 먼저 적어라.
   - 직접 회사 공시/규제 bullet에는 가능하면 이벤트 유형(신규 RSU/stock option 부여, sell to cover 매도, 옵션 행사 등), 대상자 직책, 핵심 수량/거래일을 한 문장에 포함하라.
+  - Immunovant 8-K/10-K/10-Q/실적/사업 업데이트/공식 PR이 확인되면 filing명만 쓰지 말고 2차 확인으로 확인한 임상/규제/재무/runway/개발일정 중 핵심 숫자나 날짜 1~2개를 1번 섹션에 포함하라.
+  - Immunovant 실적발표/사업 업데이트 공식 PR 또는 Exhibit 99.1에 D2T RA/IMVT-1402 ACR20/50/70 같은 임상 결과 수치가 있으면, 순손실/R&D 비용보다 그 임상 결과 수치를 먼저 요약하라.
   - B. Confirmed Updates — Company Direct 표에 넣을 direct filing fact와 핵심 숫자/날짜가 있으면 public_brief 1번 섹션에도 축약 반영하라.
   - 신규 사실이 없더라도 `신규 없음`만 쓰지 말고, 직전 공식 업데이트 이후 변동 없음 또는 현재 유지 중인 배경을 1줄 덧붙여라.
   - 2번 섹션에서는 핵심 경쟁축 또는 대표 경쟁사 이름을 2~4개까지 명시해 추상적으로 쓰지 말라.

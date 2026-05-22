@@ -250,6 +250,9 @@ class HanallRenderedOutput(BaseModel):
     public_text: str
     admin_text: str
     parse_ok: bool = True
+    strict_block_parse: bool = True
+    discarded_envelope_text: bool = False
+    format_repair_attempted: bool = False
     required_sections: list[str] = Field(default_factory=list)
     present_sections: list[str] = Field(default_factory=list)
     missing_sections: list[str] = Field(default_factory=list)
@@ -286,6 +289,10 @@ class HanallStructuredFact(BaseModel):
 
     def validation_tokens(self) -> list[str]:
         tokens = [self.title]
+        for title_piece in self.title.split("|"):
+            normalized_piece = title_piece.strip()
+            if normalized_piece:
+                tokens.append(normalized_piece)
         if self.source_id:
             tokens.append(self.source_id)
         if self.source_url:

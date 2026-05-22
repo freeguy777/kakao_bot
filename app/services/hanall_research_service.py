@@ -21,6 +21,7 @@ from app.schemas import (
     HanallApiBundle,
     HanallArtifact,
     HanallRenderedOutput,
+    HanallStructuredFact,
     HanallValidationResult,
     PromptLibrary,
 )
@@ -45,7 +46,53 @@ class HanallResearchService:
     )
     OUTPUT_BLOCK_PATTERN = re.compile(
         r"\A\s*<public_brief>\s*(?P<public>.*?)\s*</public_brief>\s*<admin_report>\s*(?P<admin>.*?)\s*</admin_report>\s*\Z",
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE,
+    )
+    PUBLIC_BLOCK_PATTERN = re.compile(r"<public_brief>\s*(?P<public>.*?)\s*</public_brief>", re.DOTALL | re.IGNORECASE)
+    ADMIN_BLOCK_PATTERN = re.compile(r"<admin_report>\s*(?P<admin>.*?)\s*</admin_report>", re.DOTALL | re.IGNORECASE)
+    BLOCK_PARSE_ERROR_MESSAGE = "Hanall research response must contain only <public_brief> and <admin_report> blocks"
+    DEEP_RESEARCH_MAX_CANDIDATES = 4
+    DEEP_RESEARCH_MAX_WEB_SEARCH_ROUNDS = 2
+    DEEP_RESEARCH_TRIGGER_KEYWORDS = (
+        "8-k",
+        "10-k",
+        "10-q",
+        "earnings",
+        "financial results",
+        "quarterly results",
+        "annual results",
+        "business update",
+        "corporate update",
+        "press release",
+        "investor presentation",
+        "presentation",
+        "실적",
+        "사업 업데이트",
+        "보도자료",
+        "투자판단관련주요경영사항",
+    )
+    DEEP_RESEARCH_DETAIL_TOKEN_PATTERN = re.compile(
+        r"\bIMVT-\d+\b|\bHL\d+[A-Z]*\b|\bACR(?:20|50|70)\b|\bD2T\s*RA\b|\bgMG\b|\bCIDP\b|\bSjD\b|"
+        r"\bCLE\b|\bGD\b|\bTED\b|\bMG\b|\bRA\b|\b(?:batoclimab|imeroprubart|tanfanercept)\b|"
+        r"\d+(?:\.\d+)?%|\$\s?\d+(?:\.\d+)?\s?(?:M|B|million|billion)\b|"
+        r"\b\d+(?:\.\d+)?\s?(?:million|billion)\b",
+        re.IGNORECASE,
+    )
+    DEEP_RESEARCH_8K_SOURCE_TOKENS = (
+        "exhibit 99.1",
+        "ex-99.1",
+        "press release",
+        "official pr",
+        "공식 pr",
+        "보도자료",
+    )
+    DEEP_RESEARCH_D2T_RA_RESULT_TOKENS = (
+        "acr20",
+        "acr50",
+        "acr70",
+        "72.7%",
+        "54.5%",
+        "35.8%",
     )
     DIRECT_NO_UPDATE_PATTERNS = (
         "한올/immunovant 직접 업데이트 : 0건",
@@ -198,14 +245,104 @@ class HanallResearchService:
             final_text = response.choices[0].message.content or ""
         if not final_text:
             raise ExternalAPIError("Hanall research produced no final text")
-        rendered_output = self._parse_rendered_output(final_text)
-        validation_result = self._validate_rendered_output(rendered_output, prefetch_bundle)
+        deep_research_candidates = self._select_deep_research_candidates(prefetch_bundle)
+        deep_research_text = ""
+        deep_research_metadata: dict[str, Any] = {
+            "status": "not_applicable",
+            "candidates": [self._deep_research_candidate_payload(fact) for fact in deep_research_candidates],
+            "result_text": "",
+        }
+        if deep_research_candidates:
+            deep_research_metadata["status"] = "pending"
+            try:
+                deep_research_text, deep_raw_response = await self._run_direct_event_deep_research(
+                    client=client,
+                    messages=messages,
+                    initial_final_text=final_text,
+                    candidates=deep_research_candidates,
+                    prefetch_bundle=prefetch_bundle,
+                    tools=tools,
+                    deadline=deadline,
+                )
+                deep_research_text = deep_research_text.strip()
+                if not deep_research_text:
+                    deep_research_text = self._build_empty_deep_research_note(deep_research_candidates)
+                    deep_research_metadata["status"] = "empty"
+                else:
+                    deep_research_metadata["status"] = "success"
+                deep_research_metadata["completion"] = deep_raw_response
+                quality_issues = self._deep_research_quality_issues(deep_research_candidates, deep_research_text)
+                if quality_issues:
+                    deep_research_metadata["quality_issues"] = quality_issues
+                    deep_research_metadata["quality_repair_attempted"] = True
+                    deep_research_text, deep_raw_response = await self._run_direct_event_deep_research(
+                        client=client,
+                        messages=messages,
+                        initial_final_text=final_text,
+                        candidates=deep_research_candidates,
+                        prefetch_bundle=prefetch_bundle,
+                        tools=tools,
+                        deadline=deadline,
+                        previous_deep_research_text=deep_research_text,
+                        quality_issues=quality_issues,
+                    )
+                    deep_research_text = deep_research_text.strip()
+                    if not deep_research_text:
+                        deep_research_text = self._build_empty_deep_research_note(deep_research_candidates)
+                        deep_research_metadata["status"] = "empty_after_quality_repair"
+                    else:
+                        repaired_quality_issues = self._deep_research_quality_issues(
+                            deep_research_candidates,
+                            deep_research_text,
+                        )
+                        deep_research_metadata["quality_repair_issues"] = repaired_quality_issues
+                        deep_research_metadata["status"] = "success" if not repaired_quality_issues else "partial"
+                    deep_research_metadata["quality_repair_completion"] = deep_raw_response
+            except Exception as exc:  # noqa: BLE001
+                deep_research_text = self._build_failed_deep_research_note(deep_research_candidates, exc)
+                deep_research_metadata["status"] = "failed"
+                deep_research_metadata["failure_reason"] = str(exc)
+
+            deep_research_metadata["result_text"] = deep_research_text
+            response = await self._request_final_render_with_deep_research(
+                client=client,
+                messages=messages,
+                initial_final_text=final_text,
+                prefetch_bundle=prefetch_bundle,
+                candidates=deep_research_candidates,
+                deep_research_text=deep_research_text,
+                deadline=deadline,
+            )
+            raw_response = response.model_dump(mode="json")
+            final_text = response.choices[0].message.content or ""
+            if not final_text:
+                raise ExternalAPIError("Hanall research deep final render produced no final text")
+        rendered_output, repaired_raw_response, repaired_text = await self._parse_or_repair_rendered_output(
+            client=client,
+            messages=messages,
+            final_text=final_text,
+            prefetch_bundle=prefetch_bundle,
+            deep_research_text=deep_research_text,
+            deep_research_candidates=deep_research_candidates,
+            deadline=deadline,
+        )
+        if repaired_raw_response is not None:
+            raw_response = repaired_raw_response
+        if repaired_text is not None:
+            final_text = repaired_text
+        validation_result = self._validate_rendered_output(
+            rendered_output,
+            prefetch_bundle,
+            deep_research_text=deep_research_text,
+        )
         if not validation_result.is_valid:
             response = await self._request_validation_repair_without_tools(
                 client,
                 messages=messages,
                 invalid_text=final_text,
                 prefetch_bundle=prefetch_bundle,
+                deep_research_text=deep_research_text,
+                deep_research_candidates=deep_research_candidates,
                 issues=validation_result.issues,
                 deadline=deadline,
             )
@@ -213,8 +350,22 @@ class HanallResearchService:
             corrected_text = response.choices[0].message.content or ""
             if not corrected_text:
                 raise ExternalAPIError("Hanall research repair produced no final text")
-            rendered_output = self._parse_rendered_output(corrected_text)
-            validation_result = self._validate_rendered_output(rendered_output, prefetch_bundle)
+            rendered_output, repaired_raw_response, _repaired_text = await self._parse_or_repair_rendered_output(
+                client=client,
+                messages=messages,
+                final_text=corrected_text,
+                prefetch_bundle=prefetch_bundle,
+                deep_research_text=deep_research_text,
+                deep_research_candidates=deep_research_candidates,
+                deadline=deadline,
+            )
+            if repaired_raw_response is not None:
+                raw_response = repaired_raw_response
+            validation_result = self._validate_rendered_output(
+                rendered_output,
+                prefetch_bundle,
+                deep_research_text=deep_research_text,
+            )
             validation_result.repair_attempted = True
             if not validation_result.is_valid:
                 issue_text = "; ".join(validation_result.issues)
@@ -230,11 +381,15 @@ class HanallResearchService:
                 "prefetch": prefetch_bundle.model_dump(mode="json"),
                 "parse": {
                     "parse_ok": rendered_output.parse_ok,
+                    "strict_block_parse": rendered_output.strict_block_parse,
+                    "discarded_envelope_text": rendered_output.discarded_envelope_text,
+                    "format_repair_attempted": rendered_output.format_repair_attempted,
                     "required_sections": rendered_output.required_sections,
                     "present_sections": rendered_output.present_sections,
                     "missing_sections": rendered_output.missing_sections,
                 },
                 "validation": validation_result.model_dump(mode="json"),
+                "deep_research": deep_research_metadata,
             },
         )
 
@@ -362,6 +517,214 @@ class HanallResearchService:
             deadline=deadline,
         )
 
+    async def _run_direct_event_deep_research(
+        self,
+        *,
+        client: AsyncOpenAI,
+        messages: list[dict[str, Any]],
+        initial_final_text: str,
+        candidates: list[HanallStructuredFact],
+        prefetch_bundle: HanallApiBundle,
+        tools: list[dict[str, Any]],
+        deadline: float,
+        previous_deep_research_text: str = "",
+        quality_issues: list[str] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        deep_messages = [
+            *self._messages_with_initial_final(messages, initial_final_text),
+            {
+                "role": "user",
+                "content": self._build_deep_research_prompt(
+                    candidates=candidates,
+                    prefetch_bundle=prefetch_bundle,
+                    previous_deep_research_text=previous_deep_research_text,
+                    quality_issues=quality_issues or [],
+                ),
+            },
+        ]
+        raw_response: dict[str, Any] = {}
+        result_text = ""
+        web_search_rounds = 0
+        max_iterations = max(1, self._settings.kimi_max_iterations)
+
+        for iteration_index in range(max_iterations):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ExternalAPIError("Hanall direct event deep research exceeded overall deadline")
+            response = await self._request_chat_completion(
+                client,
+                messages=deep_messages,
+                tools=tools or None,
+                request_timeout_seconds=self._settings.kimi_completion_timeout_seconds,
+                deadline=deadline,
+            )
+            raw_response = response.model_dump(mode="json")
+            choice = response.choices[0]
+            assistant_message = choice.message
+            if choice.finish_reason != "tool_calls" or not assistant_message.tool_calls:
+                deep_messages.append(self._assistant_message_to_context(assistant_message))
+                result_text = assistant_message.content or ""
+                break
+
+            has_web_search = self._tool_calls_include_function(assistant_message.tool_calls, "web_search")
+            if has_web_search and web_search_rounds >= self.DEEP_RESEARCH_MAX_WEB_SEARCH_ROUNDS:
+                self._append_assistant_context_without_tool_calls(deep_messages, assistant_message)
+                break
+            if iteration_index == max_iterations - 1:
+                self._append_assistant_context_without_tool_calls(deep_messages, assistant_message)
+                break
+
+            deep_messages.append(self._assistant_message_to_context(assistant_message))
+            deep_messages.extend(await self._resolve_tool_calls(assistant_message.tool_calls))
+            if has_web_search:
+                web_search_rounds += 1
+                if web_search_rounds >= self.DEEP_RESEARCH_MAX_WEB_SEARCH_ROUNDS:
+                    break
+
+        if result_text:
+            return result_text, raw_response
+
+        response = await self._request_deep_research_final_without_tools(
+            client=client,
+            messages=deep_messages,
+            candidates=candidates,
+            deadline=deadline,
+        )
+        return response.choices[0].message.content or "", response.model_dump(mode="json")
+
+    async def _request_deep_research_final_without_tools(
+        self,
+        *,
+        client: AsyncOpenAI,
+        messages: list[dict[str, Any]],
+        candidates: list[HanallStructuredFact],
+        deadline: float,
+    ) -> Any:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise ExternalAPIError("Hanall research exceeded overall deadline before direct event deep synthesis")
+        forced_message = {
+            "role": "user",
+            "content": (
+                "추가 도구 호출을 중단하고, 이미 확인한 공식 출처 정보만 사용해 2차 딥 리서치 결과를 작성하라.\n"
+                "최종 public_brief/admin_report 태그는 쓰지 말라.\n"
+                "각 후보 이벤트별로 본문 확인 여부, 핵심 사실, public_brief에 넣어야 할 1문장, Coverage Gap을 구분하라.\n\n"
+                f"{self._format_deep_research_candidates(candidates)}"
+            ),
+        }
+        return await self._request_chat_completion(
+            client,
+            messages=[*messages, forced_message],
+            tools=None,
+            request_timeout_seconds=remaining_seconds,
+            deadline=deadline,
+        )
+
+    async def _request_final_render_with_deep_research(
+        self,
+        *,
+        client: AsyncOpenAI,
+        messages: list[dict[str, Any]],
+        initial_final_text: str,
+        prefetch_bundle: HanallApiBundle,
+        candidates: list[HanallStructuredFact],
+        deep_research_text: str,
+        deadline: float,
+    ) -> Any:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise ExternalAPIError("Hanall research exceeded overall deadline before direct event final render")
+        render_message = {
+            "role": "user",
+            "content": (
+                "2차 딥 리서치 결과를 반영해 최종 답변을 다시 작성하라.\n"
+                "중요 direct company 이벤트는 filing명만 반복하지 말고 2차 확인 결과의 임상/규제/재무/runway/개발일정 핵심 사실 중 최소 1개를 public_brief 1번 섹션에 반영하라.\n"
+                "Immunovant 8-K/실적발표의 2차 확인 결과에 D2T RA ACR20/50/70 또는 반응률 수치가 있으면, net loss/R&D 비용보다 그 임상 결과 수치를 public_brief 1번 첫 bullet에 우선 반영하라.\n"
+                "admin_report의 B. Confirmed Updates — Company Direct에는 2차 확인 결과의 원문 기반 숫자/날짜/자산명/적응증을 반영하라.\n"
+                "2차 확인이 실패했거나 본문 접근이 제한된 후보는 public_brief에 추정 내용을 쓰지 말고 admin_report의 Coverage Gaps/Omission Audit에 남겨라.\n"
+                "최상위 태그는 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
+                "태그 밖 텍스트는 금지한다.\n\n"
+                f"{prefetch_bundle.prompt_block()}\n\n"
+                f"{self._build_deep_research_context_block(candidates, deep_research_text)}"
+            ),
+        }
+        return await self._request_chat_completion(
+            client,
+            messages=[*self._messages_with_initial_final(messages, initial_final_text), render_message],
+            tools=None,
+            request_timeout_seconds=remaining_seconds,
+            deadline=deadline,
+        )
+
+    async def _parse_or_repair_rendered_output(
+        self,
+        *,
+        client: AsyncOpenAI,
+        messages: list[dict[str, Any]],
+        final_text: str,
+        prefetch_bundle: HanallApiBundle,
+        deadline: float,
+        deep_research_text: str = "",
+        deep_research_candidates: list[HanallStructuredFact] | None = None,
+    ) -> tuple[HanallRenderedOutput, dict[str, Any] | None, str | None]:
+        try:
+            return self._parse_rendered_output(final_text), None, None
+        except ExternalAPIError as exc:
+            if str(exc) != self.BLOCK_PARSE_ERROR_MESSAGE:
+                raise
+
+        response = await self._request_format_repair_without_tools(
+            client,
+            messages=messages,
+            invalid_text=final_text,
+            prefetch_bundle=prefetch_bundle,
+            deep_research_text=deep_research_text,
+            deep_research_candidates=deep_research_candidates or [],
+            deadline=deadline,
+        )
+        repaired_raw_response = response.model_dump(mode="json")
+        corrected_text = response.choices[0].message.content or ""
+        if not corrected_text:
+            raise ExternalAPIError("Hanall research format repair produced no final text")
+        rendered_output = self._parse_rendered_output(corrected_text)
+        rendered_output.format_repair_attempted = True
+        return rendered_output, repaired_raw_response, corrected_text
+
+    async def _request_format_repair_without_tools(
+        self,
+        client: AsyncOpenAI,
+        *,
+        messages: list[dict[str, Any]],
+        invalid_text: str,
+        prefetch_bundle: HanallApiBundle,
+        deadline: float,
+        deep_research_text: str = "",
+        deep_research_candidates: list[HanallStructuredFact] | None = None,
+    ) -> Any:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise ExternalAPIError("Hanall research exceeded overall deadline before format repair")
+        repair_message = {
+            "role": "user",
+            "content": (
+                "직전 최종 답변은 저장 전 출력 태그 검증에 실패했다. 추가 도구 호출 없이 이미 수집한 정보만 사용해 다시 작성하라.\n"
+                "최상위 태그는 정확히 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
+                "태그 순서는 public_brief 다음 admin_report로 고정한다.\n"
+                "태그 밖 텍스트, 마크다운 코드펜스, 인사말, 사족은 금지한다.\n"
+                "admin_report에는 필수 섹션 제목을 그대로 유지하라.\n\n"
+                f"{prefetch_bundle.prompt_block()}\n\n"
+                f"{self._build_deep_research_context_block(deep_research_candidates or [], deep_research_text)}\n\n"
+                "[Invalid draft to rewrap]\n"
+                f"{invalid_text}"
+            ),
+        }
+        return await self._request_chat_completion(
+            client,
+            messages=[*messages, {"role": "assistant", "content": invalid_text}, repair_message],
+            tools=None,
+            request_timeout_seconds=remaining_seconds,
+            deadline=deadline,
+        )
+
     async def _request_validation_repair_without_tools(
         self,
         client: AsyncOpenAI,
@@ -371,6 +734,8 @@ class HanallResearchService:
         prefetch_bundle: HanallApiBundle,
         issues: list[str],
         deadline: float,
+        deep_research_text: str = "",
+        deep_research_candidates: list[HanallStructuredFact] | None = None,
     ) -> Any:
         remaining_seconds = deadline - asyncio.get_running_loop().time()
         if remaining_seconds <= 0:
@@ -383,10 +748,12 @@ class HanallResearchService:
                 "아래 검증 이슈를 모두 해결해야 한다.\n"
                 f"{issue_lines}\n"
                 "structured API direct fact는 B. Confirmed Updates — Company Direct와 public_brief 1번 섹션에 반영하라.\n"
+                "2차 딥 리서치 결과가 있으면 filing명만 쓰지 말고 그 결과의 핵심 숫자/날짜/자산명/적응증을 public_brief 1번과 admin_report B에 반영하라.\n"
                 "structured API source status가 unavailable인 범주는 direct update를 '신규 없음'으로 단정하지 말고 Coverage Gaps/Omission Audit에 반영하라.\n"
                 "최상위 태그는 <public_brief>...</public_brief> 와 <admin_report>...</admin_report> 두 개만 포함하라.\n"
                 "태그 밖 텍스트는 금지한다.\n\n"
                 f"{prefetch_bundle.prompt_block()}\n\n"
+                f"{self._build_deep_research_context_block(deep_research_candidates or [], deep_research_text)}\n\n"
                 "[Invalid draft to fix]\n"
                 f"{invalid_text}"
             ),
@@ -398,6 +765,186 @@ class HanallResearchService:
             request_timeout_seconds=remaining_seconds,
             deadline=deadline,
         )
+
+    def _select_deep_research_candidates(self, prefetch_bundle: HanallApiBundle) -> list[HanallStructuredFact]:
+        candidates: list[HanallStructuredFact] = []
+        for fact in prefetch_bundle.direct_validation_facts():
+            if not self._is_deep_research_candidate(fact):
+                continue
+            candidates.append(fact)
+            if len(candidates) >= self.DEEP_RESEARCH_MAX_CANDIDATES:
+                break
+        return candidates
+
+    def _is_deep_research_candidate(self, fact: HanallStructuredFact) -> bool:
+        if fact.source_type != "filing":
+            return False
+        haystack = self._normalize_validation_text(
+            " ".join(
+                item
+                for item in (
+                    fact.entity,
+                    fact.source_name,
+                    fact.category,
+                    fact.title,
+                    fact.fact_text,
+                    fact.source_id or "",
+                    fact.source_url or "",
+                )
+                if item
+            )
+        )
+        return any(keyword in haystack for keyword in self.DEEP_RESEARCH_TRIGGER_KEYWORDS)
+
+    @staticmethod
+    def _deep_research_candidate_payload(fact: HanallStructuredFact) -> dict[str, Any]:
+        return {
+            "source_name": fact.source_name,
+            "entity": fact.entity,
+            "title": fact.title,
+            "source_id": fact.source_id,
+            "source_url": fact.source_url,
+            "observed_at": fact.observed_at.isoformat() if fact.observed_at is not None else None,
+            "observed_date": fact.observed_date.isoformat() if fact.observed_date is not None else None,
+            "validation_mode": fact.validation_mode,
+        }
+
+    def _build_deep_research_prompt(
+        self,
+        *,
+        candidates: list[HanallStructuredFact],
+        prefetch_bundle: HanallApiBundle,
+        previous_deep_research_text: str = "",
+        quality_issues: list[str] | None = None,
+    ) -> str:
+        repair_block = ""
+        if quality_issues:
+            issue_lines = "\n".join(f"- {issue}" for issue in quality_issues)
+            repair_block = (
+                "\n[Previous deep research was incomplete]\n"
+                f"{previous_deep_research_text.strip() or '- 없음'}\n\n"
+                "[Issues to fix]\n"
+                f"{issue_lines}\n"
+                "위 이슈를 해결하기 위해 공식 8-K Exhibit 99.1 또는 Immunovant 공식 PR 원문을 다시 확인하라.\n"
+            )
+        return (
+            "2차 딥 리서치 단계다. 아래 direct company 이벤트는 공식 API에서 감지됐지만, 최종 브리핑에 filing명만 쓰면 중요한 내용이 누락될 수 있다.\n"
+            "각 후보의 공식 문서/회사 IR/SEC 원문을 우선 열어 본문 핵심을 확인하라. 2차/언론 출처는 발견용으로만 쓰고, Confirmed에는 공식 출처로 확인된 사실만 넣어라.\n"
+            "SEC 8-K가 Item 2.02/earnings/financial results/business update/corporate update 성격이면 8-K cover page에서 멈추지 말고, 8-K 안의 Exhibit 99.1/EX-99.1 또는 회사 공식 Press Release/공식 PR 링크를 반드시 열어라.\n"
+            "Immunovant 8-K/실적발표의 public 우선순위는 1) 새 임상 효능/탑라인 수치(예: D2T RA ACR20/50/70, 반응률, p-value), 2) 핵심 개발 일정, 3) cash/runway, 4) 순손실/R&D 비용 순서다.\n"
+            "공식 PR/Exhibit에 D2T RA/IMVT-1402 임상 결과 수치가 있으면 `D2T RA`, `ACR20/50/70`, 각 퍼센트 값을 public brief required points에 반드시 포함하라. 이를 단순히 '2026년 topline 예정'으로 대체하지 말라.\n"
+            "추출 대상은 고정 스키마가 아니라 원문에 실제로 있는 투자판단 핵심이다: 임상 결과, 자산/적응증, 규제 일정, 개발 일정, 중단/전략 변경, 재무 결과, 현금/runway, 가이던스.\n"
+            "숫자, 날짜, 자산명, 적응증, filing id, 원문 링크를 그대로 보존하라. 확인하지 못한 내용은 추정하지 말고 Coverage Gap으로 표시하라.\n"
+            "최종 public_brief/admin_report 태그는 쓰지 말고 아래 형식의 리서치 메모만 작성하라.\n\n"
+            "[Output]\n"
+            "- status: success | partial | failed\n"
+            "- confirmed direct-event details: 후보별 원문 기반 핵심 사실 bullet\n"
+            "- public brief required points: 공개 브리핑 1번 섹션에 넣을 1~2개 짧은 한국어 문장\n"
+            "- admin report detail points: admin B 섹션에 보존할 숫자/날짜/링크\n"
+            "- coverage gaps: 접근 제한/미확인 사항\n\n"
+            f"{prefetch_bundle.prompt_block()}\n\n"
+            f"{repair_block}\n"
+            f"{self._format_deep_research_candidates(candidates)}"
+        )
+
+    def _format_deep_research_candidates(self, candidates: list[HanallStructuredFact]) -> str:
+        if not candidates:
+            return "[Deep research candidate direct events]\n- 없음"
+        lines = ["[Deep research candidate direct events]"]
+        for index, fact in enumerate(candidates, start=1):
+            lines.append(f"{index}. {fact.prompt_line()}")
+        return "\n".join(lines)
+
+    def _build_deep_research_context_block(
+        self,
+        candidates: list[HanallStructuredFact],
+        deep_research_text: str,
+    ) -> str:
+        if not candidates and not deep_research_text.strip():
+            return ""
+        return "\n".join(
+            [
+                "[Direct event deep research]",
+                "- 아래 내용은 중요 direct company 이벤트를 대상으로 2차 확인한 결과다.",
+                "- confirmed detail이 있으면 filing명만 반복하지 말고 public_brief 1번과 admin_report B에 핵심 사실을 반영하라.",
+                "- failed/coverage gap이면 추정하지 말고 admin_report의 Coverage Gaps/Omission Audit에 남겨라.",
+                "",
+                self._format_deep_research_candidates(candidates),
+                "",
+                "[Deep research result]",
+                deep_research_text.strip() or "- 없음",
+            ]
+        )
+
+    @staticmethod
+    def _messages_with_initial_final(messages: list[dict[str, Any]], initial_final_text: str) -> list[dict[str, Any]]:
+        if messages:
+            last_message = messages[-1]
+            if last_message.get("role") == "assistant" and last_message.get("content") == initial_final_text:
+                return list(messages)
+        return [*messages, {"role": "assistant", "content": initial_final_text}]
+
+    def _build_empty_deep_research_note(self, candidates: list[HanallStructuredFact]) -> str:
+        return (
+            "status: failed\n"
+            "confirmed direct-event details: 없음\n"
+            "public brief required points: 없음\n"
+            "admin report detail points: 없음\n"
+            "coverage gaps: 2차 딥 리서치가 빈 결과를 반환함. 후보는 아래와 같음.\n"
+            f"{self._format_deep_research_candidates(candidates)}"
+        )
+
+    def _build_failed_deep_research_note(self, candidates: list[HanallStructuredFact], exc: Exception) -> str:
+        return (
+            "status: failed\n"
+            "confirmed direct-event details: 없음\n"
+            "public brief required points: 없음\n"
+            "admin report detail points: 없음\n"
+            f"coverage gaps: 2차 딥 리서치 실패: {exc}. 후보 본문 내용은 추정 금지.\n"
+            f"{self._format_deep_research_candidates(candidates)}"
+        )
+
+    def _deep_research_quality_issues(
+        self,
+        candidates: list[HanallStructuredFact],
+        deep_research_text: str,
+    ) -> list[str]:
+        normalized_text = self._normalize_validation_text(deep_research_text)
+        if not normalized_text or "status: failed" in normalized_text:
+            return []
+
+        issues: list[str] = []
+        if any(self._is_immunovant_8k_candidate(fact) for fact in candidates):
+            if not any(token in normalized_text for token in self.DEEP_RESEARCH_8K_SOURCE_TOKENS):
+                issues.append("Immunovant 8-K deep research가 Exhibit 99.1/official Press Release 확인 여부를 명시하지 않았다")
+
+            has_d2t_ra_topline_without_result_numbers = (
+                "d2t ra" in normalized_text
+                and "topline" in normalized_text
+                and not any(token in normalized_text for token in self.DEEP_RESEARCH_D2T_RA_RESULT_TOKENS)
+            )
+            if has_d2t_ra_topline_without_result_numbers:
+                issues.append(
+                    "Immunovant 8-K/PR의 D2T RA 결과가 일정 언급으로만 요약됐고 ACR20/50/70 또는 반응률 수치가 없다"
+                )
+        return issues
+
+    def _is_immunovant_8k_candidate(self, fact: HanallStructuredFact) -> bool:
+        normalized_text = self._normalize_validation_text(
+            " ".join(
+                item
+                for item in (
+                    fact.entity,
+                    fact.source_name,
+                    fact.title,
+                    fact.fact_text,
+                    fact.source_id or "",
+                    fact.source_url or "",
+                )
+                if item
+            )
+        )
+        return "immunovant" in normalized_text and "8-k" in normalized_text
 
     async def _collect_prefetch_bundle(self, *, window_start: datetime, window_end: datetime) -> HanallApiBundle:
         if self._hanall_prefetch_service is None:
@@ -412,6 +959,8 @@ class HanallResearchService:
         self,
         rendered_output: HanallRenderedOutput,
         prefetch_bundle: HanallApiBundle,
+        *,
+        deep_research_text: str = "",
     ) -> HanallValidationResult:
         issues: list[str] = []
         admin_text = rendered_output.admin_text
@@ -428,7 +977,35 @@ class HanallResearchService:
             if not self._fact_present(direct_public_section, fact.validation_tokens()):
                 issues.append(f"structured direct fact 누락(public): {fact_id}")
 
+        deep_research_tokens = self._extract_deep_research_detail_tokens(deep_research_text)
+        if deep_research_tokens:
+            token_preview = ", ".join(deep_research_tokens[:5])
+            if not self._fact_present(direct_public_section, deep_research_tokens):
+                issues.append(f"deep research 핵심 내용 누락(public): {token_preview}")
+            if not self._fact_present(admin_text, deep_research_tokens):
+                issues.append(f"deep research 핵심 내용 누락(admin): {token_preview}")
+
         return HanallValidationResult(is_valid=not issues, issues=issues)
+
+    @classmethod
+    def _extract_deep_research_detail_tokens(cls, deep_research_text: str) -> list[str]:
+        if not deep_research_text.strip():
+            return []
+        normalized_text = cls._normalize_validation_text(deep_research_text)
+        if "status: failed" in normalized_text or "public brief required points: 없음" in normalized_text:
+            return []
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for match in cls.DEEP_RESEARCH_DETAIL_TOKEN_PATTERN.finditer(deep_research_text):
+            token = re.sub(r"\s+", " ", match.group(0)).strip()
+            normalized_token = cls._normalize_validation_text(token)
+            if not normalized_token or normalized_token in seen:
+                continue
+            seen.add(normalized_token)
+            tokens.append(token)
+            if len(tokens) >= 12:
+                break
+        return tokens
 
     def _claims_no_direct_updates(self, public_text: str, admin_text: str) -> bool:
         normalized_text = self._normalize_validation_text(f"{public_text}\n{admin_text}")
@@ -610,9 +1187,17 @@ class HanallResearchService:
     def _parse_rendered_output(self, text: str) -> HanallRenderedOutput:
         match = self.OUTPUT_BLOCK_PATTERN.match(text)
         if match is None:
-            raise ExternalAPIError("Hanall research response must contain only <public_brief> and <admin_report> blocks")
-        public_text = match.group("public").strip()
-        admin_text = match.group("admin").strip()
+            recovered = self._extract_unique_output_blocks(text)
+            strict_block_parse = False
+            if recovered is None:
+                raise ExternalAPIError(self.BLOCK_PARSE_ERROR_MESSAGE)
+            public_text, admin_text = recovered
+        else:
+            strict_block_parse = True
+            public_text = match.group("public")
+            admin_text = match.group("admin")
+        public_text = public_text.strip()
+        admin_text = admin_text.strip()
         if not public_text:
             raise ExternalAPIError("Hanall research response contained an empty <public_brief> block")
         if not admin_text:
@@ -635,10 +1220,25 @@ class HanallResearchService:
         return HanallRenderedOutput(
             public_text=public_text,
             admin_text=admin_text,
+            strict_block_parse=strict_block_parse,
+            discarded_envelope_text=not strict_block_parse,
             required_sections=list(self.REQUIRED_ADMIN_SECTIONS),
             present_sections=present_sections,
             missing_sections=missing_sections,
         )
+
+    def _extract_unique_output_blocks(self, text: str) -> tuple[str, str] | None:
+        public_matches = list(self.PUBLIC_BLOCK_PATTERN.finditer(text))
+        admin_matches = list(self.ADMIN_BLOCK_PATTERN.finditer(text))
+        if len(public_matches) != 1 or len(admin_matches) != 1:
+            return None
+        public_match = public_matches[0]
+        admin_match = admin_matches[0]
+        if public_match.start() > admin_match.start():
+            return None
+        if public_match.end() > admin_match.start():
+            return None
+        return public_match.group("public"), admin_match.group("admin")
 
     @classmethod
     def _extract_normalized_admin_headings(cls, admin_text: str) -> set[str]:
