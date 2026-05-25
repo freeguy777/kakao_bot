@@ -23,20 +23,34 @@ var GATEWAY_CONFIG = {
   dedupeLimit: 500,
   pendingQueueFile: "gateway_pending_events.json",
   pendingQueueLimit: 200,
-  webhookRetryCount: 3,
-  webhookRetryBaseDelayMs: 1500,
-  pendingFlushBatchSize: 20,
-  pendingFlushIntervalMs: 30000
+  diagnosticFile: "gateway_diag.json",
+  diagnosticRecentLimit: 30,
+  diagnosticPersistIntervalMs: 60000,
+  diagnosticErrorPersistMinIntervalMs: 10000,
+  enableConsoleLog: false,
+  inboundQueueLimit: 100,
+  webhookRetryCount: 1,
+  webhookRetryBaseDelayMs: 3000,
+  pendingFlushBatchSize: 3,
+  pendingFlushIntervalMs: 60000,
+  httpConnectTimeoutMs: 3000,
+  httpReadTimeoutMs: 5000
 };
 
 var bot = BotManager.getCurrentBot();
 var pendingFlushThread = null;
 var pendingFlushWorkerToken = 0;
+var inboundQueue = new java.util.concurrent.LinkedBlockingQueue(GATEWAY_CONFIG.inboundQueueLimit);
 var gson = new com.google.gson.Gson();
 var gatewayReady = false;
+var lastDiagnosticPersistMs = 0;
+var diagState = null;
 
 function log(message) {
-  java.lang.System.out.println("[bot_gateway] " + message);
+  recordDiagnostic("log", message, false);
+  if (GATEWAY_CONFIG.enableConsoleLog === true) {
+    java.lang.System.out.println("[bot_gateway] " + message);
+  }
 }
 
 function validateGatewayConfig() {
@@ -74,16 +88,136 @@ function sleepMs(ms) {
   java.lang.Thread.sleep(ms);
 }
 
+function truncateText(value, limit) {
+  var text = String(value == null ? "" : value);
+  var max = Number(limit || 500);
+  if (text.length <= max) {
+    return text;
+  }
+  return text.substring(0, max) + "...";
+}
+
+function initDiagnosticState() {
+  diagState = {
+    started_at: nowIsoString(),
+    started_ms: nowMillis(),
+    uptime_ms: 0,
+    gateway_ready: false,
+    sequence: 0,
+    inbound_received: 0,
+    inbound_enqueued: 0,
+    inbound_delivered: 0,
+    inbound_spooled: 0,
+    inbound_queue_full: 0,
+    webhook_error_count: 0,
+    ack_ok_count: 0,
+    ack_error_count: 0,
+    pending_flush_count: 0,
+    pending_flush_error_count: 0,
+    worker_error_count: 0,
+    pending_loaded_count: 0,
+    pending_after_flush_count: 0,
+    queue_size: 0,
+    last_event_at: null,
+    last_inbound_at: null,
+    last_webhook_ok_at: null,
+    last_ack_ok_at: null,
+    last_error_at: null,
+    last_error_type: null,
+    last_error: null,
+    recent: []
+  };
+}
+
+function refreshDiagnosticSnapshot() {
+  if (diagState == null) {
+    return;
+  }
+  diagState.uptime_ms = nowMillis() - Number(diagState.started_ms || nowMillis());
+  diagState.gateway_ready = gatewayReady === true;
+  try {
+    diagState.queue_size = inboundQueue.size();
+  } catch (ignore) {}
+}
+
+function recordDiagnostic(type, detail, isError) {
+  if (diagState == null) {
+    return;
+  }
+  var currentMs = nowMillis();
+  refreshDiagnosticSnapshot();
+  diagState.sequence += 1;
+  diagState.last_event_at = nowIsoString();
+  var entry = {
+    seq: diagState.sequence,
+    at: diagState.last_event_at,
+    type: String(type || "event"),
+    detail: truncateText(detail, 500)
+  };
+  diagState.recent.push(entry);
+  while (diagState.recent.length > Number(GATEWAY_CONFIG.diagnosticRecentLimit || 30)) {
+    diagState.recent.shift();
+  }
+  if (isError === true) {
+    diagState.last_error_at = entry.at;
+    diagState.last_error_type = entry.type;
+    diagState.last_error = entry.detail;
+  }
+
+  var errorInterval = Number(GATEWAY_CONFIG.diagnosticErrorPersistMinIntervalMs || 10000);
+  var force = isError === true && currentMs - lastDiagnosticPersistMs >= errorInterval;
+  persistDiagnostic(force);
+}
+
+function persistDiagnostic(force) {
+  if (diagState == null) {
+    return;
+  }
+  var currentMs = nowMillis();
+  var interval = Number(GATEWAY_CONFIG.diagnosticPersistIntervalMs || 60000);
+  if (force !== true && currentMs - lastDiagnosticPersistMs < interval) {
+    return;
+  }
+  refreshDiagnosticSnapshot();
+  lastDiagnosticPersistMs = currentMs;
+  try {
+    Database.writeObject(GATEWAY_CONFIG.diagnosticFile, diagState);
+  } catch (ignore) {}
+}
+
+function countPendingEvents() {
+  try {
+    return loadPendingEvents().length;
+  } catch (ignore) {
+    return -1;
+  }
+}
+
+initDiagnosticState();
+
 function readObjectFile(path, emptyValue) {
-  if (!Database.exists(path)) {
+  try {
+    if (!Database.exists(path)) {
+      return emptyValue;
+    }
+    var payload = Database.readObject(path);
+    return payload == null ? emptyValue : payload;
+  } catch (error) {
+    recordDiagnostic("database_read_error", path + ": " + error, true);
     return emptyValue;
   }
-  var payload = Database.readObject(path);
-  return payload == null ? emptyValue : payload;
 }
 
 function writeObjectFile(path, payload) {
-  Database.writeObject(path, payload);
+  try {
+    Database.writeObject(path, payload);
+    return true;
+  } catch (error) {
+    if (String(path) !== String(GATEWAY_CONFIG.diagnosticFile)) {
+      recordDiagnostic("database_write_error", path + ": " + error, true);
+    }
+    return false;
+  }
 }
 
 function loadProcessedIds() {
@@ -196,8 +330,8 @@ function postJson(urlText, payload, headers) {
   var connection = url.openConnection();
   connection.setRequestMethod("POST");
   connection.setDoOutput(true);
-  connection.setConnectTimeout(5000);
-  connection.setReadTimeout(10000);
+  connection.setConnectTimeout(Number(GATEWAY_CONFIG.httpConnectTimeoutMs || 5000));
+  connection.setReadTimeout(Number(GATEWAY_CONFIG.httpReadTimeoutMs || 10000));
   connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
   if (headers != null) {
     for (var key in headers) {
@@ -212,13 +346,18 @@ function postJson(urlText, payload, headers) {
 
   var code = connection.getResponseCode();
   var stream = code >= 200 && code < 400 ? connection.getInputStream() : connection.getErrorStream();
-  var reader = new java.io.BufferedReader(new java.io.InputStreamReader(stream, "UTF-8"));
   var responseBuilder = new java.lang.StringBuilder();
-  var line;
-  while ((line = reader.readLine()) != null) {
-    responseBuilder.append(line);
+  if (stream != null) {
+    var reader = new java.io.BufferedReader(new java.io.InputStreamReader(stream, "UTF-8"));
+    var line;
+    while ((line = reader.readLine()) != null) {
+      responseBuilder.append(line);
+    }
+    reader.close();
   }
-  reader.close();
+  try {
+    connection.disconnect();
+  } catch (ignore) {}
   return { code: code, body: String(responseBuilder.toString()) };
 }
 
@@ -230,13 +369,24 @@ function deliverInboundPayload(payload) {
         "X-Bot-Secret": GATEWAY_CONFIG.botSecret
       });
       if (result.code >= 200 && result.code < 300) {
+        if (diagState != null) {
+          diagState.inbound_delivered += 1;
+          diagState.last_webhook_ok_at = nowIsoString();
+          persistDiagnostic(false);
+        }
         return { ok: true, error: "" };
       }
       lastError = "webhook failed: " + result.code + " " + result.body;
-      log(lastError);
+      if (diagState != null) {
+        diagState.webhook_error_count += 1;
+      }
+      recordDiagnostic("webhook_error", lastError, true);
     } catch (error) {
       lastError = "webhook exception: " + error;
-      log(lastError);
+      if (diagState != null) {
+        diagState.webhook_error_count += 1;
+      }
+      recordDiagnostic("webhook_exception", lastError, true);
     }
     if (attempt + 1 < GATEWAY_CONFIG.webhookRetryCount) {
       sleepMs(GATEWAY_CONFIG.webhookRetryBaseDelayMs * (attempt + 1));
@@ -247,6 +397,9 @@ function deliverInboundPayload(payload) {
 
 function flushPendingEvents() {
   var events = loadPendingEvents();
+  if (diagState != null) {
+    diagState.pending_loaded_count = events.length;
+  }
   if (events.length === 0) {
     return;
   }
@@ -273,6 +426,48 @@ function flushPendingEvents() {
     }
   }
   savePendingEvents(remaining);
+  if (diagState != null) {
+    diagState.pending_flush_count += 1;
+    diagState.pending_after_flush_count = remaining.length;
+    persistDiagnostic(false);
+  }
+}
+
+function processInboundPayload(payload) {
+  var result = deliverInboundPayload(payload);
+  if (!result.ok) {
+    if (diagState != null) {
+      diagState.inbound_spooled += 1;
+    }
+    upsertPendingEvent(payload, result.error);
+  }
+}
+
+function processQueuedInboundPayload(payloadText) {
+  var payload = JSON.parse(String(payloadText));
+  processInboundPayload(payload);
+}
+
+function enqueueInboundPayload(payload) {
+  var payloadText = gson.toJson(payload);
+  var accepted = inboundQueue.offer(payloadText);
+  if (diagState != null) {
+    diagState.inbound_received += 1;
+    diagState.last_inbound_at = nowIsoString();
+    diagState.queue_size = inboundQueue.size();
+    if (accepted) {
+      diagState.inbound_enqueued += 1;
+    } else {
+      diagState.inbound_queue_full += 1;
+    }
+  }
+  if (!accepted) {
+    recordDiagnostic("inbound_queue_full", "logId=" + String(payload.logId || ""), true);
+    upsertPendingEvent(payload, "inbound queue full");
+  } else {
+    persistDiagnostic(false);
+  }
+  return accepted;
 }
 
 function startPendingFlushWorker() {
@@ -288,23 +483,35 @@ function startPendingFlushWorker() {
   var workerToken = pendingFlushWorkerToken;
   pendingFlushThread = new java.lang.Thread(new java.lang.Runnable({
     run: function() {
-      log("pending flush worker started");
+      recordDiagnostic("worker_started", "gateway worker started", false);
+      var nextFlushAt = nowMillis();
       while (workerToken === pendingFlushWorkerToken) {
         try {
-          flushPendingEvents();
+          var currentMs = nowMillis();
+          if (currentMs >= nextFlushAt) {
+            flushPendingEvents();
+            nextFlushAt = nowMillis() + Number(GATEWAY_CONFIG.pendingFlushIntervalMs || 60000);
+          }
+          var payloadText = inboundQueue.poll(1000, java.util.concurrent.TimeUnit.MILLISECONDS);
+          if (payloadText != null) {
+            processQueuedInboundPayload(payloadText);
+          }
+          persistDiagnostic(false);
         } catch (error) {
-          log("pending flush worker error: " + error);
-        }
-        var sleepFor = Number(GATEWAY_CONFIG.pendingFlushIntervalMs || 30000);
-        while (workerToken === pendingFlushWorkerToken && sleepFor > 0) {
-          var step = Math.min(sleepFor, 1000);
-          sleepMs(step);
-          sleepFor -= step;
+          if (diagState != null) {
+            diagState.worker_error_count += 1;
+          }
+          recordDiagnostic("worker_error", String(error), true);
+          sleepMs(1000);
         }
       }
-      log("pending flush worker stopped");
+      recordDiagnostic("worker_stopped", "gateway worker stopped", false);
+      persistDiagnostic(true);
     }
   }));
+  try {
+    pendingFlushThread.setName("bot_gateway_worker");
+  } catch (ignore2) {}
   pendingFlushThread.start();
 }
 
@@ -314,6 +521,8 @@ function stopPendingFlushWorker() {
   }
   pendingFlushWorkerToken += 1;
   pendingFlushThread = null;
+  recordDiagnostic("worker_stop_requested", "gateway worker stop requested", false);
+  persistDiagnostic(true);
 }
 
 function sendAdminReport(text) {
@@ -342,13 +551,66 @@ function sendDeliveryAck(messageId, roomName, packageName, status, errorCode, er
       "X-Bot-Secret": GATEWAY_CONFIG.botSecret
     });
     if (result.code >= 200 && result.code < 300) {
+      if (diagState != null) {
+        diagState.ack_ok_count += 1;
+        diagState.last_ack_ok_at = nowIsoString();
+        persistDiagnostic(false);
+      }
       return true;
     }
-    log("delivery ack failed for message_id=" + payload.message_id + ": " + result.code + " " + result.body);
+    if (diagState != null) {
+      diagState.ack_error_count += 1;
+    }
+    recordDiagnostic("delivery_ack_error", "message_id=" + payload.message_id + ": " + result.code + " " + result.body, true);
   } catch (error) {
-    log("delivery ack exception for message_id=" + payload.message_id + ": " + error);
+    if (diagState != null) {
+      diagState.ack_error_count += 1;
+    }
+    recordDiagnostic("delivery_ack_exception", "message_id=" + payload.message_id + ": " + error, true);
   }
   return false;
+}
+
+function buildDiagnosticReport() {
+  refreshDiagnosticSnapshot();
+  var pendingCount = countPendingEvents();
+  var lines = [
+    "[gateway_diag]",
+    "ready=" + String(gatewayReady === true),
+    "started_at=" + String(diagState.started_at || ""),
+    "uptime_ms=" + String(diagState.uptime_ms || 0),
+    "queue_size=" + String(diagState.queue_size || 0),
+    "pending_count=" + String(pendingCount),
+    "inbound_received=" + String(diagState.inbound_received || 0),
+    "inbound_enqueued=" + String(diagState.inbound_enqueued || 0),
+    "inbound_delivered=" + String(diagState.inbound_delivered || 0),
+    "inbound_spooled=" + String(diagState.inbound_spooled || 0),
+    "webhook_error_count=" + String(diagState.webhook_error_count || 0),
+    "ack_error_count=" + String(diagState.ack_error_count || 0),
+    "worker_error_count=" + String(diagState.worker_error_count || 0),
+    "last_webhook_ok_at=" + String(diagState.last_webhook_ok_at || ""),
+    "last_ack_ok_at=" + String(diagState.last_ack_ok_at || ""),
+    "last_error_type=" + String(diagState.last_error_type || ""),
+    "last_error_at=" + String(diagState.last_error_at || ""),
+    "last_error=" + truncateText(diagState.last_error || "", 300)
+  ];
+  return lines.join("\n");
+}
+
+function handleLocalDiagnosticCommand(message) {
+  if (message == null) {
+    return false;
+  }
+  if (String(message.room || "") !== String(GATEWAY_CONFIG.adminRoomName || "")) {
+    return false;
+  }
+  var content = String(message.content || "").replace(/^\s+|\s+$/g, "");
+  if (content !== "@게이트웨이진단" && content !== "@gateway_diag") {
+    return false;
+  }
+  persistDiagnostic(true);
+  sendAdminReport(buildDiagnosticReport());
+  return true;
 }
 
 function isControlMessage(message) {
@@ -459,7 +721,6 @@ function forwardInbound(message) {
     log("gateway disabled: inbound forwarding skipped");
     return;
   }
-  flushPendingEvents();
   var payload = {
     room: String(message.room || ""),
     content: String(message.content || ""),
@@ -472,10 +733,7 @@ function forwardInbound(message) {
     client_received_at: nowIsoString()
   };
 
-  var result = deliverInboundPayload(payload);
-  if (!result.ok) {
-    upsertPendingEvent(payload, result.error);
-  }
+  enqueueInboundPayload(payload);
 }
 
 try {
@@ -485,6 +743,9 @@ try {
 
 bot.on(Event.MESSAGE, function(message) {
   if (handleControlMessage(message)) {
+    return;
+  }
+  if (handleLocalDiagnosticCommand(message)) {
     return;
   }
   forwardInbound(message);
@@ -497,9 +758,10 @@ bot.on(Event.START_COMPILE, function() {
 try {
   validateGatewayConfig();
   gatewayReady = true;
-  flushPendingEvents();
+  recordDiagnostic("gateway_started", "gateway startup completed", false);
   startPendingFlushWorker();
+  persistDiagnostic(true);
 } catch (error) {
   gatewayReady = false;
-  log("gateway startup blocked: " + error);
+  recordDiagnostic("gateway_startup_blocked", String(error), true);
 }
