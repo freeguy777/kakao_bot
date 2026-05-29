@@ -30,6 +30,7 @@ from app.services.family_brief_service import FamilyBriefService
 from app.services.clinicaltrials_service import ClinicalTrialsService
 from app.services.hanall_research_service import HanallResearchService
 from app.services.hanall_prefetch_service import HanallPrefetchService
+from app.services.kind_krx_service import KindKrxService
 from app.services.options_sentiment_service import OptionsSentimentService
 from app.services.opendart_service import OpenDartService
 from app.services.sec_edgar_service import SecEdgarService
@@ -94,10 +95,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin_notifier=admin_notifier,
     )
     opendart_service = OpenDartService(settings)
+    kind_krx_service = KindKrxService(settings)
     clinicaltrials_service = ClinicalTrialsService(settings)
     sec_edgar_service = SecEdgarService(settings)
     hanall_prefetch_service = HanallPrefetchService(
         opendart_service=opendart_service,
+        kind_krx_service=kind_krx_service,
         clinicaltrials_service=clinicaltrials_service,
         sec_edgar_service=sec_edgar_service,
     )

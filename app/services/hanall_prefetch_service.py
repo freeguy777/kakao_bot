@@ -11,16 +11,19 @@ class HanallPrefetchService:
         self,
         *,
         opendart_service: object | None = None,
+        kind_krx_service: object | None = None,
         clinicaltrials_service: object | None = None,
         sec_edgar_service: object | None = None,
     ) -> None:
         self._opendart_service = opendart_service
+        self._kind_krx_service = kind_krx_service
         self._clinicaltrials_service = clinicaltrials_service
         self._sec_edgar_service = sec_edgar_service
 
     async def collect(self, *, window_start: datetime, window_end: datetime) -> HanallApiBundle:
         tasks = [
             self._collect_from_service(self._opendart_service, window_start=window_start, window_end=window_end),
+            self._collect_from_service(self._kind_krx_service, window_start=window_start, window_end=window_end),
             self._collect_from_service(self._clinicaltrials_service, window_start=window_start, window_end=window_end),
             self._collect_from_service(self._sec_edgar_service, window_start=window_start, window_end=window_end),
         ]
@@ -48,6 +51,8 @@ class HanallPrefetchService:
             source_name = type(service).__name__
             if source_name == "OpenDartService":
                 source_name = "OpenDART"
+            elif source_name == "KindKrxService":
+                source_name = "KIND/KRX"
             elif source_name == "ClinicalTrialsService":
                 source_name = "ClinicalTrials.gov API"
             elif source_name == "SecEdgarService":

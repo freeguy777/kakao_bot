@@ -245,6 +245,94 @@ def test_validate_rendered_output_requires_soft_direct_fact_in_admin_and_public(
     assert "structured direct fact 누락(public): NCT06727604" in validation.issues
 
 
+def test_validate_rendered_output_requires_kind_krx_fact_in_admin_and_public(test_settings, tmp_path: Path) -> None:
+    bundle = HanallApiBundle(
+        facts=[
+            HanallStructuredFact(
+                source_name="KIND/KRX",
+                source_type="filing",
+                entity="HanAll Biopharma",
+                category="SEC/DART/KRX",
+                title="[투자주의]투자경고종목 지정예고",
+                fact_text=(
+                    "[투자주의]투자경고종목 지정예고 KIND/KRX 공시가 2026-05-27 20:00 KST에 확인됨, "
+                    "지정/예고일: 2026년 05월 28일"
+                ),
+                source_id="20260527000934",
+                source_url="https://kind.krx.co.kr/external/2026/05/27/000934/20260527002162/68807.htm",
+                observed_at=datetime(2026, 5, 27, 20, 0),
+                validation_mode="hard",
+            )
+        ],
+        source_statuses=[
+            HanallSourceStatus(
+                source_name="KIND/KRX",
+                status="ok",
+                checked_at=datetime(2026, 5, 28, 7, 42),
+                detail="KIND/KRX 1건 감지",
+                hard_requirement=True,
+            )
+        ],
+    )
+    service = _build_service(
+        test_settings,
+        tmp_path,
+        bundle=bundle,
+        contents=[f"<public_brief>{INVALID_PUBLIC}</public_brief>\n<admin_report>{INVALID_ADMIN}</admin_report>"],
+    )
+
+    validation = service._validate_rendered_output(
+        HanallRenderedOutput(public_text=INVALID_PUBLIC, admin_text=INVALID_ADMIN),
+        bundle,
+    )
+
+    assert validation.is_valid is False
+    assert "structured direct fact 누락(admin): 20260527000934" in validation.issues
+    assert "structured direct fact 누락(public): 20260527000934" in validation.issues
+
+
+def test_validate_rendered_output_flags_kind_krx_claim_when_source_was_not_checked(test_settings, tmp_path: Path) -> None:
+    public_text = """📅 2026-05-28 07:42 KST 기준
+
+1. 🏢 한올/IMVT 직접 업데이트 : 0건
+- KIND/KRX 시장경보 신규 없음 확인.
+
+2. 🧬 경쟁사/파이프라인 체크 : 0건
+- 24시간 내 경쟁사 공식 업데이트 없음
+
+3. 🔎 이번에 확인한 범위 : 2개 범주
+- OpenDART, SEC EDGAR
+
+4. 👀 참고할 포인트 : 1개
+- 공식 소스 점검 지속"""
+    admin_text = INVALID_ADMIN.replace("OpenDART | 확인했으나 신규 없음", "KIND/KRX | 확인했으나 신규 없음")
+    bundle = HanallApiBundle(
+        source_statuses=[
+            HanallSourceStatus(
+                source_name="OpenDART",
+                status="ok",
+                checked_at=datetime(2026, 5, 28, 7, 42),
+                detail="공시 없음",
+                hard_requirement=True,
+            )
+        ]
+    )
+    service = _build_service(
+        test_settings,
+        tmp_path,
+        bundle=bundle,
+        contents=[f"<public_brief>{public_text}</public_brief>\n<admin_report>{admin_text}</admin_report>"],
+    )
+
+    validation = service._validate_rendered_output(
+        HanallRenderedOutput(public_text=public_text, admin_text=admin_text),
+        bundle,
+    )
+
+    assert validation.is_valid is False
+    assert any("KIND/KRX source" in issue for issue in validation.issues)
+
+
 async def test_hanall_collect_repairs_missing_hard_fact_with_prefetch_bundle(test_settings, tmp_path: Path) -> None:
     bundle = HanallApiBundle(
         facts=[

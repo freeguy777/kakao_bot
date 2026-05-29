@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     opendart_timeout_seconds: int = 15
     hanall_dart_stock_code: str = "009420"
     hanall_dart_corp_code: str | None = None
+    kind_krx_base_url: str = "https://kind.krx.co.kr"
+    kind_krx_timeout_seconds: int = 15
     clinicaltrials_api_base_url: str = "https://clinicaltrials.gov/api/v2"
     clinicaltrials_timeout_seconds: int = 15
     sec_submissions_base_url: str = "https://data.sec.gov/submissions"

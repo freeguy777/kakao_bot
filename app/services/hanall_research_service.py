@@ -101,6 +101,19 @@ class HanallResearchService:
         "24시간 내 신규 사실 미확인",
         "직전 공식 업데이트",
     )
+    KIND_KRX_SOURCE_NAME = "KIND/KRX"
+    KIND_KRX_SOURCE_TOKENS = ("kind", "시장경보", "투자주의", "투자경고", "투자위험")
+    KIND_KRX_COMPLETION_TOKENS = (
+        "확인 완료",
+        "확인했으나 신규 없음",
+        "신규 없음",
+        "공시 없음",
+        "시장경보 없음",
+        "시장경보 신규 없음",
+        "hard check",
+        "하드체크",
+        "누락 가능성 낮",
+    )
     SECTION_HEADING_MARKUP_PATTERN = re.compile(r"^#+\s*")
     SECTION_EMPHASIS_PATTERN = re.compile(r"^\*{1,2}(?P<body>.+?)\*{1,2}$")
     DASH_VARIANTS_PATTERN = re.compile(r"[\u2010-\u2015\u2212-]")
@@ -969,6 +982,12 @@ class HanallResearchService:
         if prefetch_bundle.has_unavailable_hard_source() and self._claims_no_direct_updates(public_text, admin_text):
             issues.append("direct source가 unavailable인데 direct company 업데이트를 '신규 없음'으로 단정했다")
 
+        kind_krx_status = self._source_status(prefetch_bundle, self.KIND_KRX_SOURCE_NAME)
+        if prefetch_bundle.source_statuses and self._claims_kind_krx_checked(public_text, admin_text) and (
+            kind_krx_status is None or kind_krx_status.status != "ok"
+        ):
+            issues.append("KIND/KRX source가 unavailable 또는 unchecked인데 KRX/KIND 확인 완료나 신규 없음으로 단정했다")
+
         direct_public_section = self._extract_public_direct_section(public_text)
         for fact in prefetch_bundle.direct_validation_facts():
             fact_id = fact.source_id or fact.title
@@ -1010,6 +1029,19 @@ class HanallResearchService:
     def _claims_no_direct_updates(self, public_text: str, admin_text: str) -> bool:
         normalized_text = self._normalize_validation_text(f"{public_text}\n{admin_text}")
         return any(pattern in normalized_text for pattern in self.DIRECT_NO_UPDATE_PATTERNS)
+
+    def _claims_kind_krx_checked(self, public_text: str, admin_text: str) -> bool:
+        normalized_text = self._normalize_validation_text(f"{public_text}\n{admin_text}")
+        has_source_reference = any(token in normalized_text for token in self.KIND_KRX_SOURCE_TOKENS)
+        has_completion_claim = any(token in normalized_text for token in self.KIND_KRX_COMPLETION_TOKENS)
+        return has_source_reference and has_completion_claim
+
+    @staticmethod
+    def _source_status(prefetch_bundle: HanallApiBundle, source_name: str) -> object | None:
+        for status in prefetch_bundle.source_statuses:
+            if status.source_name == source_name:
+                return status
+        return None
 
     def _fact_present(self, admin_text: str, tokens: list[str]) -> bool:
         normalized_admin = self._normalize_validation_text(admin_text)

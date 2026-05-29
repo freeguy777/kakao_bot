@@ -324,7 +324,9 @@ class HanallSourceStatus(BaseModel):
 
 
 class HanallApiBundle(BaseModel):
-    DIRECT_VALIDATION_SOURCES: ClassVar[frozenset[str]] = frozenset({"OpenDART", "ClinicalTrials.gov API", "SEC EDGAR API"})
+    DIRECT_VALIDATION_SOURCES: ClassVar[frozenset[str]] = frozenset(
+        {"OpenDART", "KIND/KRX", "ClinicalTrials.gov API", "SEC EDGAR API"}
+    )
     facts: list[HanallStructuredFact] = Field(default_factory=list)
     source_statuses: list[HanallSourceStatus] = Field(default_factory=list)
 
