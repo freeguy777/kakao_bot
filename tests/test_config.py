@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.config import Settings
@@ -11,7 +10,7 @@ from app.errors import ConfigurationError
 from app.main import create_app
 
 
-def test_app_startup_rejects_placeholder_secrets(tmp_path: Path) -> None:
+async def test_app_startup_rejects_placeholder_secrets(tmp_path: Path) -> None:
     db_dir = tmp_path / "data"
     db_dir.mkdir()
     settings = Settings(
@@ -25,7 +24,7 @@ def test_app_startup_rejects_placeholder_secrets(tmp_path: Path) -> None:
     app = create_app(settings)
 
     with pytest.raises(ConfigurationError, match="must be replaced before startup"):
-        with TestClient(app):
+        async with app.router.lifespan_context(app):
             pass
 
 
@@ -99,16 +98,15 @@ def test_load_prompts_requires_hanall_runtime_wrapper(tmp_path: Path) -> None:
         settings.load_prompts()
 
 
-def test_runtime_validation_requires_messengerbot_bot_name(tmp_path: Path) -> None:
+def test_runtime_validation_allows_legacy_socket_placeholders(tmp_path: Path) -> None:
     settings = Settings(
         inbound_bot_secret="test-secret",
-        socket_shared_token="test-token",
+        socket_shared_token="change-me-too",
         messengerbot_bot_name="change-me-bot",
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
     )
 
-    with pytest.raises(ConfigurationError, match="MESSENGERBOT_BOT_NAME must be replaced before startup"):
-        settings.validate_runtime_secrets()
+    settings.validate_runtime_secrets()
 
 
 def test_control_channel_defaults_are_loaded(tmp_path: Path) -> None:

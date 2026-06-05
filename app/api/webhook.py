@@ -6,7 +6,14 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
-from app.schemas import DeliveryAckPayload, DeliveryResult, InboundWebhookPayload, NormalizedInboundEvent, PollingAckRequest
+from app.schemas import (
+    DeliveryAckPayload,
+    DeliveryResult,
+    InboundWebhookPayload,
+    NormalizedInboundEvent,
+    PollingAckRequest,
+    PollingPullRequest,
+)
 
 router = APIRouter(prefix="/kakao", tags=["kakao"])
 logger = logging.getLogger(__name__)
@@ -49,24 +56,47 @@ async def kakao_webhook(
 
 
 @router.post("/polling/pull")
-async def polling_pull() -> dict[str, object]:
-    # Compatibility shim for older phone-side polling clients. This app's active
-    # delivery path is socket push, so we explicitly return an empty outbox.
+async def polling_pull(
+    payload: PollingPullRequest,
+    request: Request,
+    x_bot_secret: str | None = Header(None),
+) -> dict[str, object]:
+    _require_bot_secret(request, x_bot_secret)
+    items = request.app.state.delivery_repository.pull_pending_messages(limit=payload.limit, stale_after_seconds=300)
+    serialized_items = [item.model_dump(mode="json") for item in items]
+    snapshot = request.app.state.delivery_repository.get_queue_snapshot()
     return {
         "ok": True,
         "trace_id": str(uuid4()),
         "action": "polling.outbox.pull",
+        "items": serialized_items,
         "messages": [],
         "error": None,
         "meta": {
-            "count": 0,
-            "items": [],
+            "count": len(serialized_items),
+            "items": serialized_items,
+            "pending_count": snapshot.pending_count,
+            "inflight_count": snapshot.inflight_count,
         },
     }
 
 
 @router.post("/polling/ack")
-async def polling_ack(payload: PollingAckRequest) -> dict[str, object]:
+async def polling_ack(
+    payload: PollingAckRequest,
+    request: Request,
+    x_bot_secret: str | None = Header(None),
+) -> dict[str, object]:
+    _require_bot_secret(request, x_bot_secret)
+    updated = request.app.state.delivery_repository.acknowledge_polled_message(
+        message_id=payload.message_id,
+        success=payload.success,
+        error_code=payload.error_code,
+        error_message=payload.error_message,
+    )
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
+    snapshot = request.app.state.delivery_repository.get_queue_snapshot()
     return {
         "ok": True,
         "trace_id": str(uuid4()),
@@ -74,10 +104,18 @@ async def polling_ack(payload: PollingAckRequest) -> dict[str, object]:
         "messages": ["처리 완료"],
         "error": None,
         "meta": {
-            "updated_count": len(payload.message_ids),
+            "updated_count": 1,
             "success": payload.success,
+            "pending_count": snapshot.pending_count,
+            "inflight_count": snapshot.inflight_count,
         },
     }
+
+
+def _require_bot_secret(request: Request, x_bot_secret: str | None) -> None:
+    settings = request.app.state.settings
+    if x_bot_secret != settings.inbound_bot_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bot secret")
 
 
 @router.post("/delivery/ack")

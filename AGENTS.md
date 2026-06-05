@@ -7,7 +7,7 @@ This repository contains a Kakao bot system with:
 - single FastAPI app
 - SQLite
 - APScheduler
-- socket push delivery
+- polling outbox delivery
 
 ## Working rules
 - For large changes, start in Ask mode and produce an implementation plan before writing code.

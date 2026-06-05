@@ -6,17 +6,20 @@
 
   Notes:
   - Inbound path remains: Kakao event -> bot_gateway -> FastAPI webhook.
-  - Outbound control messages arrive through MessengerBot's built-in socket debugRoom transport.
-  - This script must not open its own socket port.
+  - Outbound path is polling: bot_gateway pulls FastAPI outbox messages and ACKs delivery results.
+  - Built-in socket debugRoom control handling is disabled by default.
 */
 
 var GATEWAY_CONFIG = {
   webhookUrl: "http://192.168.0.10:8000/kakao/webhook",
+  pollingPullUrl: "http://192.168.0.10:8000/kakao/polling/pull",
+  pollingAckUrl: "http://192.168.0.10:8000/kakao/polling/ack",
   deliveryAckUrl: "http://192.168.0.10:8000/kakao/delivery/ack",
   botSecret: "8d3f6c1b9e4a7f2d5c8b1e6a3f9d4c7e",
   socketToken: "2f7a9d4c6e1b8f3d5a0c7e9b4d1f6a2c",
   controlAuthorName: "__FASTAPI__",
   controlRoomName: "__MB_SOCKET_CONTROL__",
+  enableSocketControl: false,
   adminRoomName: "김휘태",
   packageName: "com.kakao.talk",
   dedupeFile: "gateway_message_ids.json",
@@ -29,6 +32,8 @@ var GATEWAY_CONFIG = {
   diagnosticErrorPersistMinIntervalMs: 10000,
   enableConsoleLog: false,
   inboundQueueLimit: 100,
+  pollingIntervalMs: 2000,
+  pollingBatchLimit: 5,
   webhookRetryCount: 1,
   webhookRetryBaseDelayMs: 3000,
   pendingFlushBatchSize: 3,
@@ -40,6 +45,8 @@ var GATEWAY_CONFIG = {
 var bot = BotManager.getCurrentBot();
 var pendingFlushThread = null;
 var pendingFlushWorkerToken = 0;
+var pollingThread = null;
+var pollingWorkerToken = 0;
 var inboundQueue = new java.util.concurrent.LinkedBlockingQueue(GATEWAY_CONFIG.inboundQueueLimit);
 var gson = new com.google.gson.Gson();
 var gatewayReady = false;
@@ -57,20 +64,28 @@ function validateGatewayConfig() {
   if (!GATEWAY_CONFIG.botSecret || GATEWAY_CONFIG.botSecret === "change-me") {
     throw new Error("GATEWAY_CONFIG.botSecret must be replaced before startup");
   }
-  if (!GATEWAY_CONFIG.socketToken || GATEWAY_CONFIG.socketToken === "change-me-too") {
-    throw new Error("GATEWAY_CONFIG.socketToken must be replaced before startup");
-  }
   if (!GATEWAY_CONFIG.adminRoomName || GATEWAY_CONFIG.adminRoomName === "change-me-admin-room") {
     throw new Error("GATEWAY_CONFIG.adminRoomName must be replaced before startup");
   }
-  if (!GATEWAY_CONFIG.deliveryAckUrl) {
-    throw new Error("GATEWAY_CONFIG.deliveryAckUrl must not be empty");
+  if (!GATEWAY_CONFIG.pollingPullUrl) {
+    throw new Error("GATEWAY_CONFIG.pollingPullUrl must not be empty");
   }
-  if (!GATEWAY_CONFIG.controlAuthorName) {
-    throw new Error("GATEWAY_CONFIG.controlAuthorName must not be empty");
+  if (!GATEWAY_CONFIG.pollingAckUrl) {
+    throw new Error("GATEWAY_CONFIG.pollingAckUrl must not be empty");
   }
-  if (!GATEWAY_CONFIG.controlRoomName) {
-    throw new Error("GATEWAY_CONFIG.controlRoomName must not be empty");
+  if (GATEWAY_CONFIG.enableSocketControl === true) {
+    if (!GATEWAY_CONFIG.socketToken || GATEWAY_CONFIG.socketToken === "change-me-too") {
+      throw new Error("GATEWAY_CONFIG.socketToken must be replaced before startup");
+    }
+    if (!GATEWAY_CONFIG.deliveryAckUrl) {
+      throw new Error("GATEWAY_CONFIG.deliveryAckUrl must not be empty");
+    }
+    if (!GATEWAY_CONFIG.controlAuthorName) {
+      throw new Error("GATEWAY_CONFIG.controlAuthorName must not be empty");
+    }
+    if (!GATEWAY_CONFIG.controlRoomName) {
+      throw new Error("GATEWAY_CONFIG.controlRoomName must not be empty");
+    }
   }
 }
 
@@ -112,6 +127,14 @@ function initDiagnosticState() {
     webhook_error_count: 0,
     ack_ok_count: 0,
     ack_error_count: 0,
+    polling_running: false,
+    polling_pull_count: 0,
+    polling_pull_error_count: 0,
+    polling_message_count: 0,
+    polling_ack_ok_count: 0,
+    polling_ack_error_count: 0,
+    polling_pending_count: null,
+    polling_inflight_count: null,
     pending_flush_count: 0,
     pending_flush_error_count: 0,
     worker_error_count: 0,
@@ -121,6 +144,8 @@ function initDiagnosticState() {
     last_event_at: null,
     last_inbound_at: null,
     last_webhook_ok_at: null,
+    last_pull_at: null,
+    last_ack_at: null,
     last_ack_ok_at: null,
     last_error_at: null,
     last_error_type: null,
@@ -135,6 +160,7 @@ function refreshDiagnosticSnapshot() {
   }
   diagState.uptime_ms = nowMillis() - Number(diagState.started_ms || nowMillis());
   diagState.gateway_ready = gatewayReady === true;
+  diagState.polling_running = pollingThread != null;
   try {
     diagState.queue_size = inboundQueue.size();
   } catch (ignore) {}
@@ -361,6 +387,15 @@ function postJson(urlText, payload, headers) {
   return { code: code, body: String(responseBuilder.toString()) };
 }
 
+function parseJsonObject(text, emptyValue) {
+  try {
+    var parsed = JSON.parse(String(text || "{}"));
+    return parsed == null ? emptyValue : parsed;
+  } catch (error) {
+    return emptyValue;
+  }
+}
+
 function deliverInboundPayload(payload) {
   var lastError = "";
   for (var attempt = 0; attempt < GATEWAY_CONFIG.webhookRetryCount; attempt++) {
@@ -571,6 +606,170 @@ function sendDeliveryAck(messageId, roomName, packageName, status, errorCode, er
   return false;
 }
 
+function updatePollingCounts(meta) {
+  if (diagState == null || meta == null) {
+    return;
+  }
+  if (meta.pending_count != null) {
+    diagState.polling_pending_count = Number(meta.pending_count);
+  }
+  if (meta.inflight_count != null) {
+    diagState.polling_inflight_count = Number(meta.inflight_count);
+  }
+}
+
+function sendPollingAck(messageId, success, errorCode, errorMessage) {
+  var payload = {
+    message_id: String(messageId || ""),
+    success: success === true,
+    error_code: errorCode == null ? null : String(errorCode),
+    error_message: errorMessage == null ? null : String(errorMessage)
+  };
+  try {
+    var result = postJson(GATEWAY_CONFIG.pollingAckUrl, payload, {
+      "X-Bot-Secret": GATEWAY_CONFIG.botSecret
+    });
+    if (result.code >= 200 && result.code < 300) {
+      var response = parseJsonObject(result.body, {});
+      if (diagState != null) {
+        diagState.polling_ack_ok_count += 1;
+        diagState.last_ack_at = nowIsoString();
+        updatePollingCounts(response.meta);
+        persistDiagnostic(false);
+      }
+      return true;
+    }
+    if (diagState != null) {
+      diagState.polling_ack_error_count += 1;
+    }
+    recordDiagnostic("polling_ack_error", "message_id=" + payload.message_id + ": " + result.code + " " + result.body, true);
+  } catch (error) {
+    if (diagState != null) {
+      diagState.polling_ack_error_count += 1;
+    }
+    recordDiagnostic("polling_ack_exception", "message_id=" + payload.message_id + ": " + error, true);
+  }
+  return false;
+}
+
+function deliverPolledItem(item) {
+  var messageId = String(item.message_id || "");
+  var roomName = String(item.target_room || "");
+  var text = String(item.text || "");
+  var packageName = String(item.package_name || GATEWAY_CONFIG.packageName);
+
+  if (!messageId) {
+    recordDiagnostic("polling_invalid_item", "missing message_id", true);
+    return;
+  }
+  if (!roomName || !text) {
+    sendPollingAck(messageId, false, "gateway_invalid_payload", "invalid target_room or text");
+    return;
+  }
+  if (hasProcessedMessage(messageId)) {
+    sendPollingAck(messageId, true, null, null);
+    return;
+  }
+
+  try {
+    if (!bot.canReply(roomName, packageName)) {
+      sendPollingAck(messageId, false, "gateway_cannot_reply", "bot.canReply returned false");
+      return;
+    }
+    var success = bot.send(roomName, text, packageName);
+    if (!success) {
+      sendPollingAck(messageId, false, "gateway_send_false", "bot.send returned false");
+      return;
+    }
+    rememberMessage(messageId);
+    sendPollingAck(messageId, true, null, null);
+  } catch (error) {
+    sendPollingAck(messageId, false, "gateway_exception", String(error));
+  }
+}
+
+function pullPollingBatch() {
+  var result = postJson(GATEWAY_CONFIG.pollingPullUrl, {
+    limit: Number(GATEWAY_CONFIG.pollingBatchLimit || 5)
+  }, {
+    "X-Bot-Secret": GATEWAY_CONFIG.botSecret
+  });
+  if (result.code < 200 || result.code >= 300) {
+    if (diagState != null) {
+      diagState.polling_pull_error_count += 1;
+    }
+    recordDiagnostic("polling_pull_error", result.code + " " + result.body, true);
+    return;
+  }
+
+  var response = parseJsonObject(result.body, {});
+  var items = response.items;
+  if ((items == null || typeof items.length !== "number") && response.meta != null) {
+    items = response.meta.items;
+  }
+  if (items == null || typeof items.length !== "number") {
+    items = [];
+  }
+
+  if (diagState != null) {
+    diagState.polling_pull_count += 1;
+    diagState.polling_message_count += Number(items.length || 0);
+    diagState.last_pull_at = nowIsoString();
+    updatePollingCounts(response.meta);
+    persistDiagnostic(false);
+  }
+  for (var i = 0; i < items.length; i++) {
+    deliverPolledItem(items[i]);
+  }
+}
+
+function startPollingWorker() {
+  if (!gatewayReady) {
+    log("gateway disabled: polling worker not started");
+    return;
+  }
+  if (pollingThread != null) {
+    return;
+  }
+
+  pollingWorkerToken += 1;
+  var workerToken = pollingWorkerToken;
+  pollingThread = new java.lang.Thread(new java.lang.Runnable({
+    run: function() {
+      recordDiagnostic("polling_worker_started", "polling worker started", false);
+      while (workerToken === pollingWorkerToken) {
+        try {
+          pullPollingBatch();
+          persistDiagnostic(false);
+        } catch (error) {
+          if (diagState != null) {
+            diagState.worker_error_count += 1;
+            diagState.polling_pull_error_count += 1;
+          }
+          recordDiagnostic("polling_worker_error", String(error), true);
+        }
+        sleepMs(Number(GATEWAY_CONFIG.pollingIntervalMs || 2000));
+      }
+      recordDiagnostic("polling_worker_stopped", "polling worker stopped", false);
+      persistDiagnostic(true);
+    }
+  }));
+  try {
+    pollingThread.setName("bot_gateway_polling_worker");
+  } catch (ignore2) {}
+  pollingThread.start();
+}
+
+function stopPollingWorker() {
+  if (pollingThread == null) {
+    return;
+  }
+  pollingWorkerToken += 1;
+  pollingThread = null;
+  recordDiagnostic("polling_worker_stop_requested", "polling worker stop requested", false);
+  persistDiagnostic(true);
+}
+
 function buildDiagnosticReport() {
   refreshDiagnosticSnapshot();
   var pendingCount = countPendingEvents();
@@ -580,16 +779,22 @@ function buildDiagnosticReport() {
     "started_at=" + String(diagState.started_at || ""),
     "uptime_ms=" + String(diagState.uptime_ms || 0),
     "queue_size=" + String(diagState.queue_size || 0),
-    "pending_count=" + String(pendingCount),
+    "inbound_pending_count=" + String(pendingCount),
+    "polling_running=" + String(diagState.polling_running === true),
+    "polling_pending_count=" + String(diagState.polling_pending_count),
+    "polling_inflight_count=" + String(diagState.polling_inflight_count),
+    "polling_pull_count=" + String(diagState.polling_pull_count || 0),
+    "polling_ack_ok_count=" + String(diagState.polling_ack_ok_count || 0),
+    "polling_ack_error_count=" + String(diagState.polling_ack_error_count || 0),
     "inbound_received=" + String(diagState.inbound_received || 0),
     "inbound_enqueued=" + String(diagState.inbound_enqueued || 0),
     "inbound_delivered=" + String(diagState.inbound_delivered || 0),
     "inbound_spooled=" + String(diagState.inbound_spooled || 0),
     "webhook_error_count=" + String(diagState.webhook_error_count || 0),
-    "ack_error_count=" + String(diagState.ack_error_count || 0),
     "worker_error_count=" + String(diagState.worker_error_count || 0),
     "last_webhook_ok_at=" + String(diagState.last_webhook_ok_at || ""),
-    "last_ack_ok_at=" + String(diagState.last_ack_ok_at || ""),
+    "last_pull_at=" + String(diagState.last_pull_at || ""),
+    "last_ack_at=" + String(diagState.last_ack_at || ""),
     "last_error_type=" + String(diagState.last_error_type || ""),
     "last_error_at=" + String(diagState.last_error_at || ""),
     "last_error=" + truncateText(diagState.last_error || "", 300)
@@ -742,7 +947,10 @@ try {
 } catch (ignore) {}
 
 bot.on(Event.MESSAGE, function(message) {
-  if (handleControlMessage(message)) {
+  if (GATEWAY_CONFIG.enableSocketControl === true && handleControlMessage(message)) {
+    return;
+  }
+  if (GATEWAY_CONFIG.enableSocketControl !== true && message != null && message.isDebugRoom === true) {
     return;
   }
   if (handleLocalDiagnosticCommand(message)) {
@@ -753,6 +961,7 @@ bot.on(Event.MESSAGE, function(message) {
 
 bot.on(Event.START_COMPILE, function() {
   stopPendingFlushWorker();
+  stopPollingWorker();
 });
 
 try {
@@ -760,6 +969,7 @@ try {
   gatewayReady = true;
   recordDiagnostic("gateway_started", "gateway startup completed", false);
   startPendingFlushWorker();
+  startPollingWorker();
   persistDiagnostic(true);
 } catch (error) {
   gatewayReady = false;

@@ -57,7 +57,31 @@ def ensure_runtime_schema(engine: Engine) -> None:
                 "WHERE processing_status IS NULL OR processed_at IS NULL"
             )
         )
+        _ensure_outbound_messages_schema(connection, tables)
         _ensure_options_pcr_daily_summary_schema(connection)
+
+
+def _ensure_outbound_messages_schema(connection: Connection, tables: set[str]) -> None:
+    if "outbound_messages" not in tables:
+        return
+    columns = {row[1] for row in connection.execute(text("PRAGMA table_info('outbound_messages')"))}
+    if "inflight_at" not in columns:
+        connection.execute(text("ALTER TABLE outbound_messages ADD COLUMN inflight_at DATETIME"))
+    if "attempt_count" not in columns:
+        connection.execute(text("ALTER TABLE outbound_messages ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"))
+    connection.execute(
+        text(
+            "UPDATE outbound_messages "
+            "SET attempt_count = COALESCE(attempt_count, 0) "
+            "WHERE attempt_count IS NULL"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_messages_status_inflight_created "
+            "ON outbound_messages(status, inflight_at, created_at)"
+        )
+    )
 
 
 def _ensure_options_pcr_daily_summary_schema(connection: Connection) -> None:

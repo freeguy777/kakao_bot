@@ -47,6 +47,8 @@ class OutboundMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    inflight_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
 
     attempts: Mapped[list["DeliveryAttempt"]] = relationship(back_populates="message", cascade="all, delete-orphan")
 

@@ -34,10 +34,25 @@ class NormalizedInboundEvent(BaseModel):
     server_received_at: datetime
 
 
+class PollingPullRequest(BaseModel):
+    limit: int = Field(default=5, ge=1, le=50)
+
+
+class PollingOutboxItem(BaseModel):
+    message_id: str
+    target_room: str
+    package_name: str
+    text: str
+    chunk_index: int
+    total_chunks: int
+    created_at: datetime
+
+
 class PollingAckRequest(BaseModel):
-    message_ids: list[int] = Field(default_factory=list)
-    success: bool = True
-    increment_retry: bool | None = None
+    message_id: str
+    success: bool
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class SocketControlCommand(BaseModel):
@@ -370,5 +385,6 @@ class HanallValidationResult(BaseModel):
 
 class DeliveryQueueSnapshot(BaseModel):
     pending_count: int
+    inflight_count: int = 0
     failed_count: int
     latest_failed_ids: list[str] = Field(default_factory=list)

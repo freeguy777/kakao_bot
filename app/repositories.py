@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -24,6 +24,7 @@ from app.schemas import (
     HanallArtifact,
     NormalizedInboundEvent,
     OptionsPCRDailySummary as OptionsPCRDailySummarySchema,
+    PollingOutboxItem,
 )
 
 
@@ -126,6 +127,7 @@ class DeliveryRepository:
         chunk_index: int,
         total_chunks: int,
         correlation_key: str | None,
+        failure_type: str | None = None,
     ) -> OutboundMessage:
         now = datetime.now(timezone.utc)
         record = OutboundMessage(
@@ -134,11 +136,13 @@ class DeliveryRepository:
             package_name=package_name,
             text=text,
             status=constants.OUTBOUND_STATUS_PENDING,
+            failure_type=failure_type,
             chunk_index=chunk_index,
             total_chunks=total_chunks,
             correlation_key=correlation_key,
             created_at=now,
             updated_at=now,
+            attempt_count=0,
         )
         with session_scope(self._session_factory) as session:
             session.add(record)
@@ -158,6 +162,9 @@ class DeliveryRepository:
             failed_count = session.scalar(
                 select(func.count()).select_from(OutboundMessage).where(OutboundMessage.status == constants.OUTBOUND_STATUS_FAILED)
             )
+            inflight_count = session.scalar(
+                select(func.count()).select_from(OutboundMessage).where(OutboundMessage.status == constants.OUTBOUND_STATUS_INFLIGHT)
+            )
             latest_failed_ids = list(
                 session.scalars(
                     select(OutboundMessage.message_id)
@@ -168,9 +175,137 @@ class DeliveryRepository:
             )
             return DeliveryQueueSnapshot(
                 pending_count=int(pending_count or 0),
+                inflight_count=int(inflight_count or 0),
                 failed_count=int(failed_count or 0),
                 latest_failed_ids=latest_failed_ids,
             )
+
+    def pull_pending_messages(
+        self,
+        *,
+        limit: int,
+        stale_after_seconds: int = 300,
+        expires_after_seconds: int = 600,
+    ) -> list[PollingOutboxItem]:
+        now = datetime.now(timezone.utc)
+        stale_before = now - timedelta(seconds=stale_after_seconds)
+        expires_before = now - timedelta(seconds=expires_after_seconds)
+        max_rows = max(1, min(int(limit), 50))
+        with session_scope(self._session_factory) as session:
+            expired_messages = list(
+                session.scalars(
+                    select(OutboundMessage).where(
+                        or_(
+                            and_(
+                                OutboundMessage.status == constants.OUTBOUND_STATUS_PENDING,
+                                OutboundMessage.created_at <= expires_before,
+                            ),
+                            and_(
+                                OutboundMessage.status == constants.OUTBOUND_STATUS_INFLIGHT,
+                                OutboundMessage.created_at <= expires_before,
+                                or_(OutboundMessage.inflight_at.is_(None), OutboundMessage.inflight_at <= stale_before),
+                            ),
+                        )
+                    )
+                )
+            )
+            for message in expired_messages:
+                self._mark_expired(message, now)
+
+            messages = list(
+                session.scalars(
+                    select(OutboundMessage)
+                    .where(
+                        OutboundMessage.created_at > expires_before,
+                        or_(
+                            OutboundMessage.status == constants.OUTBOUND_STATUS_PENDING,
+                            and_(
+                                OutboundMessage.status == constants.OUTBOUND_STATUS_INFLIGHT,
+                                or_(OutboundMessage.inflight_at.is_(None), OutboundMessage.inflight_at <= stale_before),
+                            ),
+                        )
+                    )
+                    .order_by(OutboundMessage.created_at.asc(), OutboundMessage.id.asc())
+                    .limit(max_rows)
+                )
+            )
+            items: list[PollingOutboxItem] = []
+            for message in messages:
+                message.status = constants.OUTBOUND_STATUS_INFLIGHT
+                message.inflight_at = now
+                message.updated_at = now
+                message.acknowledged_at = None
+                items.append(
+                    PollingOutboxItem(
+                        message_id=message.message_id,
+                        target_room=message.target_room,
+                        package_name=message.package_name,
+                        text=message.text,
+                        chunk_index=message.chunk_index,
+                        total_chunks=message.total_chunks,
+                        created_at=message.created_at,
+                    )
+                )
+            commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
+            return items
+
+    def acknowledge_polled_message(
+        self,
+        *,
+        message_id: str,
+        success: bool,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        with session_scope(self._session_factory) as session:
+            message = session.scalar(select(OutboundMessage).where(OutboundMessage.message_id == message_id))
+            if message is None:
+                return False
+            if success and message.status == constants.OUTBOUND_STATUS_SENT:
+                return True
+
+            attempt_no = int(message.attempt_count or 0) + 1
+            message.attempt_count = attempt_no
+            message.updated_at = now
+            message.inflight_at = None
+
+            if success:
+                attempt_status = constants.ACK_OK
+                message.status = constants.OUTBOUND_STATUS_SENT
+                message.acknowledged_at = now
+                message.last_error_code = None
+                message.last_error_message = None
+            else:
+                attempt_status = constants.ACK_RETRYABLE_ERROR
+                message.status = constants.OUTBOUND_STATUS_FAILED
+                message.acknowledged_at = now
+                message.last_error_code = error_code
+                message.last_error_message = error_message
+                message.failure_type = message.failure_type or constants.FAILURE_DELIVERY
+
+            session.add(
+                DeliveryAttempt(
+                    outbound_message_id=message.id,
+                    attempt_no=attempt_no,
+                    status=attempt_status,
+                    error_code=error_code,
+                    error_message=error_message,
+                    created_at=now,
+                    ack_received_at=now,
+                )
+            )
+            commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
+            return True
+
+    @staticmethod
+    def _mark_expired(message: OutboundMessage, now: datetime) -> None:
+        message.status = constants.OUTBOUND_STATUS_FAILED
+        message.failure_type = message.failure_type or constants.FAILURE_DELIVERY
+        message.last_error_code = constants.OUTBOUND_EXPIRED_ERROR_CODE
+        message.last_error_message = constants.OUTBOUND_EXPIRED_ERROR_MESSAGE
+        message.inflight_at = None
+        message.updated_at = now
 
     def record_attempt(
         self,
@@ -208,6 +343,7 @@ class DeliveryRepository:
             message.status = constants.OUTBOUND_STATUS_SENT
             message.acknowledged_at = datetime.now(timezone.utc)
             message.updated_at = datetime.now(timezone.utc)
+            message.inflight_at = None
             message.last_error_code = None
             message.last_error_message = None
             commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
@@ -221,6 +357,7 @@ class DeliveryRepository:
             message.failure_type = failure_type
             message.last_error_code = error_code
             message.last_error_message = error_message
+            message.inflight_at = None
             message.updated_at = datetime.now(timezone.utc)
             commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
 
@@ -230,6 +367,8 @@ class DeliveryRepository:
             if message is None:
                 return
             message.status = constants.OUTBOUND_STATUS_PENDING
+            message.inflight_at = None
+            message.acknowledged_at = None
             message.updated_at = datetime.now(timezone.utc)
             commit_with_retry(session, self._sqlite_policy.retries, self._sqlite_policy.delay_seconds)
 

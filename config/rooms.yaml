@@ -75,6 +75,25 @@ rooms:
       grid_y: 77
       publish_time: "08:06"
 
+  - name: "김휘태, 김헌호, JUNGAIE"
+    admin: false
+    package_name: "com.kakao.talk"
+    persona_path: "config/personas/room3.md"
+    features:
+      youtube_summary: true
+      llm_chat: true
+      hanall_briefing: true
+      weather: true
+      child_age: true
+      admin_commands: false
+    hanall_publish_time: "08:22"
+    weather:
+      enabled: true
+      location_label: "김해율하"
+      grid_x: 95
+      grid_y: 77
+      publish_time: "08:06"
+
   - name: "현기휘태"
     admin: false
     package_name: "com.kakao.talk"

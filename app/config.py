@@ -146,10 +146,6 @@ class Settings(BaseSettings):
 
     def validate_runtime_secrets(self) -> None:
         _validate_secret("INBOUND_BOT_SECRET", self.inbound_bot_secret, "change-me")
-        _validate_secret("SOCKET_SHARED_TOKEN", self.socket_shared_token, "change-me-too")
-        _validate_secret("MESSENGERBOT_BOT_NAME", self.messengerbot_bot_name, "change-me-bot")
-        _validate_required("MB_SOCKET_CONTROL_AUTHOR_NAME", self.mb_socket_control_author_name)
-        _validate_required("MB_SOCKET_CONTROL_ROOM_NAME", self.mb_socket_control_room_name)
 
     def load_rooms(self) -> RoomRegistryConfig:
         payload = _load_yaml_file(self.room_config_path)
